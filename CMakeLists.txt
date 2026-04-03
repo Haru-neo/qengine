@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.18)
+project(qwen-engine LANGUAGES CXX CUDA)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_ARCHITECTURES 70)
+find_package(CUDAToolkit REQUIRED)
+add_executable(qwen-engine src/main.cu)
+target_link_libraries(qwen-engine PRIVATE CUDA::cudart CUDA::cublas)
