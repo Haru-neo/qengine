@@ -30,14 +30,18 @@ struct SamplingParams {
 };
 
 struct Sampler {
-    SamplingParams params;
+    const SamplingParams* params_ptr = nullptr;  // points at the live, per-request params
+    SamplingParams params_default;                // fallback if no pointer set
     std::mt19937 rng;
     // Pre-allocated buffers to avoid per-token allocation
     std::vector<float> logits;
     std::vector<int> indices;
 
+    const SamplingParams& params() const { return params_ptr ? *params_ptr : params_default; }
+
     void init(const SamplingParams& p, int vocab_size) {
-        params = p;
+        params_default = p;
+        params_ptr = &p;  // bind to caller's params (live)
         logits.resize(vocab_size);
         indices.resize(vocab_size);
         if (p.seed == 0) {
@@ -54,22 +58,22 @@ struct Sampler {
             logits[i] = __half2float(logits_half[i]);
 
         // 1. Repetition penalty
-        if (params.rep_penalty != 1.0f || params.freq_penalty != 0.0f || params.pres_penalty != 0.0f) {
+        if (params().rep_penalty != 1.0f || params().freq_penalty != 0.0f || params().pres_penalty != 0.0f) {
             apply_rep_penalty(logits, context);
         }
 
         // 2. Greedy
-        if (params.temperature <= 0.0f) {
+        if (params().temperature <= 0.0f) {
             return std::max_element(logits.begin(), logits.begin() + vocab_size) - logits.begin();
         }
 
         // 3. Temperature
-        float inv_temp = 1.0f / params.temperature;
+        float inv_temp = 1.0f / params().temperature;
         for (int i = 0; i < vocab_size; i++) logits[i] *= inv_temp;
 
         // 4. Determine effective K for partial sort
         // Even with top_k=0, we only need ~1000 candidates for top_p sampling
-        int eff_k = params.top_k > 0 ? params.top_k : 256;
+        int eff_k = params().top_k > 0 ? params().top_k : 256;
         if (eff_k > vocab_size) eff_k = vocab_size;
 
         // Build index array and partial sort (top-K only)
@@ -90,19 +94,19 @@ struct Sampler {
 
         // 6. Min-p
         int n_keep = eff_k;
-        if (params.min_p > 0.0f) {
-            float threshold = params.min_p * probs[0];
+        if (params().min_p > 0.0f) {
+            float threshold = params().min_p * probs[0];
             for (int i = 1; i < eff_k; i++) {
                 if (probs[i] < threshold) { n_keep = i; break; }
             }
         }
 
         // 7. Top-p (nucleus)
-        if (params.top_p < 1.0f) {
+        if (params().top_p < 1.0f) {
             float cumsum = 0.0f;
             for (int i = 0; i < n_keep; i++) {
                 cumsum += probs[i];
-                if (cumsum >= params.top_p) { n_keep = i + 1; break; }
+                if (cumsum >= params().top_p) { n_keep = i + 1; break; }
             }
         }
 
@@ -121,19 +125,19 @@ struct Sampler {
 
 private:
     void apply_rep_penalty(std::vector<float>& logits, const std::vector<int>& context) {
-        int start = std::max(0, (int)context.size() - params.rep_window);
+        int start = std::max(0, (int)context.size() - params().rep_window);
         std::unordered_map<int, int> counts;
         for (int i = start; i < (int)context.size(); i++)
             counts[context[i]]++;
 
         for (auto& [tok, cnt] : counts) {
             if (tok < 0 || tok >= (int)logits.size()) continue;
-            if (params.rep_penalty != 1.0f) {
-                if (logits[tok] > 0) logits[tok] /= params.rep_penalty;
-                else logits[tok] *= params.rep_penalty;
+            if (params().rep_penalty != 1.0f) {
+                if (logits[tok] > 0) logits[tok] /= params().rep_penalty;
+                else logits[tok] *= params().rep_penalty;
             }
-            logits[tok] -= params.freq_penalty * cnt;
-            logits[tok] -= params.pres_penalty;
+            logits[tok] -= params().freq_penalty * cnt;
+            logits[tok] -= params().pres_penalty;
         }
     }
 };
