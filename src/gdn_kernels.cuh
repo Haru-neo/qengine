@@ -63,6 +63,7 @@ __global__ void gdn_recurrent_step(
 ) {
     int head = blockIdx.x;
     if (head >= num_v) return;
+    // qwen35 uses ggml_repeat_4d (tile pattern): v_head h → k_head h%num_k
     int k_head = head % num_k;
 
     const float* q_raw = qkv + k_head * k_dim;
@@ -180,6 +181,7 @@ __global__ void gdn_chunk_step(
 ) {
     int head = blockIdx.x;
     if (head >= num_v) return;
+    // qwen35 uses ggml_repeat_4d (tile pattern): v_head h → k_head h%num_k
     int k_head = head % num_k;
     int qkv_dim = 2 * num_k * k_dim + num_v * v_dim;
     int v_total = num_v * v_dim;

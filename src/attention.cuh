@@ -28,7 +28,8 @@ struct RoPETable {
         
         for (int pos = 0; pos < max_seq; pos++) {
             for (int i = 0; i < half_dim; i++) {
-                float freq = 1.0f / powf(theta, (float)(2 * i) / head_dim);
+                // standard NeoX RoPE: freq depends on rope_dim (n_rot), not head_dim
+                float freq = 1.0f / powf(theta, (float)(2 * i) / rope_dim);
                 float angle = pos * freq;
                 h_sin[pos * half_dim + i] = sinf(angle);
                 h_cos[pos * half_dim + i] = cosf(angle);
