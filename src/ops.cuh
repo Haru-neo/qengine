@@ -283,3 +283,46 @@ __global__ void dequant_embd_q6k_row_v2(
     int8_t q = (int8_t)(ql4 | (qh2 << 4)) - 32;
     out[idx] = __float2half(d * b->scales[is + quarter*2] * q);
 }
+
+// Q8_0: 32 elements per block, half scale + int8 quants
+__global__ void dequant_embd_q8_0_row(
+    const void* __restrict__ embd, half* __restrict__ out, int token_id, int H
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= H) return;
+    struct bq8_0 { half d; int8_t qs[32]; };
+    int blocks_per_row = H / 32;
+    const bq8_0* row = (const bq8_0*)embd + (size_t)token_id * blocks_per_row;
+    int blk = idx / 32;
+    int elem = idx % 32;
+    out[idx] = __float2half(__half2float(row[blk].d) * row[blk].qs[elem]);
+}
+
+// Q8_K: 256 elements per block, float scale + int8 quants (used by Gemma)
+__global__ void dequant_embd_q8k_row(
+    const void* __restrict__ embd, half* __restrict__ out, int token_id, int H
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= H) return;
+    struct bq8_k { float d; int8_t qs[256]; int16_t bsums[16]; };
+    int blocks_per_row = H / 256;
+    const bq8_k* row = (const bq8_k*)embd + (size_t)token_id * blocks_per_row;
+    int blk = idx / 256;
+    int elem = idx % 256;
+    out[idx] = __float2half(row[blk].d * row[blk].qs[elem]);
+}
+
+// Scale embedding by sqrt(hidden_size) (used by Gemma)
+__global__ void scale_embedding_kernel(half* __restrict__ x, float scale, int H) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < H) x[idx] = __float2half(__half2float(x[idx]) * scale);
+}
+
+// Softcap: x = scale * tanh(x / scale) (used by Gemma final logits)
+__global__ void softcap_kernel(half* __restrict__ x, float scale, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {
+        float v = __half2float(x[idx]);
+        x[idx] = __float2half(scale * tanhf(v / scale));
+    }
+}

@@ -128,9 +128,19 @@ __global__ void head_rms_norm_kernel(
 // scores: [num_q_heads, seq_len]
 // With GQA: each q head maps to k head = q_head / gqa_ratio
 
+// Convert fp16 K/V to fp32 and store in cache at given position
+__global__ void store_kv_fp32_kernel(
+    const half* __restrict__ src,
+    float* __restrict__ dst,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = __half2float(src[idx]);
+}
+
 __global__ void attn_score_kernel(
     const half* __restrict__ q,         // [num_q_heads * head_dim]
-    const half* __restrict__ k_cache,   // [seq_len * num_kv_heads * head_dim]
+    const float* __restrict__ k_cache,  // [seq_len * num_kv_heads * head_dim] FP32
     float* __restrict__ scores,         // [num_q_heads * seq_len]
     int num_q_heads,
     int num_kv_heads,
@@ -141,21 +151,21 @@ __global__ void attn_score_kernel(
     int q_head = blockIdx.x;
     int pos = blockIdx.y;
     if (q_head >= num_q_heads || pos >= seq_len) return;
-    
+
     int kv_head = q_head / (num_q_heads / num_kv_heads);
-    
+
     const half* qh = q + q_head * head_dim;
-    const half* kh = k_cache + pos * num_kv_heads * head_dim + kv_head * head_dim;
-    
-    // Dot product
+    const float* kh = k_cache + pos * num_kv_heads * head_dim + kv_head * head_dim;
+
+    // Dot product (Q is fp16, K is fp32, accumulate in fp32)
     float sum = 0.0f;
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
-        sum += __half2float(qh[i]) * __half2float(kh[i]);
-    
+        sum += __half2float(qh[i]) * kh[i];
+
     // Warp reduce
     for (int off = 16; off > 0; off >>= 1)
         sum += __shfl_xor_sync(0xffffffff, sum, off);
-    
+
     if (threadIdx.x == 0)
         scores[q_head * seq_len + pos] = sum * scale;
 }
@@ -215,7 +225,7 @@ __global__ void softmax_kernel(
 
 __global__ void attn_value_kernel(
     const float* __restrict__ scores,   // [num_q_heads * seq_len]
-    const half* __restrict__ v_cache,   // [seq_len * num_kv_heads * head_dim]
+    const float* __restrict__ v_cache,  // [seq_len * num_kv_heads * head_dim] FP32
     half* __restrict__ output,          // [num_q_heads * head_dim]
     int num_q_heads,
     int num_kv_heads,
@@ -224,14 +234,14 @@ __global__ void attn_value_kernel(
 ) {
     int q_head = blockIdx.x;
     if (q_head >= num_q_heads) return;
-    
+
     int kv_head = q_head / (num_q_heads / num_kv_heads);
     const float* sc = scores + q_head * seq_len;
-    
+
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float sum = 0.0f;
         for (int pos = 0; pos < seq_len; pos++) {
-            sum += sc[pos] * __half2float(v_cache[pos * num_kv_heads * head_dim + kv_head * head_dim + d]);
+            sum += sc[pos] * v_cache[pos * num_kv_heads * head_dim + kv_head * head_dim + d];
         }
         output[q_head * head_dim + d] = __float2half(sum);
     }

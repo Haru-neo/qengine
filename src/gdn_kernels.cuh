@@ -11,30 +11,26 @@
 // weight: [kernel_width=4, dim] stored as [dim, kernel_width] in GGUF
 
 __global__ void conv1d_update_silu(
-    half* __restrict__ conv_state,   // [dim, kw]
+    float* __restrict__ conv_state,  // [dim, kw] FP32
     const half* __restrict__ input,  // [dim]
     const float* __restrict__ weight, // [kw, dim] F32
-    half* __restrict__ output,       // [dim]
+    float* __restrict__ output,      // [dim] FP32
     int dim, int kw
 ) {
     int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= dim) return;
-    
-    // Shift state left: state[d][0..kw-2] = state[d][1..kw-1]
-    half* st = conv_state + d * kw;
+
+    float* st = conv_state + d * kw;
     for (int i = 0; i < kw - 1; i++)
         st[i] = st[i + 1];
-    // Insert new input at end
-    st[kw - 1] = input[d];
-    
-    // Conv1d dot product
+    st[kw - 1] = __half2float(input[d]);
+
     float sum = 0.0f;
     for (int i = 0; i < kw; i++)
-        sum += weight[d * kw + i] * __half2float(st[i]);
-    
-    // SiLU
+        sum += weight[d * kw + i] * st[i];
+
     float silu = sum / (1.0f + expf(-sum));
-    output[d] = __float2half(silu);
+    output[d] = silu;
 }
 
 // ============ L2 Norm (per head) ============
@@ -56,77 +52,82 @@ __device__ float l2norm_head(const half* data, int dim) {
 // Q, K = L2 normalized
 
 __global__ void gdn_recurrent_step(
-    const half* __restrict__ qkv,      // [2*num_k*k_dim + num_v*v_dim] post-conv+silu
-    const float* __restrict__ a_log,   // [num_v] A_log values
-    const float* __restrict__ dt_bias, // [num_v] F32
-    const half* __restrict__ a_proj,   // [num_v] alpha projection
-    const half* __restrict__ b_proj,   // [num_v] beta projection
-    float* __restrict__ rec_state,     // [num_v, k_dim, v_dim] updated inplace
-    half* __restrict__ core_out,       // [num_v, v_dim] output
+    const float* __restrict__ qkv,   // FP32 input from conv1d
+    const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias,
+    const half* __restrict__ a_proj,
+    const half* __restrict__ b_proj,
+    double* __restrict__ rec_state,  // FP64 state for precision
+    half* __restrict__ core_out,
     int num_k, int num_v, int k_dim, int v_dim
 ) {
-    int head = blockIdx.x;  // v-head index
+    int head = blockIdx.x;
     if (head >= num_v) return;
-
-    // Qwen3.5 uses modulo mapping (repeat_type=1): head % num_k
     int k_head = head % num_k;
 
-    // Get Q, K, V pointers
-    const half* q_raw = qkv + k_head * k_dim;
-    const half* k_raw = qkv + num_k * k_dim + k_head * k_dim;
-    const half* v_raw = qkv + 2 * num_k * k_dim + head * v_dim;
+    const float* q_raw = qkv + k_head * k_dim;
+    const float* k_raw = qkv + num_k * k_dim + k_head * k_dim;
+    const float* v_raw = qkv + 2 * num_k * k_dim + head * v_dim;
 
-    // L2 normalize Q and K
-    float q_norm_sq = 0.0f, k_norm_sq = 0.0f;
-    for (int i = 0; i < k_dim; i++) {
-        float qv = __half2float(q_raw[i]);
-        float kv = __half2float(k_raw[i]);
-        q_norm_sq += qv * qv;
-        k_norm_sq += kv * kv;
+    extern __shared__ float smem[];
+    float* sQ = smem;
+    float* sK = smem + k_dim + 1;
+
+    // 1. L2 norm Q and K
+    if (threadIdx.x == 0) {
+        float q_norm_sq = 0.0f, k_norm_sq = 0.0f;
+        for (int i = 0; i < k_dim; i++) {
+            float qv = q_raw[i];
+            float kv = k_raw[i];
+            q_norm_sq += qv * qv;
+            k_norm_sq += kv * kv;
+        }
+        float q_inv = rsqrtf(q_norm_sq + 1e-6f);
+        float k_inv = rsqrtf(k_norm_sq + 1e-6f);
+        float scale = rsqrtf((float)k_dim);
+        float attn_score = 0.0f;
+        for (int i = 0; i < k_dim; i++) {
+            float q_n = q_raw[i] * q_inv;
+            float k_n = k_raw[i] * k_inv;
+            sQ[i] = q_n * scale;
+            sK[i] = k_n;
+            attn_score += q_n * k_n;
+        }
+        attn_score *= scale;
+        sQ[k_dim] = attn_score;
     }
-    float q_scale = rsqrtf(q_norm_sq + 1e-6f) * rsqrtf((float)k_dim);  // L2 norm + 1/sqrt(d)
-    float k_inv_norm = rsqrtf(k_norm_sq + 1e-6f);
+    __syncthreads();
 
-    // Compute gate: g_log = ssm_a * softplus(alpha + dt_bias)
-    // ssm_a is already negative (stores -exp(A_log) or similar)
-    float alpha = __half2float(a_proj[head]);
-    float dt = dt_bias[head];
-    float ssm_a_val = a_log[head];  // already negative
-    float g_log = ssm_a_val * logf(1.0f + expf(alpha + dt));  // negative
-    float g = expf(g_log);  // 0 < g < 1, decay factor
+    float attn_score = sQ[k_dim];
 
-    // Beta = sigmoid(b_proj)
-    float beta = 1.0f / (1.0f + expf(-__half2float(b_proj[head])));
+    // 2. Compute gate and beta in FP64
+    double alpha = (double)__half2float(a_proj[head]);
+    double dt = (double)dt_bias[head];
+    double ssm_a_val = (double)a_log[head];
+    double g_log = ssm_a_val * log(1.0 + exp(alpha + dt));
+    double g = exp(fmin(g_log, 50.0));
+    double beta = 1.0 / (1.0 + exp(-(double)__half2float(b_proj[head])));
 
-    float* state = rec_state + head * k_dim * v_dim;
+    double* state = rec_state + head * k_dim * v_dim;
 
-    // For each v dimension
+    // 3. State update in FP64
     for (int vi = threadIdx.x; vi < v_dim; vi += blockDim.x) {
-        // Compute S^T k for this v-dimension
-        // S^T k = sum_kd(state[kd, vi] * k_normed[kd])
-        float stk = 0.0f;
+        double sum1 = 0.0, sum2 = 0.0;
         for (int kd = 0; kd < k_dim; kd++) {
-            stk += state[kd * v_dim + vi] * __half2float(k_raw[kd]) * k_inv_norm;
+            double s = state[kd * v_dim + vi];
+            sum1 += s * (double)sK[kd];
+            sum2 += s * (double)sQ[kd];
         }
+        double sv_new = beta * ((double)v_raw[vi] - sum1 * g);
+        double out_val = sum2 * g + sv_new * (double)attn_score;
+        core_out[head * v_dim + vi] = __float2half((float)out_val);
 
-        // v value
-        float v_val = __half2float(v_raw[vi]);
-
-        // delta = beta * (v - g * S^T k)
-        float delta = beta * (v_val - g * stk);
-
-        // Update state and compute output: o = q^T * S_new
-        float out_val = 0.0f;
         for (int kd = 0; kd < k_dim; kd++) {
-            float k_val = __half2float(k_raw[kd]) * k_inv_norm;
-            float q_val = __half2float(q_raw[kd]) * q_scale;
-            float s_old = state[kd * v_dim + vi];
-            float s_new = g * s_old + k_val * delta;
-            s_new = fminf(fmaxf(s_new, -1e6f), 1e6f);
+            double s_new = g * state[kd * v_dim + vi] + sv_new * (double)sK[kd];
+            if (s_new > 1e6) s_new = 1e6;
+            else if (s_new < -1e6) s_new = -1e6;
             state[kd * v_dim + vi] = s_new;
-            out_val += q_val * s_new;
         }
-        core_out[head * v_dim + vi] = __float2half(out_val);
     }
 }
 
