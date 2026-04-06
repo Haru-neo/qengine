@@ -514,17 +514,21 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     auto* out_w = gpu_model.get("output.weight");
 
     // FP32 hidden state through forward pass (precision)
+    constexpr int CHUNK_SIZE = QwenModel::CHUNK_SIZE;
     float* gpu_hidden[4];
-    half* gpu_hidden_half[4];  // scratch fp16 buffer for embedding dequant
+    half*  gpu_hidden_half[4];  // scratch fp16 buffer for embedding dequant
+    float* gpu_hidden_chunk[4]; // [CHUNK_SIZE * H] for chunked prompt processing
     for (int g = 0; g < n_gpus; g++) {
         cudaSetDevice(g);
         cudaMalloc(&gpu_hidden[g], H * sizeof(float));
         cudaMalloc(&gpu_hidden_half[g], H * sizeof(half));
+        cudaMalloc(&gpu_hidden_chunk[g], CHUNK_SIZE * H * sizeof(float));
     }
     cudaSetDevice(last_gpu);
     half* logits_buf; cudaMalloc(&logits_buf, V * sizeof(half));
     half* norm_buf; cudaMalloc(&norm_buf, H * sizeof(half));
     float* host_transfer; cudaMallocHost(&host_transfer, H * sizeof(float));
+    float* host_chunk_transfer; cudaMallocHost(&host_chunk_transfer, CHUNK_SIZE * H * sizeof(float));
     QuantInput qi_logits;
 
     SamplingParams sp;
@@ -542,7 +546,55 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         bool in_think = false;
         int output_tokens = 0;
 
-        for (int step = 0; step < (int)(prompt_ids.size() + max_gen + 4096); step++) {
+        // ============ Phase 1: chunked prompt processing ============
+        // Process prompt in CHUNK_SIZE token chunks. Skip the very last prompt
+        // token so the existing per-token loop handles logits + sampling for it.
+        int prompt_len = (int)prompt_ids.size();
+        int prefill_len = prompt_len > 1 ? prompt_len - 1 : 0;
+        int chunk_pos = 0;
+        while (chunk_pos < prefill_len) {
+            int chunk_n = std::min(CHUNK_SIZE, prefill_len - chunk_pos);
+
+            // 1. Embed all chunk tokens to gpu_hidden_chunk[0] (fp32)
+            cudaSetDevice(0);
+            for (int t = 0; t < chunk_n; t++) {
+                int token_id = prompt_ids[chunk_pos + t];
+                if (embd_t->type == GGML_TYPE_Q8_0)
+                    dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+                else if (embd_t->type == GGML_TYPE_Q5_K)
+                    dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+                else if (embd_t->type == GGML_TYPE_Q6_K)
+                    dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+                half_to_float_kernel<<<(H+255)/256, 256>>>(
+                    gpu_hidden_half[0], gpu_hidden_chunk[0] + (size_t)t * H, H);
+            }
+
+            // 2. Process chunk through all layers (transfer between GPUs as needed)
+            float* h_chunk = gpu_hidden_chunk[0];
+            for (int layer = 0; layer < model.cfg.num_layers; layer++) {
+                int g = gpu_model.layer_gpu[layer];
+                int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
+                if (g != prev_g) {
+                    cudaSetDevice(prev_g);
+                    cudaMemcpy(host_chunk_transfer, h_chunk, (size_t)chunk_n * H * sizeof(float), cudaMemcpyDeviceToHost);
+                    cudaSetDevice(g);
+                    cudaMemcpy(gpu_hidden_chunk[g], host_chunk_transfer, (size_t)chunk_n * H * sizeof(float), cudaMemcpyHostToDevice);
+                    h_chunk = gpu_hidden_chunk[g];
+                } else { cudaSetDevice(g); }
+
+                if (model.is_attn_layer(layer))
+                    model.forward_attn_chunk(layer, h_chunk, chunk_pos, chunk_n, 0);
+                else
+                    model.forward_gdn_chunk(layer, h_chunk, chunk_n, 0);
+                model.forward_mlp_chunk(layer, h_chunk, chunk_n, 0);
+            }
+            cudaSetDevice(last_gpu); cudaDeviceSynchronize();
+
+            chunk_pos += chunk_n;
+        }
+
+        // ============ Phase 2: per-token loop (handles last prompt token + generation) ============
+        for (int step = prefill_len; step < (int)(prompt_ids.size() + max_gen + 4096); step++) {
             int token_id = step < (int)prompt_ids.size() ? prompt_ids[step] : generated.back();
 
             cudaSetDevice(0);
