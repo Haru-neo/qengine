@@ -101,7 +101,7 @@ struct QwenModel {
     }
 
     // MLP: gate_proj(SiLU) * up_proj -> down_proj
-    void forward_mlp(int layer, half* hidden, cudaStream_t stream) {
+    void forward_mlp(int layer, float* hidden, cudaStream_t stream) {
         int g = gpu->layer_gpu[layer];
         auto& buf = bufs[g];
         int H = cfg.hidden_size;
@@ -117,32 +117,22 @@ struct QwenModel {
             return;
         }
 
-        // RMSNorm (norm weight may be F32, need fp16)
+        // RMSNorm: read FP32 hidden, output FP16 norm_out
         if (norm_w->type == GGML_TYPE_F32) {
-            // F32 norm: use custom kernel
-            rms_norm_f32w(buf.norm_out, hidden, (float*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+            rms_norm_f32in_f32w(buf.norm_out, hidden, (float*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
         } else {
-            rms_norm(buf.norm_out, hidden, (half*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+            rms_norm_f32in(buf.norm_out, hidden, (half*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
         }
 
-        // Quantize input once, reuse for gate + up
         gpu_qi[g].quantize(buf.norm_out, H, stream);
-
-        // Gate projection
         quant_gemv(gate_w->data, gate_w->type, buf.norm_out, buf.mlp_gate, H, I, &gpu_qi[g], stream);
-
-        // Up projection (reuse Q8 input)
         quant_gemv(up_w->data, up_w->type, buf.norm_out, buf.mlp_up, H, I, &gpu_qi[g], stream);
-
-        // Fused SiLU * mul
         silu_mul_kernel<<<(I+255)/256, 256, 0, stream>>>(buf.mlp_gate, buf.mlp_up, I);
-
-        // Down projection
         gpu_qi_inter[g].quantize(buf.mlp_gate, I, stream);
         quant_gemv(down_w->data, down_w->type, buf.mlp_gate, buf.mlp_down, I, H, &gpu_qi_inter[g], stream);
 
-        // Residual add
-        add_kernel<<<(H+255)/256, 256, 0, stream>>>(hidden, buf.mlp_down, H);
+        // Residual add into FP32 hidden
+        add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(hidden, buf.mlp_down, H);
     }
 
 
@@ -243,7 +233,7 @@ struct QwenModel {
         }
     }
 
-    void forward_attn(int layer, half* hidden, int pos, cudaStream_t stream) {
+    void forward_attn(int layer, float* hidden, int pos, cudaStream_t stream) {
         int g = gpu->layer_gpu[layer];
         int H = cfg.hidden_size;
         int num_q = cfg.num_q_heads;
@@ -268,11 +258,11 @@ struct QwenModel {
         int kv_dim = num_kv * hd;
         int seq_len = pos + 1;  // including current token
 
-        // 1. RMSNorm
+        // 1. RMSNorm (FP32 hidden in)
         if (norm_w->type == GGML_TYPE_F32)
-            rms_norm_f32w(norm_out, hidden, (float*)norm_w->data, 1, H, eps, stream);
+            rms_norm_f32in_f32w(norm_out, hidden, (float*)norm_w->data, 1, H, eps, stream);
         else
-            rms_norm(norm_out, hidden, (half*)norm_w->data, 1, H, eps, stream);
+            rms_norm_f32in(norm_out, hidden, (half*)norm_w->data, 1, H, eps, stream);
 
         // 2. Q/K/V projections
         int q_out_dim = q_w->dims[1];
@@ -342,8 +332,8 @@ struct QwenModel {
         gpu_qi_inter[g].quantize(q_buf, num_q * hd, stream);
         quant_gemv(o_w->data, o_w->type, q_buf, proj_out, num_q * hd, H, &gpu_qi_inter[g], stream);
 
-        // 10. Residual
-        add_kernel<<<(H+255)/256, 256, 0, stream>>>(hidden, proj_out, H);
+        // 10. Residual into FP32 hidden
+        add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(hidden, proj_out, H);
     }
 
     // ============ GDN Forward ============
@@ -428,7 +418,7 @@ struct QwenModel {
 
 
     // GDN forward (seq_len=1, with cache)
-    void forward_gdn(int layer, half* hidden, cudaStream_t stream) {
+    void forward_gdn(int layer, float* hidden, cudaStream_t stream) {
         int g = gpu->layer_gpu[layer];
         auto& buf = bufs[g];
         int H = cfg.hidden_size;
@@ -456,11 +446,11 @@ struct QwenModel {
         half* a_out = buf.mlp_up;      // reuse, [num_v]  
         half* b_out = buf.mlp_down;    // reuse, [num_v]
 
-        // 1. RMSNorm
+        // 1. RMSNorm (FP32 hidden in)
         if (norm_w->type == GGML_TYPE_F32)
-            rms_norm_f32w(norm_out, hidden, (float*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+            rms_norm_f32in_f32w(norm_out, hidden, (float*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
         else
-            rms_norm(norm_out, hidden, (half*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+            rms_norm_f32in(norm_out, hidden, (half*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
 
         // 2. Projections: QKV, Z(gate), alpha, beta — quantize once, reuse
         gpu_qi[g].quantize(norm_out, H, stream);
@@ -509,13 +499,12 @@ struct QwenModel {
         gpu_qi_inter[g].quantize(normed_out, num_v * v_dim, stream);
         quant_gemv(out_w->data, out_w->type, normed_out, proj_out, num_v * v_dim, H, &gpu_qi_inter[g], stream);
 
-        // 7. Residual add
-        add_kernel<<<(H+255)/256, 256, 0, stream>>>(hidden, proj_out, H);
-
-        // Buffers preallocated, no free needed
+        // 7. Residual add into FP32 hidden
+        add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(hidden, proj_out, H);
     }
 
 
+#if 0  // unused — kept for reference, signatures need updating to fp32 hidden
     // ============ Full Pipeline Forward (1 token) ============
     void forward_one_token(half* hidden, int pos, int gpu_start = 0) {
         for (int layer = 0; layer < cfg.num_layers; layer++) {
@@ -676,80 +665,7 @@ struct QwenModel {
             cudaFree(gpu_hidden[g]);
         }
     }
+#endif
 
-    void test_gdn(int layer) {
-        int g = gpu->layer_gpu[layer];
-        cudaSetDevice(g);
-        int H = cfg.hidden_size;
-
-        half* hidden;
-        cudaMalloc(&hidden, H * sizeof(half));
-        std::vector<half> h_data(H);
-        for (int i = 0; i < H; i++) h_data[i] = __float2half(0.01f * (i % 100 - 50));
-        cudaMemcpy(hidden, h_data.data(), H * sizeof(half), cudaMemcpyHostToDevice);
-
-        cudaStream_t stream;
-        cudaStreamCreate(&stream);
-
-        // Warmup
-        for (int i = 0; i < 3; i++) forward_gdn(layer, hidden, stream);
-        cudaStreamSynchronize(stream);
-
-        int runs = 20;
-        auto t0 = std::chrono::high_resolution_clock::now();
-        for (int i = 0; i < runs; i++) forward_gdn(layer, hidden, stream);
-        cudaStreamSynchronize(stream);
-        auto t1 = std::chrono::high_resolution_clock::now();
-        double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / runs;
-
-        half host_buf[8];
-        cudaMemcpy(host_buf, hidden, 8 * sizeof(half), cudaMemcpyDeviceToHost);
-        printf("GDN L%d: %.1f us | out[0:4]: %.4f %.4f %.4f %.4f\n",
-            layer, us,
-            __half2float(host_buf[0]), __half2float(host_buf[1]),
-            __half2float(host_buf[2]), __half2float(host_buf[3]));
-
-        cudaStreamDestroy(stream);
-        cudaFree(hidden);
-    }
-
-    // Test: run one MLP layer and benchmark
-    void test_mlp(int layer) {
-        int g = gpu->layer_gpu[layer];
-        cudaSetDevice(g);
-        auto& buf = bufs[g];
-        int H = cfg.hidden_size;
-
-        // Fake hidden state
-        half* hidden;
-        cudaMalloc(&hidden, H * sizeof(half));
-        std::vector<half> h_data(H);
-        for (int i = 0; i < H; i++) h_data[i] = __float2half(0.01f * (i % 100 - 50));
-        cudaMemcpy(hidden, h_data.data(), H * sizeof(half), cudaMemcpyHostToDevice);
-
-        cudaStream_t stream;
-        cudaStreamCreate(&stream);
-
-        // Warmup
-        for (int i = 0; i < 5; i++) forward_mlp(layer, hidden, stream);
-        cudaStreamSynchronize(stream);
-
-        // Benchmark
-        int runs = 50;
-        auto t0 = std::chrono::high_resolution_clock::now();
-        for (int i = 0; i < runs; i++) forward_mlp(layer, hidden, stream);
-        cudaStreamSynchronize(stream);
-        auto t1 = std::chrono::high_resolution_clock::now();
-        double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / runs;
-
-        half host_buf[8];
-        cudaMemcpy(host_buf, hidden, 8 * sizeof(half), cudaMemcpyDeviceToHost);
-        printf("MLP L%d: %.1f us | out[0:4]: %.4f %.4f %.4f %.4f\n",
-            layer, us,
-            __half2float(host_buf[0]), __half2float(host_buf[1]),
-            __half2float(host_buf[2]), __half2float(host_buf[3]));
-
-        cudaStreamDestroy(stream);
-        cudaFree(hidden);
-    }
+    // test_gdn / test_mlp removed — needed updating to fp32 hidden
 };

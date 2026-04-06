@@ -87,6 +87,94 @@ void rms_norm_f32w(half* out, const half* x, const float* weight, int rows, int 
     rms_norm_f32w_kernel<<<rows, threads, threads * sizeof(float), stream>>>(x, weight, out, hidden_size, eps);
 }
 
+// ============ FP32-input variants for hidden state ============
+// Read fp32 hidden, output fp16 (for projections that take fp16)
+__global__ void rms_norm_f32in_kernel(
+    const float* __restrict__ x,
+    const half* __restrict__ weight,
+    half* __restrict__ out,
+    int hidden_size,
+    float eps
+) {
+    int row = blockIdx.x;
+    const float* x_row = x + row * hidden_size;
+    half* out_row = out + row * hidden_size;
+    extern __shared__ float sdata[];
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float v = x_row[i];
+        sum += v * v;
+    }
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float rms = rsqrtf(sdata[0] / hidden_size + eps);
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        out_row[i] = __float2half(x_row[i] * rms * __half2float(weight[i]));
+    }
+}
+
+__global__ void rms_norm_f32in_f32w_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    half* __restrict__ out,
+    int hidden_size,
+    float eps
+) {
+    int row = blockIdx.x;
+    const float* x_row = x + row * hidden_size;
+    half* out_row = out + row * hidden_size;
+    extern __shared__ float sdata[];
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float v = x_row[i];
+        sum += v * v;
+    }
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float rms = rsqrtf(sdata[0] / hidden_size + eps);
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        out_row[i] = __float2half(x_row[i] * rms * weight[i]);
+    }
+}
+
+inline void rms_norm_f32in(half* out, const float* x, const half* weight, int rows, int hidden_size, float eps, cudaStream_t stream = 0) {
+    int threads = min(hidden_size, 256);
+    rms_norm_f32in_kernel<<<rows, threads, threads * sizeof(float), stream>>>(x, weight, out, hidden_size, eps);
+}
+
+inline void rms_norm_f32in_f32w(half* out, const float* x, const float* weight, int rows, int hidden_size, float eps, cudaStream_t stream = 0) {
+    int threads = min(hidden_size, 256);
+    rms_norm_f32in_f32w_kernel<<<rows, threads, threads * sizeof(float), stream>>>(x, weight, out, hidden_size, eps);
+}
+
+// FP32 residual add: hidden_f32 += proj_out (half)
+__global__ void add_kernel_f32(float* __restrict__ x, const half* __restrict__ residual, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        x[idx] = x[idx] + __half2float(residual[idx]);
+    }
+}
+
+// Convert half → fp32 (used after embedding lookup)
+__global__ void half_to_float_kernel(const half* __restrict__ src, float* __restrict__ dst, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = __half2float(src[idx]);
+}
+
+// Convert fp32 → half (used before output projection)
+__global__ void float_to_half_kernel(const float* __restrict__ src, half* __restrict__ dst, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = __float2half(src[idx]);
+}
+
 
 // cuBLAS fp16 GEMM wrapper
 // C = A @ B^T  (A: [M, K], B: [N, K] -> C: [M, N])

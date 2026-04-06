@@ -69,6 +69,9 @@ struct GGUFFile {
     std::unordered_map<std::string, uint64_t> meta_u64;
     std::unordered_map<std::string, float> meta_f32;
     std::unordered_map<std::string, std::vector<std::string>> meta_str_arr;
+    std::unordered_map<std::string, std::vector<int32_t>> meta_i32_arr;
+    std::unordered_map<std::string, std::vector<uint8_t>> meta_bool_arr;
+    std::unordered_map<std::string, std::vector<float>> meta_f32_arr;
     
     // Tensors
     std::unordered_map<std::string, TensorInfo> tensors;
@@ -202,6 +205,18 @@ private:
                         arr.push_back(std::string((char*)p, slen)); p += slen;
                     }
                     meta_str_arr[key] = arr;
+                } else if (atype == GGUF_TYPE_INT32 || atype == GGUF_TYPE_UINT32) {
+                    std::vector<int32_t> arr(count);
+                    for (uint64_t j = 0; j < count; j++) { arr[j] = *(int32_t*)p; p += 4; }
+                    meta_i32_arr[key] = arr;
+                } else if (atype == GGUF_TYPE_BOOL || atype == GGUF_TYPE_UINT8 || atype == GGUF_TYPE_INT8) {
+                    std::vector<uint8_t> arr(count);
+                    for (uint64_t j = 0; j < count; j++) { arr[j] = *(uint8_t*)p; p += 1; }
+                    meta_bool_arr[key] = arr;
+                } else if (atype == GGUF_TYPE_FLOAT32) {
+                    std::vector<float> arr(count);
+                    for (uint64_t j = 0; j < count; j++) { arr[j] = *(float*)p; p += 4; }
+                    meta_f32_arr[key] = arr;
                 } else {
                     // Skip other array types
                     static const size_t type_sizes[] = {1,1,2,2,4,4,4,1,0,0,8,8,8};

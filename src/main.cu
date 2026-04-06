@@ -199,12 +199,17 @@ int run_chat(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, const SamplingPara
     auto* out_norm_t = gpu_model.get("output_norm.weight");
     auto* out_w = gpu_model.get("output.weight");
 
-    half* gpu_hidden[4];
-    for (int g = 0; g < n_gpus; g++) { cudaSetDevice(g); cudaMalloc(&gpu_hidden[g], H * sizeof(half)); }
+    float* gpu_hidden[4];
+    half* gpu_hidden_half[4];
+    for (int g = 0; g < n_gpus; g++) {
+        cudaSetDevice(g);
+        cudaMalloc(&gpu_hidden[g], H * sizeof(float));
+        cudaMalloc(&gpu_hidden_half[g], H * sizeof(half));
+    }
     cudaSetDevice(last_gpu);
     half* logits_buf; cudaMalloc(&logits_buf, V * sizeof(half));
     half* norm_buf; cudaMalloc(&norm_buf, H * sizeof(half));
-    half* host_transfer; cudaMallocHost(&host_transfer, H * sizeof(half));
+    float* host_transfer; cudaMallocHost(&host_transfer, H * sizeof(float));
     QuantInput qi_logits;
 
     Sampler sampler;
@@ -253,24 +258,25 @@ int run_chat(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, const SamplingPara
         for (int step = 0; step < total_steps; step++) {
             int token_id = step < (int)prompt_ids.size() ? prompt_ids[step] : generated.back();
 
-            // Embedding
+            // Embedding (fp16 → fp32 hidden)
             cudaSetDevice(0);
             if (embd_t->type == GGML_TYPE_Q8_0)
-                dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden[0], token_id, H);
+                dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
             else if (embd_t->type == GGML_TYPE_Q5_K)
-                dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden[0], token_id, H);
+                dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
             else if (embd_t->type == GGML_TYPE_Q6_K)
-                dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden[0], token_id, H);
+                dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+            half_to_float_kernel<<<(H+255)/256, 256>>>(gpu_hidden_half[0], gpu_hidden[0], H);
 
-            half* h = gpu_hidden[0];
+            float* h = gpu_hidden[0];
             for (int layer = 0; layer < model.cfg.num_layers; layer++) {
                 int g = model.gpu->layer_gpu[layer];
                 int prev_g = (layer == 0) ? 0 : model.gpu->layer_gpu[layer - 1];
                 if (g != prev_g) {
                     cudaSetDevice(prev_g);
-                    cudaMemcpy(host_transfer, h, H * sizeof(half), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(host_transfer, h, H * sizeof(float), cudaMemcpyDeviceToHost);
                     cudaSetDevice(g);
-                    cudaMemcpy(gpu_hidden[g], host_transfer, H * sizeof(half), cudaMemcpyHostToDevice);
+                    cudaMemcpy(gpu_hidden[g], host_transfer, H * sizeof(float), cudaMemcpyHostToDevice);
                     h = gpu_hidden[g];
                 } else {
                     cudaSetDevice(g);
@@ -285,10 +291,11 @@ int run_chat(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, const SamplingPara
             // Decode only after prefill
             if (step >= (int)prompt_ids.size() - 1) {
                 cudaSetDevice(last_gpu); cudaDeviceSynchronize();
+                float_to_half_kernel<<<(H+255)/256, 256>>>(h, gpu_hidden_half[last_gpu], H);
                 if (out_norm_t->type == GGML_TYPE_F32)
-                    rms_norm_f32w(norm_buf, h, (float*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
+                    rms_norm_f32w(norm_buf, gpu_hidden_half[last_gpu], (float*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
                 else
-                    rms_norm(norm_buf, h, (half*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
+                    rms_norm(norm_buf, gpu_hidden_half[last_gpu], (half*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
                 qi_logits.quantize(norm_buf, H, 0);
                 quant_gemv(out_w->data, out_w->type, norm_buf, logits_buf, H, V, &qi_logits);
                 cudaDeviceSynchronize();
@@ -376,12 +383,17 @@ int run_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, const SamplingPara
     auto* out_norm_t = gpu_model.get("output_norm.weight");
     auto* out_w = gpu_model.get("output.weight");
 
-    half* gpu_hidden[4];
-    for (int g = 0; g < n_gpus; g++) { cudaSetDevice(g); cudaMalloc(&gpu_hidden[g], H * sizeof(half)); }
+    float* gpu_hidden[4];
+    half* gpu_hidden_half[4];
+    for (int g = 0; g < n_gpus; g++) {
+        cudaSetDevice(g);
+        cudaMalloc(&gpu_hidden[g], H * sizeof(float));
+        cudaMalloc(&gpu_hidden_half[g], H * sizeof(half));
+    }
     cudaSetDevice(last_gpu);
     half* logits_buf; cudaMalloc(&logits_buf, V * sizeof(half));
     half* norm_buf; cudaMalloc(&norm_buf, H * sizeof(half));
-    half* host_transfer; cudaMallocHost(&host_transfer, H * sizeof(half));
+    float* host_transfer; cudaMallocHost(&host_transfer, H * sizeof(float));
     QuantInput qi_logits;
 
     model.reset_all_states();
@@ -397,22 +409,22 @@ int run_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, const SamplingPara
 
         cudaSetDevice(0);
         if (embd_t->type == GGML_TYPE_Q8_0)
-            dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden[0], token_id, H);
+            dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
         else if (embd_t->type == GGML_TYPE_Q5_K)
-            dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden[0], token_id, H);
+            dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
         else if (embd_t->type == GGML_TYPE_Q6_K)
-            dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden[0], token_id, H);
+            dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+        half_to_float_kernel<<<(H+255)/256, 256>>>(gpu_hidden_half[0], gpu_hidden[0], H);
 
-        half* h = gpu_hidden[0];
+        float* h = gpu_hidden[0];
         for (int layer = 0; layer < model.cfg.num_layers; layer++) {
             int g = model.gpu->layer_gpu[layer];
             int prev_g = (layer == 0) ? 0 : model.gpu->layer_gpu[layer - 1];
             if (g != prev_g) {
-                // cudaMemcpy is synchronous and implicitly waits for stream 0
                 cudaSetDevice(prev_g);
-                cudaMemcpy(host_transfer, h, H * sizeof(half), cudaMemcpyDeviceToHost);
+                cudaMemcpy(host_transfer, h, H * sizeof(float), cudaMemcpyDeviceToHost);
                 cudaSetDevice(g);
-                cudaMemcpy(gpu_hidden[g], host_transfer, H * sizeof(half), cudaMemcpyHostToDevice);
+                cudaMemcpy(gpu_hidden[g], host_transfer, H * sizeof(float), cudaMemcpyHostToDevice);
                 h = gpu_hidden[g];
             } else {
                 cudaSetDevice(g);
@@ -426,10 +438,11 @@ int run_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, const SamplingPara
 
         if (step >= (int)prompt_ids.size() - 1) {
             cudaSetDevice(last_gpu); cudaDeviceSynchronize();
+            float_to_half_kernel<<<(H+255)/256, 256>>>(h, gpu_hidden_half[last_gpu], H);
             if (out_norm_t->type == GGML_TYPE_F32)
-                rms_norm_f32w(norm_buf, h, (float*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
+                rms_norm_f32w(norm_buf, gpu_hidden_half[last_gpu], (float*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
             else
-                rms_norm(norm_buf, h, (half*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
+                rms_norm(norm_buf, gpu_hidden_half[last_gpu], (half*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
             qi_logits.quantize(norm_buf, H, 0);
             quant_gemv(out_w->data, out_w->type, norm_buf, logits_buf, H, V, &qi_logits);
             cudaDeviceSynchronize();
@@ -500,12 +513,18 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     auto* out_norm_t = gpu_model.get("output_norm.weight");
     auto* out_w = gpu_model.get("output.weight");
 
-    half* gpu_hidden[4];
-    for (int g = 0; g < n_gpus; g++) { cudaSetDevice(g); cudaMalloc(&gpu_hidden[g], H * sizeof(half)); }
+    // FP32 hidden state through forward pass (precision)
+    float* gpu_hidden[4];
+    half* gpu_hidden_half[4];  // scratch fp16 buffer for embedding dequant
+    for (int g = 0; g < n_gpus; g++) {
+        cudaSetDevice(g);
+        cudaMalloc(&gpu_hidden[g], H * sizeof(float));
+        cudaMalloc(&gpu_hidden_half[g], H * sizeof(half));
+    }
     cudaSetDevice(last_gpu);
     half* logits_buf; cudaMalloc(&logits_buf, V * sizeof(half));
     half* norm_buf; cudaMalloc(&norm_buf, H * sizeof(half));
-    half* host_transfer; cudaMallocHost(&host_transfer, H * sizeof(half));
+    float* host_transfer; cudaMallocHost(&host_transfer, H * sizeof(float));
     QuantInput qi_logits;
 
     SamplingParams sp;
@@ -521,29 +540,30 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         auto t_first = t0;
         bool got_first_tok = false;
         bool in_think = false;
-        int output_tokens = 0;  // count tokens OUTSIDE think for max_tokens
+        int output_tokens = 0;
 
         for (int step = 0; step < (int)(prompt_ids.size() + max_gen + 4096); step++) {
-            // Allow extra 4096 tokens for think block (not counted against max_tokens)
             int token_id = step < (int)prompt_ids.size() ? prompt_ids[step] : generated.back();
 
             cudaSetDevice(0);
+            // Dequant embedding into fp16 scratch, then convert to fp32 hidden
             if (embd_t->type == GGML_TYPE_Q8_0)
-                dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden[0], token_id, H);
+                dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
             else if (embd_t->type == GGML_TYPE_Q5_K)
-                dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden[0], token_id, H);
+                dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
             else if (embd_t->type == GGML_TYPE_Q6_K)
-                dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden[0], token_id, H);
+                dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+            half_to_float_kernel<<<(H+255)/256, 256>>>(gpu_hidden_half[0], gpu_hidden[0], H);
 
-            half* h = gpu_hidden[0];
+            float* h = gpu_hidden[0];
             for (int layer = 0; layer < model.cfg.num_layers; layer++) {
                 int g = gpu_model.layer_gpu[layer];
                 int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
                 if (g != prev_g) {
                     cudaSetDevice(prev_g);
-                    cudaMemcpy(host_transfer, h, H * sizeof(half), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(host_transfer, h, H * sizeof(float), cudaMemcpyDeviceToHost);
                     cudaSetDevice(g);
-                    cudaMemcpy(gpu_hidden[g], host_transfer, H * sizeof(half), cudaMemcpyHostToDevice);
+                    cudaMemcpy(gpu_hidden[g], host_transfer, H * sizeof(float), cudaMemcpyHostToDevice);
                     h = gpu_hidden[g];
                 } else { cudaSetDevice(g); }
                 if (model.is_attn_layer(layer))
@@ -555,10 +575,12 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
 
             if (step >= (int)prompt_ids.size() - 1) {
                 cudaSetDevice(last_gpu); cudaDeviceSynchronize();
+                // Convert fp32 hidden to fp16 for output norm + projection
+                float_to_half_kernel<<<(H+255)/256, 256>>>(h, gpu_hidden_half[last_gpu], H);
                 if (out_norm_t->type == GGML_TYPE_F32)
-                    rms_norm_f32w(norm_buf, h, (float*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
+                    rms_norm_f32w(norm_buf, gpu_hidden_half[last_gpu], (float*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
                 else
-                    rms_norm(norm_buf, h, (half*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
+                    rms_norm(norm_buf, gpu_hidden_half[last_gpu], (half*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
                 qi_logits.quantize(norm_buf, H, 0);
                 quant_gemv(out_w->data, out_w->type, norm_buf, logits_buf, H, V, &qi_logits);
                 cudaDeviceSynchronize();
@@ -623,21 +645,22 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
 
             cudaSetDevice(0);
             if (embd_t->type == GGML_TYPE_Q8_0)
-                dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden[0], token_id, H);
+                dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
             else if (embd_t->type == GGML_TYPE_Q5_K)
-                dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden[0], token_id, H);
+                dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
             else if (embd_t->type == GGML_TYPE_Q6_K)
-                dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden[0], token_id, H);
+                dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+            half_to_float_kernel<<<(H+255)/256, 256>>>(gpu_hidden_half[0], gpu_hidden[0], H);
 
-            half* h = gpu_hidden[0];
+            float* h = gpu_hidden[0];
             for (int layer = 0; layer < model.cfg.num_layers; layer++) {
                 int g = gpu_model.layer_gpu[layer];
                 int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
                 if (g != prev_g) {
                     cudaSetDevice(prev_g);
-                    cudaMemcpy(host_transfer, h, H * sizeof(half), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(host_transfer, h, H * sizeof(float), cudaMemcpyDeviceToHost);
                     cudaSetDevice(g);
-                    cudaMemcpy(gpu_hidden[g], host_transfer, H * sizeof(half), cudaMemcpyHostToDevice);
+                    cudaMemcpy(gpu_hidden[g], host_transfer, H * sizeof(float), cudaMemcpyHostToDevice);
                     h = gpu_hidden[g];
                 } else { cudaSetDevice(g); }
                 if (model.is_attn_layer(layer))
@@ -649,10 +672,11 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
 
             if (step >= (int)prompt_ids.size() - 1) {
                 cudaSetDevice(last_gpu); cudaDeviceSynchronize();
+                float_to_half_kernel<<<(H+255)/256, 256>>>(h, gpu_hidden_half[last_gpu], H);
                 if (out_norm_t->type == GGML_TYPE_F32)
-                    rms_norm_f32w(norm_buf, h, (float*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
+                    rms_norm_f32w(norm_buf, gpu_hidden_half[last_gpu], (float*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
                 else
-                    rms_norm(norm_buf, h, (half*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
+                    rms_norm(norm_buf, gpu_hidden_half[last_gpu], (half*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
                 qi_logits.quantize(norm_buf, H, 0);
                 quant_gemv(out_w->data, out_w->type, norm_buf, logits_buf, H, V, &qi_logits);
                 cudaDeviceSynchronize();
