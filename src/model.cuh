@@ -38,6 +38,15 @@ struct QwenModel {
     LayerBuffers bufs[4];
     QuantInput gpu_qi[4];  // per-GPU reusable Q8 buffer (hidden_size)
     QuantInput gpu_qi_inter[4];  // per-GPU for intermediate_size  // one per GPU
+    // Second-token buffer set used by the speculative-decoding path
+    // (forward_*_n2). Allocated lazily in alloc_buffers_n2() — only the
+    // MLP/attn fields are duplicated here because GDN's per-call temp
+    // buffers (gdn_bufs[g].conv_out etc.) are reused across the two
+    // sequential GDN forwards within a spec iter.
+    LayerBuffers bufs2[4];
+    QuantInput gpu_qi2[4];
+    QuantInput gpu_qi_inter2[4];
+    bool n2_buffers_ready = false;
 
     void init_config(GGUFFile& gguf) {
         auto arch = gguf.get_str("general.architecture");
@@ -117,6 +126,23 @@ struct QwenModel {
         }
     }
 
+    void alloc_buffers_n2() {
+        if (n2_buffers_ready) return;
+        int H = cfg.hidden_size;
+        int I = cfg.intermediate_size;
+        for (int g = 0; g < gpu->num_gpus; g++) {
+            cudaSetDevice(g);
+            cudaMalloc(&bufs2[g].norm_out, H * sizeof(half));
+            cudaMalloc(&bufs2[g].attn_out, std::max(H * 4, cfg.num_q_heads * cfg.head_dim * 2) * sizeof(half));
+            cudaMalloc(&bufs2[g].mlp_gate, I * sizeof(half));
+            cudaMalloc(&bufs2[g].mlp_up,   I * sizeof(half));
+            cudaMalloc(&bufs2[g].mlp_down, H * sizeof(half));
+            cudaMalloc(&bufs2[g].residual, H * sizeof(half));
+        }
+        n2_buffers_ready = true;
+        printf("[SPEC] N=2 buffers allocated for speculative decoding\n");
+    }
+
     // Get tensor helper
     GPUTensor* t(const std::string& name) { return gpu->get(name); }
     std::string blk(int layer, const std::string& suffix) {
@@ -158,7 +184,57 @@ struct QwenModel {
         add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(hidden, buf.mlp_down, H);
     }
 
+    // N=2 batched MLP. Processes two hidden states sharing the same weight
+    // loads (gate_proj, up_proj, down_proj). Memory traffic stays at the
+    // N=1 cost since each weight word is read once and dp4a runs against
+    // both inputs. The two RMSNorms, two silu_muls, and two residual adds
+    // are sequential but cheap (no GEMV).
+    void forward_mlp_n2(int layer, float* hidden_a, float* hidden_b, cudaStream_t stream) {
+        int g = gpu->layer_gpu[layer];
+        auto& bA = bufs[g];
+        auto& bB = bufs2[g];
+        int H = cfg.hidden_size;
+        int I = cfg.intermediate_size;
 
+        auto* norm_w = t(blk(layer, "post_attention_norm.weight"));
+        auto* gate_w = t(blk(layer, "ffn_gate.weight"));
+        auto* up_w   = t(blk(layer, "ffn_up.weight"));
+        auto* down_w = t(blk(layer, "ffn_down.weight"));
+
+        if (norm_w->type == GGML_TYPE_F32) {
+            rms_norm_f32in_f32w(bA.norm_out, hidden_a, (float*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+            rms_norm_f32in_f32w(bB.norm_out, hidden_b, (float*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+        } else {
+            rms_norm_f32in(bA.norm_out, hidden_a, (half*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+            rms_norm_f32in(bB.norm_out, hidden_b, (half*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+        }
+
+        gpu_qi[g].quantize(bA.norm_out, H, stream);
+        gpu_qi2[g].quantize(bB.norm_out, H, stream);
+
+        quant_gemv_n2(gate_w->data, gate_w->type,
+                      bA.norm_out, bB.norm_out,
+                      bA.mlp_gate, bB.mlp_gate,
+                      H, I, &gpu_qi[g], &gpu_qi2[g], stream);
+        quant_gemv_n2(up_w->data, up_w->type,
+                      bA.norm_out, bB.norm_out,
+                      bA.mlp_up, bB.mlp_up,
+                      H, I, &gpu_qi[g], &gpu_qi2[g], stream);
+
+        silu_mul_kernel<<<(I+255)/256, 256, 0, stream>>>(bA.mlp_gate, bA.mlp_up, I);
+        silu_mul_kernel<<<(I+255)/256, 256, 0, stream>>>(bB.mlp_gate, bB.mlp_up, I);
+
+        gpu_qi_inter[g].quantize(bA.mlp_gate, I, stream);
+        gpu_qi_inter2[g].quantize(bB.mlp_gate, I, stream);
+
+        quant_gemv_n2(down_w->data, down_w->type,
+                      bA.mlp_gate, bB.mlp_gate,
+                      bA.mlp_down, bB.mlp_down,
+                      I, H, &gpu_qi_inter[g], &gpu_qi_inter2[g], stream);
+
+        add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(hidden_a, bA.mlp_down, H);
+        add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(hidden_b, bB.mlp_down, H);
+    }
 
     // ============ Attention state ============
     RoPETable rope;
@@ -822,4 +898,122 @@ struct QwenModel {
 #endif
 
     // test_gdn / test_mlp removed — needed updating to fp32 hidden
+
+    // ============ N=2 sequential wrappers for spec decoding ============
+    // forward_attn / forward_gdn are inherently sequential because of KV cache
+    // append + GDN recurrent state. We just call them twice with the two
+    // positions / hidden states. The "speedup" comes entirely from MLP
+    // batching (forward_mlp_n2) which shares weight loads across both tokens.
+
+    void forward_attn_n2(int layer, float* hidden_a, float* hidden_b,
+                         int pos_a, int pos_b, cudaStream_t stream) {
+        forward_attn(layer, hidden_a, pos_a, stream);
+        forward_attn(layer, hidden_b, pos_b, stream);
+    }
+
+    void forward_gdn_n2(int layer, float* hidden_a, float* hidden_b, cudaStream_t stream) {
+        forward_gdn(layer, hidden_a, stream);
+        // Snapshot GDN state RIGHT AFTER the first token's update so a
+        // reject of the second token (the speculative draft) can restore
+        // exactly to "post-h_a" instead of "pre-batched". Only the snapshot
+        // for THIS GDN layer is touched here; restore_gdn_states walks all
+        // layers when applied.
+        if (snapshots_ready && !is_attn_layer(layer)) {
+            auto* qkv = t("blk.0.attn_qkv.weight");
+            int qkv_dim = qkv->dims[1];
+            int num_v = cfg.linear_v_heads;
+            int k_dim = cfg.linear_k_dim;
+            int v_dim = cfg.linear_v_dim;
+            size_t conv_sz = qkv_dim * 4 * sizeof(float);
+            size_t rec_sz  = (size_t)num_v * k_dim * v_dim * sizeof(float);
+            int g = gpu->layer_gpu[layer];
+            cudaSetDevice(g);
+            cudaMemcpyAsync(gdn_snapshots[layer].conv_state, gdn_states[layer].conv_state,
+                            conv_sz, cudaMemcpyDeviceToDevice, stream);
+            cudaMemcpyAsync(gdn_snapshots[layer].rec_state, gdn_states[layer].rec_state,
+                            rec_sz, cudaMemcpyDeviceToDevice, stream);
+        }
+        forward_gdn(layer, hidden_b, stream);
+    }
+
+    // ============ GDN state snapshot/restore (for spec rollback) ============
+    // When the MTP draft for the second token is rejected, GDN state has
+    // already advanced past the (wrong) draft input. We need to roll back
+    // to "after the first token only". Strategy: snapshot state BEFORE the
+    // second token forward, run forward, then either commit (do nothing) or
+    // restore. KV cache rollback is automatic — we just don't increment the
+    // position counter and the next forward overwrites the rejected slot.
+
+    struct GDNSnapshot {
+        float* conv_state;  // backup
+        float* rec_state;
+    };
+    std::vector<GDNSnapshot> gdn_snapshots;
+    bool snapshots_ready = false;
+
+    void alloc_gdn_snapshots() {
+        if (snapshots_ready) return;
+        auto* qkv = t("blk.0.attn_qkv.weight");
+        if (!qkv) { printf("[SPEC] no qkv tensor for snapshot alloc\n"); return; }
+        int qkv_dim = qkv->dims[1];
+        int num_v = cfg.linear_v_heads;
+        int k_dim = cfg.linear_k_dim;
+        int v_dim = cfg.linear_v_dim;
+        gdn_snapshots.resize(cfg.num_layers);
+        size_t total = 0;
+        for (int layer = 0; layer < cfg.num_layers; layer++) {
+            if (is_attn_layer(layer)) {
+                gdn_snapshots[layer].conv_state = nullptr;
+                gdn_snapshots[layer].rec_state = nullptr;
+                continue;
+            }
+            int g = gpu->layer_gpu[layer];
+            cudaSetDevice(g);
+            size_t conv_sz = qkv_dim * 4 * sizeof(float);
+            size_t rec_sz  = (size_t)num_v * k_dim * v_dim * sizeof(float);
+            cudaMalloc(&gdn_snapshots[layer].conv_state, conv_sz);
+            cudaMalloc(&gdn_snapshots[layer].rec_state,  rec_sz);
+            total += conv_sz + rec_sz;
+        }
+        snapshots_ready = true;
+        printf("[SPEC] GDN snapshot buffers allocated (%.1f MB total)\n", total / 1e6);
+    }
+
+    void snapshot_gdn_states(cudaStream_t stream = 0) {
+        auto* qkv = t("blk.0.attn_qkv.weight");
+        int qkv_dim = qkv->dims[1];
+        int num_v = cfg.linear_v_heads;
+        int k_dim = cfg.linear_k_dim;
+        int v_dim = cfg.linear_v_dim;
+        size_t conv_sz = qkv_dim * 4 * sizeof(float);
+        size_t rec_sz  = (size_t)num_v * k_dim * v_dim * sizeof(float);
+        for (int layer = 0; layer < cfg.num_layers; layer++) {
+            if (!gdn_snapshots[layer].conv_state) continue;
+            int g = gpu->layer_gpu[layer];
+            cudaSetDevice(g);
+            cudaMemcpyAsync(gdn_snapshots[layer].conv_state, gdn_states[layer].conv_state,
+                            conv_sz, cudaMemcpyDeviceToDevice, stream);
+            cudaMemcpyAsync(gdn_snapshots[layer].rec_state, gdn_states[layer].rec_state,
+                            rec_sz, cudaMemcpyDeviceToDevice, stream);
+        }
+    }
+
+    void restore_gdn_states(cudaStream_t stream = 0) {
+        auto* qkv = t("blk.0.attn_qkv.weight");
+        int qkv_dim = qkv->dims[1];
+        int num_v = cfg.linear_v_heads;
+        int k_dim = cfg.linear_k_dim;
+        int v_dim = cfg.linear_v_dim;
+        size_t conv_sz = qkv_dim * 4 * sizeof(float);
+        size_t rec_sz  = (size_t)num_v * k_dim * v_dim * sizeof(float);
+        for (int layer = 0; layer < cfg.num_layers; layer++) {
+            if (!gdn_snapshots[layer].conv_state) continue;
+            int g = gpu->layer_gpu[layer];
+            cudaSetDevice(g);
+            cudaMemcpyAsync(gdn_states[layer].conv_state, gdn_snapshots[layer].conv_state,
+                            conv_sz, cudaMemcpyDeviceToDevice, stream);
+            cudaMemcpyAsync(gdn_states[layer].rec_state, gdn_snapshots[layer].rec_state,
+                            rec_sz, cudaMemcpyDeviceToDevice, stream);
+        }
+    }
 };

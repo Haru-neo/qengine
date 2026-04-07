@@ -244,6 +244,74 @@ __global__ void gemv_q8_0_q8(
     if(l==0)sm[w2]=thread_sum; __syncthreads();
     if(w2==0&&l<nw){float v=sm[l]; for(int o=16;o>0;o>>=1)v+=__shfl_xor_sync(0xffffffff,v,o); if(l==0)output[row]=__float2half(v);}
 }
+// N=2 BATCHED Q8_0 weight × Q8_1 input GEMV.
+// Same as gemv_q8_0_q8 but processes two independent input vectors that share
+// the same weight matrix. The hot loop loads each weight word ONCE and runs
+// two dp4a accumulators against it, so memory bandwidth (the bottleneck on
+// HBM2-bound Volta) stays at the N=1 cost while we get two outputs.
+//
+// Used by the speculative-decoding path to verify the MTP draft token at the
+// same wall-clock cost as a single non-spec forward — see model.cuh's
+// forward_mlp_n2.
+__global__ void gemv_q8_0_q8_n2(
+    const void* __restrict__ weight,
+    const block_q8_1* __restrict__ x_q8_a,
+    const block_q8_1* __restrict__ x_q8_b,
+    half* __restrict__ output_a,
+    half* __restrict__ output_b,
+    const int K, const int N
+) {
+    const int row = blockIdx.x;
+    if (row >= N) return;
+    const int bpr = K / 32;
+    const block_q8_0_aligned* w_row = (const block_q8_0_aligned*)weight + (size_t)row * bpr;
+
+    float thread_sum_a = 0.0f;
+    float thread_sum_b = 0.0f;
+    for (int b = threadIdx.x; b < bpr; b += blockDim.x) {
+        const block_q8_0_aligned* wb = &w_row[b];
+        const block_q8_1* xb_a = &x_q8_a[b];
+        const block_q8_1* xb_b = &x_q8_b[b];
+        float d_w   = __half2float(wb->d);
+        float d_x_a = __half2float(xb_a->ds.x);
+        float d_x_b = __half2float(xb_b->ds.x);
+
+        const int* wp32  = (const int*)wb->qs;
+        const int* xa32 = (const int*)xb_a->qs;
+        const int* xb32 = (const int*)xb_b->qs;
+
+        int isum_a = 0;
+        int isum_b = 0;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int wj = wp32[j];   // load weight ONCE, reuse for both lanes
+            isum_a = __dp4a(wj, xa32[j], isum_a);
+            isum_b = __dp4a(wj, xb32[j], isum_b);
+        }
+        thread_sum_a += d_w * d_x_a * (float)isum_a;
+        thread_sum_b += d_w * d_x_b * (float)isum_b;
+    }
+    for (int off=16; off>0; off>>=1) {
+        thread_sum_a += __shfl_xor_sync(0xffffffff, thread_sum_a, off);
+        thread_sum_b += __shfl_xor_sync(0xffffffff, thread_sum_b, off);
+    }
+    __shared__ float sm_a[8], sm_b[8];
+    int w2 = threadIdx.x >> 5, l = threadIdx.x & 31, nw = blockDim.x >> 5;
+    if (l == 0) { sm_a[w2] = thread_sum_a; sm_b[w2] = thread_sum_b; }
+    __syncthreads();
+    if (w2 == 0 && l < nw) {
+        float va = sm_a[l], vb = sm_b[l];
+        for (int o=16; o>0; o>>=1) {
+            va += __shfl_xor_sync(0xffffffff, va, o);
+            vb += __shfl_xor_sync(0xffffffff, vb, o);
+        }
+        if (l == 0) {
+            output_a[row] = __float2half(va);
+            output_b[row] = __float2half(vb);
+        }
+    }
+}
+
 __global__ void gemv_fp16(const half* __restrict__ w,const half* __restrict__ x,half* __restrict__ y,int K,int N){
     int row=blockIdx.x;if(row>=N)return;float s=0.0f;
     for(int i=threadIdx.x;i<K;i+=blockDim.x)s+=__half2float(w[(size_t)row*K+i])*__half2float(x[i]);
@@ -300,4 +368,26 @@ inline void quant_gemv(void* weight,ggml_type type,half* input,half* output,int 
         default:fprintf(stderr,"quant_gemv: unsupported type %d\n",type);
         }
     }
+}
+
+// N=2 batched dispatch. Both inputs MUST be pre-quantized into qi_a / qi_b.
+// Only Q8_0 is supported for now (the only quantization the speculative
+// decoding path actually exercises on the 27B model). Other types fall back
+// to two sequential N=1 calls — correct but no shared memory traffic.
+inline void quant_gemv_n2(void* weight, ggml_type type,
+                          half* in_a, half* in_b,
+                          half* out_a, half* out_b,
+                          int K, int N,
+                          QuantInput* qi_a, QuantInput* qi_b,
+                          cudaStream_t stream = 0) {
+    int threads = (K >= 8192) ? 256 : 128;
+    if (type == GGML_TYPE_Q8_0 && qi_a && qi_b) {
+        gemv_q8_0_q8_n2<<<N, threads, 0, stream>>>(
+            weight, qi_a->q8_buf, qi_b->q8_buf, out_a, out_b, K, N);
+        return;
+    }
+    // Fallback: two sequential N=1 calls. Loses the shared-weight-load win
+    // but stays correct for any quantization.
+    quant_gemv(weight, type, in_a, out_a, K, N, qi_a, stream);
+    quant_gemv(weight, type, in_b, out_b, K, N, qi_b, stream);
 }

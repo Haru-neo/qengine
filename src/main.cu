@@ -1,6 +1,7 @@
 #include "gguf.h"
 #include "gpu_loader.h"
 #include "model.cuh"
+#include "mtp_head.cuh"
 #include "gemma_model.cuh"
 #include "ops.cuh"
 #include "turboquant.cuh"
@@ -536,6 +537,69 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     int*  d_argmax;       cudaMalloc(&d_argmax, sizeof(int));
     int*  h_argmax_pinned; cudaMallocHost(&h_argmax_pinned, sizeof(int));
 
+    // Speculative decoding (MTP_SPEC=1) buffers — declared here, allocated
+    // below after mtp.load() reports success.
+    bool spec_enabled = false;
+    float* gpu_hidden_b[4]   = {nullptr,nullptr,nullptr,nullptr};
+    half*  gpu_hidden_half_b[4] = {nullptr,nullptr,nullptr,nullptr};
+    half*  norm_buf_b   = nullptr;
+    half*  logits_buf_b = nullptr;
+    int*   d_argmax_b   = nullptr;
+    int*   h_argmax_pinned_b = nullptr;
+    float* host_transfer_b = nullptr;
+    QuantInput qi_logits_b;
+
+    // ── MTP head (Phase 0: forward + accept rate measurement) ─────────────
+    // Loaded only if /home/paru/mtp_work/mtp_head.bin exists.
+    MTPHead mtp;
+    bool mtp_loaded = false;
+    {
+        const char* mtp_path = "/home/paru/mtp_work/mtp_head.bin";
+        if (access(mtp_path, R_OK) == 0) {
+            // Pull RoPE table for last_gpu, embd source from GPU 0, lm_head from last_gpu.
+            mtp_loaded = mtp.load(
+                mtp_path, last_gpu,
+                model.cfg.hidden_size, V,
+                model.cfg.num_q_heads, model.cfg.num_kv_heads, model.cfg.head_dim,
+                model.cfg.intermediate_size, model.cfg.rope_dim, max_seq, model.cfg.rms_norm_eps);
+            if (mtp_loaded) {
+                auto* embd_t  = gpu_model.get("token_embd.weight");
+                auto* outw_t  = gpu_model.get("output.weight");
+                mtp.set_embed_source(embd_t->data, embd_t->type, embd_t->gpu_id);
+                mtp.set_lm_head(outw_t->data, outw_t->type);
+                mtp.set_rope_tables(model.rope.sin_table(last_gpu), model.rope.cos_table(last_gpu));
+                printf("[MTP] head ready, will measure acceptance rate during gen\n");
+            } else {
+                printf("[MTP] failed to load %s\n", mtp_path);
+            }
+        }
+    }
+
+    // Now that mtp_loaded is known, allocate spec-decoding buffers if requested.
+    spec_enabled = (mtp_loaded && getenv("MTP_SPEC") != nullptr);
+    if (spec_enabled) {
+        for (int g = 0; g < n_gpus; g++) {
+            cudaSetDevice(g);
+            cudaMalloc(&gpu_hidden_b[g], H * sizeof(float));
+            cudaMalloc(&gpu_hidden_half_b[g], H * sizeof(half));
+        }
+        cudaSetDevice(last_gpu);
+        cudaMalloc(&norm_buf_b,   H * sizeof(half));
+        cudaMalloc(&logits_buf_b, V * sizeof(half));
+        cudaMalloc(&d_argmax_b,   sizeof(int));
+        cudaMallocHost(&h_argmax_pinned_b, sizeof(int));
+        cudaMallocHost(&host_transfer_b, H * sizeof(float));
+        model.alloc_buffers_n2();
+        model.alloc_gdn_snapshots();
+        printf("[SPEC] speculative decoding enabled (MTP K=1, MLP batched)\n");
+    }
+    long long mtp_accept_count = 0;
+    long long mtp_total_count  = 0;
+    int mtp_pending_draft = -1;       // draft for some future step (MTP_DRAFT mode)
+    int mtp_pending_draft_step = -1;
+    long long spec_accept_count = 0;
+    long long spec_total_count  = 0;
+
     SamplingParams sp;
     sp.rep_penalty = 1.0f;  // match llama.cpp default; users can set via repetition_penalty in request
     Sampler sampler;
@@ -550,6 +614,11 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         bool got_first_tok = false;
         bool in_think = false;
         int output_tokens = 0;
+        // Reset MTP KV cache at the start of each generate() call so its
+        // attention window matches the main model's per-request context.
+        if (mtp_loaded) mtp.reset_kv();
+        mtp_pending_draft = -1;
+        mtp_pending_draft_step = -1;
 
         // ============ Phase 1: chunked prompt processing ============
         // Process prompt in CHUNK_SIZE token chunks. Skip the very last prompt
@@ -664,6 +733,52 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     max_idx = sampler.sample(h_logits.data(), V, ctx);
                 }
 
+                // Phase 0 MTP measurement: at the same step run the MTP head
+                // with the post-output_norm hidden state and compare its argmax
+                // to main's. Both predict the token at position step+1.
+                //
+                // MTP_DRAFT=1 switches to TRUE draft mode (one-step ahead).
+                // In that mode at iter for step we call MTP with prev_token_id
+                // = max_idx (the token main JUST produced) and position=step+1,
+                // so MTP predicts the token at step+2. The verify is then done
+                // at the NEXT iter by comparing that iter's main max_idx to the
+                // draft we saved here. mtp_pending_draft / _step persist across
+                // iters for that purpose.
+                if (mtp_loaded && step >= (int)prompt_ids.size() - 1 && getenv("MTP_ON")) {
+                    cudaError_t err_pre = cudaGetLastError();
+                    if (err_pre != cudaSuccess && mtp_total_count == 0)
+                        printf("[MTP] CUDA error BEFORE forward: %s\n", cudaGetErrorString(err_pre));
+                    bool draft_mode = getenv("MTP_DRAFT") != nullptr;
+                    int mtp_pred;
+                    if (draft_mode) {
+                        if (mtp_pending_draft_step == step && mtp_pending_draft >= 0) {
+                            if (mtp_pending_draft == max_idx) mtp_accept_count++;
+                            mtp_total_count++;
+                            if (mtp_total_count <= 3)
+                                printf("[MTP-DRAFT] verify step=%d main=%d draft=%d %s\n",
+                                       step, max_idx, mtp_pending_draft,
+                                       (mtp_pending_draft == max_idx) ? "ACCEPT" : "reject");
+                        }
+                        mtp_pred = mtp.forward(norm_buf, max_idx, step + 1);
+                        mtp_pending_draft = mtp_pred;
+                        mtp_pending_draft_step = step + 1;
+                        cudaError_t err_post = cudaGetLastError();
+                        if (err_post != cudaSuccess)
+                            printf("[MTP-DRAFT] CUDA error step=%d: %s\n", step, cudaGetErrorString(err_post));
+                        cudaSetDevice(last_gpu);
+                    } else {
+                        mtp_pred = mtp.forward(norm_buf, token_id, step);
+                        cudaError_t err_post = cudaGetLastError();
+                        if (err_post != cudaSuccess && mtp_total_count < 3)
+                            printf("[MTP] CUDA error AFTER forward step=%d: %s\n", step, cudaGetErrorString(err_post));
+                        if (mtp_total_count < 3)
+                            printf("[MTP] step=%d token_id=%d main=%d mtp=%d\n", step, token_id, max_idx, mtp_pred);
+                        if (mtp_pred == max_idx) mtp_accept_count++;
+                        mtp_total_count++;
+                        cudaSetDevice(last_gpu);
+                    }
+                }
+
                 if (step >= (int)prompt_ids.size()) {
                     if (!got_first_tok) { t_first = std::chrono::high_resolution_clock::now(); got_first_tok = true; }
                     generated.push_back(max_idx);
@@ -681,6 +796,133 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         std::string tail = tok.decode(std::vector<int>(generated.end()-4, generated.end()));
                         if (tail.find("</tool_call>") != std::string::npos) break;
                     }
+
+                    // ===================== MTP_SPEC speculative decoding =====================
+                    // After main has produced max_idx (= t_{step+1}) and we hold h[step] in
+                    // norm_buf, draft t_{step+2} via MTP, then run a batched main forward at
+                    // [step+1, step+2] with inputs [max_idx, mtp_draft] using the N=2 batched
+                    // MLP path. Accept the draft if main's verify (logit at step+1) matches.
+                    if (spec_enabled) {
+                        // 1. MTP draft
+                        int mtp_draft = mtp.forward(norm_buf, max_idx, step + 1);
+                        cudaSetDevice(last_gpu);
+
+                        // 2. Embed both tokens onto GPU 0
+                        cudaSetDevice(0);
+                        if (embd_t->type == GGML_TYPE_Q8_0) {
+                            dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0],   max_idx,   H);
+                            dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half_b[0], mtp_draft, H);
+                        } else if (embd_t->type == GGML_TYPE_Q5_K) {
+                            dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0],   max_idx,   H);
+                            dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half_b[0], mtp_draft, H);
+                        } else if (embd_t->type == GGML_TYPE_Q6_K) {
+                            dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0],   max_idx,   H);
+                            dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half_b[0], mtp_draft, H);
+                        }
+                        half_to_float_kernel<<<(H+255)/256, 256>>>(gpu_hidden_half[0],   gpu_hidden[0],   H);
+                        half_to_float_kernel<<<(H+255)/256, 256>>>(gpu_hidden_half_b[0], gpu_hidden_b[0], H);
+
+                        // 3. Run all 64 layers in N=2 batched mode
+                        float* h_a = gpu_hidden[0];
+                        float* h_b = gpu_hidden_b[0];
+                        for (int layer = 0; layer < model.cfg.num_layers; layer++) {
+                            int g_l = gpu_model.layer_gpu[layer];
+                            int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
+                            if (g_l != prev_g) {
+                                cudaSetDevice(prev_g);
+                                cudaMemcpy(host_transfer,   h_a, H * sizeof(float), cudaMemcpyDeviceToHost);
+                                cudaMemcpy(host_transfer_b, h_b, H * sizeof(float), cudaMemcpyDeviceToHost);
+                                cudaSetDevice(g_l);
+                                cudaMemcpy(gpu_hidden[g_l],   host_transfer,   H * sizeof(float), cudaMemcpyHostToDevice);
+                                cudaMemcpy(gpu_hidden_b[g_l], host_transfer_b, H * sizeof(float), cudaMemcpyHostToDevice);
+                                h_a = gpu_hidden[g_l];
+                                h_b = gpu_hidden_b[g_l];
+                            } else {
+                                cudaSetDevice(g_l);
+                            }
+                            if (model.is_attn_layer(layer))
+                                model.forward_attn_n2(layer, h_a, h_b, step + 1, step + 2, 0);
+                            else
+                                model.forward_gdn_n2(layer, h_a, h_b, 0);
+                            model.forward_mlp_n2(layer, h_a, h_b, 0);
+                        }
+
+                        // 4. Output norm + lm_head for both
+                        cudaSetDevice(last_gpu);
+                        cudaDeviceSynchronize();
+                        float_to_half_kernel<<<(H+255)/256, 256>>>(h_a, gpu_hidden_half[last_gpu],   H);
+                        float_to_half_kernel<<<(H+255)/256, 256>>>(h_b, gpu_hidden_half_b[last_gpu], H);
+                        if (out_norm_t->type == GGML_TYPE_F32) {
+                            rms_norm_f32w(norm_buf,   gpu_hidden_half[last_gpu],   (float*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
+                            rms_norm_f32w(norm_buf_b, gpu_hidden_half_b[last_gpu], (float*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
+                        } else {
+                            rms_norm(norm_buf,   gpu_hidden_half[last_gpu],   (half*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
+                            rms_norm(norm_buf_b, gpu_hidden_half_b[last_gpu], (half*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
+                        }
+                        qi_logits.quantize(norm_buf,     H, 0);
+                        qi_logits_b.quantize(norm_buf_b, H, 0);
+                        quant_gemv(out_w->data, out_w->type, norm_buf,   logits_buf,   H, V, &qi_logits);
+                        quant_gemv(out_w->data, out_w->type, norm_buf_b, logits_buf_b, H, V, &qi_logits_b);
+
+                        // 5. Argmax both
+                        argmax_half_kernel<<<1, 1024>>>(logits_buf,   V, d_argmax);
+                        argmax_half_kernel<<<1, 1024>>>(logits_buf_b, V, d_argmax_b);
+                        cudaMemcpy(h_argmax_pinned,   d_argmax,   sizeof(int), cudaMemcpyDeviceToHost);
+                        cudaMemcpy(h_argmax_pinned_b, d_argmax_b, sizeof(int), cudaMemcpyDeviceToHost);
+                        int max_idx_a = h_argmax_pinned[0];   // verify of mtp_draft (= main's pred at step+2)
+                        int max_idx_b = h_argmax_pinned_b[0]; // provisional t_{step+3}
+
+                        bool spec_accept = (max_idx_a == mtp_draft);
+                        if (spec_total_count < 3)
+                            printf("[SPEC] step=%d main=%d draft=%d verify=%d %s prov=%d\n",
+                                   step, max_idx, mtp_draft, max_idx_a,
+                                   spec_accept ? "ACCEPT" : "reject", max_idx_b);
+                        spec_total_count++;
+                        if (spec_accept) spec_accept_count++;
+
+                        if (spec_accept) {
+                            // Append the accepted draft + the provisional next token.
+                            generated.push_back(mtp_draft);   // = t_{step+2}
+                            if (mtp_draft == 248068) in_think = true;
+                            if (mtp_draft == 248069) in_think = false;
+                            if (!in_think) output_tokens++;
+                            bool stop_now = false;
+                            if (mtp_draft == 248046 || mtp_draft == 248044 || mtp_draft == 248045) stop_now = true;
+
+                            if (!stop_now && output_tokens < max_gen) {
+                                generated.push_back(max_idx_b);   // = t_{step+3}
+                                if (max_idx_b == 248068) in_think = true;
+                                if (max_idx_b == 248069) in_think = false;
+                                if (!in_think) output_tokens++;
+                                if (max_idx_b == 248046 || max_idx_b == 248044 || max_idx_b == 248045) stop_now = true;
+                            }
+                            if (stop_now || output_tokens >= max_gen) break;
+                            // Skip outer loop iters at step+1 and step+2 (we processed them
+                            // via the batched verify). norm_buf gets re-derived next iter
+                            // from main's forward at the new step.
+                            step += 2;
+                        } else {
+                            // Reject: keep main's verify (max_idx_a = t_{step+2}_main).
+                            generated.push_back(max_idx_a);
+                            if (max_idx_a == 248068) in_think = true;
+                            if (max_idx_a == 248069) in_think = false;
+                            if (!in_think) output_tokens++;
+                            if (max_idx_a == 248046 || max_idx_a == 248044 || max_idx_a == 248045) break;
+                            if (output_tokens >= max_gen) break;
+                            // Rollback GDN past the second (rejected) token. The snapshot
+                            // was taken inside forward_gdn_n2 right after the first token's
+                            // GDN update, so restoring brings state to "post-(step+1)".
+                            model.restore_gdn_states(0);
+                            // KV[step+2] in main's attention cache is wrong but will be
+                            // overwritten when next iter's main runs at step+2. No explicit
+                            // KV rollback needed (positional addressing).
+                            // Skip outer loop iter at step+1 (we processed it correctly via
+                            // the verify).
+                            step += 1;
+                            // norm_buf now needs to be h[step+1] = norm_buf (the verify path's
+                            // hidden), which is already in norm_buf. Done.
+                        }
+                    }
                 } else {
                     generated.push_back(max_idx);
                 }
@@ -694,6 +936,17 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         printf("[API] prefill %zu tok %.1fs | gen %d tok %.1f t/s (%.1fs)\n",
                prompt_ids.size(), prefill_ms / 1000.0,
                gen_count, gen_count > 1 ? (gen_count - 1) * 1000.0 / gen_ms : 0, gen_ms / 1000.0);
+        if (mtp_loaded && mtp_total_count > 0) {
+            printf("[MTP] accept %lld / %lld = %.1f%%\n",
+                   mtp_accept_count, mtp_total_count,
+                   100.0 * mtp_accept_count / mtp_total_count);
+        }
+        if (spec_enabled && spec_total_count > 0) {
+            printf("[SPEC] accept %lld / %lld = %.1f%%  (per-iter avg tokens %.2f)\n",
+                   spec_accept_count, spec_total_count,
+                   100.0 * spec_accept_count / spec_total_count,
+                   1.0 + (double)spec_accept_count / spec_total_count);
+        }
 
         return tok.decode(generated);
     };
@@ -771,6 +1024,13 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     std::vector<half> h_logits(V);
                     cudaMemcpy(h_logits.data(), logits_buf, V * sizeof(half), cudaMemcpyDeviceToHost);
                     max_idx = sampler.sample(h_logits.data(), V, ctx);
+                }
+
+                // Phase 0 MTP measurement (streaming generate path).
+                if (mtp_loaded && step >= (int)prompt_ids.size() - 1) {
+                    int mtp_pred = mtp.forward(norm_buf, token_id, step);
+                    if (mtp_pred == max_idx) mtp_accept_count++;
+                    mtp_total_count++;
                 }
 
                 generated.push_back(max_idx);
