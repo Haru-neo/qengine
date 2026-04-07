@@ -254,8 +254,15 @@ inline void quant_gemv(void* weight,ggml_type type,half* input,half* output,int 
                        QuantInput* qi=nullptr,cudaStream_t stream=0){
     // 128 threads for better occupancy with K=5120
     int threads = 128;
+    // When qi is provided we ASSUME the caller has already called
+    // qi->quantize(input, K, stream) — every call site in model.cuh,
+    // gemma_model.cuh, and main.cu does this immediately before its first
+    // quant_gemv call and reuses the same q8_buf for all subsequent GEMVs
+    // that share the same input. The previous version called qi->quantize
+    // here too which was redundant work (4× per GDN layer, etc.). Speedup
+    // is small in single-token generation (well under noise on 27B) but the
+    // change is correct and removes wasted launches.
     if(qi&&(type==GGML_TYPE_Q5_K||type==GGML_TYPE_Q6_K||type==GGML_TYPE_Q8_0)){
-        qi->quantize(input,K,stream);
         if(type==GGML_TYPE_Q5_K)      gemv_q5_K_q8<<<N,threads,0,stream>>>(weight,qi->q8_buf,output,K,N);
         else if(type==GGML_TYPE_Q6_K) gemv_q6_K_q8<<<N,threads,0,stream>>>(weight,qi->q8_buf,output,K,N);
         else                          gemv_q8_0_q8<<<N,threads,0,stream>>>(weight,qi->q8_buf,output,K,N);
