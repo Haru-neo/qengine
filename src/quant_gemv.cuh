@@ -202,20 +202,23 @@ __global__ void gemv_q8_0_q8(
         float d_w = __half2float(wb->d);
         float d_x = __half2float(xb->ds.x);
 
-        // Weight qs (unaligned): pack 4 bytes at a time via byte load.
-        // The compiler will fuse adjacent uint8 loads into wider loads where
-        // legal. Treat the int8_t bytes as signed for sign-extension correctness.
-        const int8_t* wp = wb->qs;
+        // wb->qs is 2-byte aligned (offset 2 from wb base, wb itself is 2-byte
+        // aligned). On Volta sm70 ld.global.u32 requires 4-byte alignment so
+        // we can't read whole ints, but ld.global.u16 only needs 2-byte align,
+        // which is half the memory transactions of byte-by-byte loads.
+        const uint16_t* wp16 = (const uint16_t*)wb->qs;
         const int* x_qs = (const int*)xb->qs;  // 4-byte aligned (half2 prefix)
 
         int isum = 0;
         #pragma unroll
         for (int j = 0; j < 8; j++) {
-            // Pack 4 signed bytes into one 32-bit int (little-endian).
-            int wq = (int)((uint8_t)wp[4*j+0])
-                   | ((int)((uint8_t)wp[4*j+1]) << 8)
-                   | ((int)((uint8_t)wp[4*j+2]) << 16)
-                   | ((int)((uint8_t)wp[4*j+3]) << 24);
+            // Two u16 loads → assemble little-endian 32-bit word for dp4a.
+            // dp4a interprets the 4 bytes as signed int8 — sign bits land
+            // in bits 7/15/23/31, which is exactly where the int8 sign bits
+            // sit when packed little-endian.
+            int w_lo = wp16[2*j+0];
+            int w_hi = wp16[2*j+1];
+            int wq = w_lo | (w_hi << 16);
             isum = __dp4a(wq, x_qs[j], isum);
         }
         thread_sum += d_w * d_x * (float)isum;
