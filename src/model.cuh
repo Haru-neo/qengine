@@ -214,10 +214,14 @@ struct QwenModel {
     }
     
     // Attention forward (seq_len=1, token generation)
-    // ============ FP32 KV Cache (precision for long contexts) ============
+    // ============ FP16 KV Cache (memory + speed) ============
+    // Precision is recovered by the attn_score_kernel cross-warp fix +
+    // FP32 attention compute (accumulators, softmax). The cache itself
+    // can stay fp16: the K/V tensors come straight from fp16 head_norm
+    // outputs and storing them in fp16 has no extra cast loss.
     struct KVCache {
-        float* k;  // [max_seq, num_kv * head_dim]
-        float* v;  // [max_seq, num_kv * head_dim]
+        half* k;  // [max_seq, num_kv * head_dim]
+        half* v;  // [max_seq, num_kv * head_dim]
     };
     std::unordered_map<int, KVCache> kv_caches;
     int kv_max_seq = 0;
@@ -226,7 +230,7 @@ struct QwenModel {
         kv_max_seq = max_seq;
         int num_kv = cfg.num_kv_heads;
         int hd = cfg.head_dim;
-        int kv_size = max_seq * num_kv * hd * sizeof(float);
+        int kv_size = max_seq * num_kv * hd * sizeof(half);
 
         for (int layer = 0; layer < cfg.num_layers; layer++) {
             if (!is_attn_layer(layer)) continue;
@@ -239,7 +243,7 @@ struct QwenModel {
             cudaMemset(kv.v, 0, kv_size);
             kv_caches[layer] = kv;
         }
-        printf("KV cache (FP32): %d layers, %d max_seq, %.1f MB total\n",
+        printf("KV cache (FP16): %d layers, %d max_seq, %.1f MB total\n",
             (int)kv_caches.size(), max_seq,
             (float)kv_caches.size() * kv_size * 2 / 1e6);
     }
@@ -247,7 +251,7 @@ struct QwenModel {
     void reset_kv_cache() {
         int num_kv = cfg.num_kv_heads;
         int hd = cfg.head_dim;
-        int kv_size = kv_max_seq * num_kv * hd * sizeof(float);
+        int kv_size = kv_max_seq * num_kv * hd * sizeof(half);
         for (auto& [layer, kv] : kv_caches) {
             int g = gpu->layer_gpu[layer];
             cudaSetDevice(g);
@@ -324,15 +328,17 @@ struct QwenModel {
         apply_rope_kernel<<<(num_kv * half_rope + 255)/256, 256, 0, stream>>>(
             ab.k_proj, sin_pos, cos_pos, num_kv, hd, rope_dim);
 
-        // 6. Store K, V into FP32 cache at position pos (convert from fp16)
-        float* k_cache_pos = kv.k + (size_t)pos * kv_dim;
-        float* v_cache_pos = kv.v + (size_t)pos * kv_dim;
-        store_kv_fp32_kernel<<<(kv_dim+255)/256, 256, 0, stream>>>(ab.k_proj, k_cache_pos, kv_dim);
-        store_kv_fp32_kernel<<<(kv_dim+255)/256, 256, 0, stream>>>(ab.v_proj, v_cache_pos, kv_dim);
+        // 6. Store K, V into FP16 cache at position pos
+        half* k_cache_pos = kv.k + (size_t)pos * kv_dim;
+        half* v_cache_pos = kv.v + (size_t)pos * kv_dim;
+        cudaMemcpyAsync(k_cache_pos, ab.k_proj, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(v_cache_pos, ab.v_proj, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
 
         // 7. Attention: Q[num_q, hd] @ K_cache[seq_len, num_kv, hd]^T → scores → softmax → @ V
+        // FP16 KV cache variant — uses attn_score_kernel_h / attn_value_kernel_h
+        // Both have the cross-warp reduction fix.
         dim3 score_grid(num_q, seq_len);
-        attn_score_kernel<<<score_grid, min(hd, 256), 0, stream>>>(
+        attn_score_kernel_h<<<score_grid, min(hd, 256), 0, stream>>>(
             q_buf, kv.k, ab.attn_scores,
             num_q, num_kv, hd, seq_len, scale);
 
@@ -341,8 +347,8 @@ struct QwenModel {
         softmax_kernel<<<num_q, st, st * sizeof(float), stream>>>(
             ab.attn_scores, num_q, seq_len); }
 
-        // Weighted sum of V
-        attn_value_kernel<<<num_q, min(hd, 256), 0, stream>>>(
+        // Weighted sum of V (fp16 V cache)
+        attn_value_kernel_h<<<num_q, min(hd, 256), 0, stream>>>(
             ab.attn_scores, kv.v, q_buf,
             num_q, num_kv, hd, seq_len);
 
@@ -365,7 +371,7 @@ struct QwenModel {
     
     struct GDNState {
         float* conv_state;    // [qkv_dim, 4] FP32
-        double* rec_state;    // [num_v_heads, k_dim, v_dim] FP64
+        float* rec_state;    // [num_v_heads, k_dim, v_dim] FP32 (Volta has 1:32 fp64)
     };
     std::vector<GDNState> gdn_states;
     
@@ -411,8 +417,8 @@ struct QwenModel {
             cudaSetDevice(g);
             cudaMalloc(&gdn_states[layer].conv_state, qkv_dim * 4 * sizeof(float));
             cudaMemset(gdn_states[layer].conv_state, 0, qkv_dim * 4 * sizeof(float));
-            cudaMalloc(&gdn_states[layer].rec_state, num_v * k_dim * v_dim * sizeof(double));
-            cudaMemset(gdn_states[layer].rec_state, 0, num_v * k_dim * v_dim * sizeof(double));
+            cudaMalloc(&gdn_states[layer].rec_state, num_v * k_dim * v_dim * sizeof(float));
+            cudaMemset(gdn_states[layer].rec_state, 0, num_v * k_dim * v_dim * sizeof(float));
         }
         printf("GDN states allocated for %d layers\n", cfg.num_layers);
     }
@@ -433,7 +439,7 @@ struct QwenModel {
             int k_dim = cfg.linear_k_dim;
             int v_dim = cfg.linear_v_dim;
             cudaMemset(gdn_states[layer].conv_state, 0, qkv_dim * 4 * sizeof(float));
-            cudaMemset(gdn_states[layer].rec_state, 0, num_v * k_dim * v_dim * sizeof(double));
+            cudaMemset(gdn_states[layer].rec_state, 0, num_v * k_dim * v_dim * sizeof(float));
         }
     }
     

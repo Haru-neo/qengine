@@ -81,7 +81,7 @@ __global__ void gdn_recurrent_step(
     const float* __restrict__ dt_bias,
     const half* __restrict__ a_proj,
     const half* __restrict__ b_proj,
-    double* __restrict__ rec_state,  // FP64 state for precision
+    float* __restrict__ rec_state,   // FP32 state (Volta has 1:32 fp64 throughput)
     half* __restrict__ core_out,
     int num_k, int num_v, int k_dim, int v_dim
 ) {
@@ -125,32 +125,32 @@ __global__ void gdn_recurrent_step(
 
     float attn_score = sQ[k_dim];
 
-    // 2. Compute gate and beta in FP64
-    double alpha = (double)__half2float(a_proj[head]);
-    double dt = (double)dt_bias[head];
-    double ssm_a_val = (double)a_log[head];
-    double g_log = ssm_a_val * log(1.0 + exp(alpha + dt));
-    double g = exp(fmin(g_log, 50.0));
-    double beta = 1.0 / (1.0 + exp(-(double)__half2float(b_proj[head])));
+    // 2. Compute gate and beta in FP32
+    float alpha = __half2float(a_proj[head]);
+    float dt = dt_bias[head];
+    float ssm_a_val = a_log[head];
+    float g_log = ssm_a_val * logf(1.0f + expf(alpha + dt));
+    float g = expf(fminf(g_log, 50.0f));
+    float beta = 1.0f / (1.0f + expf(-__half2float(b_proj[head])));
 
-    double* state = rec_state + head * k_dim * v_dim;
+    float* state = rec_state + head * k_dim * v_dim;
 
-    // 3. State update in FP64
+    // 3. State update in FP32
     for (int vi = threadIdx.x; vi < v_dim; vi += blockDim.x) {
-        double sum1 = 0.0, sum2 = 0.0;
+        float sum1 = 0.0f, sum2 = 0.0f;
         for (int kd = 0; kd < k_dim; kd++) {
-            double s = state[kd * v_dim + vi];
-            sum1 += s * (double)sK[kd];
-            sum2 += s * (double)sQ[kd];
+            float s = state[kd * v_dim + vi];
+            sum1 += s * sK[kd];
+            sum2 += s * sQ[kd];
         }
-        double sv_new = beta * ((double)v_raw[vi] - sum1 * g);
-        double out_val = sum2 * g + sv_new * (double)attn_score;
-        core_out[head * v_dim + vi] = __float2half((float)out_val);
+        float sv_new = beta * (v_raw[vi] - sum1 * g);
+        float out_val = sum2 * g + sv_new * attn_score;
+        core_out[head * v_dim + vi] = __float2half(out_val);
 
         for (int kd = 0; kd < k_dim; kd++) {
-            double s_new = g * state[kd * v_dim + vi] + sv_new * (double)sK[kd];
-            if (s_new > 1e6) s_new = 1e6;
-            else if (s_new < -1e6) s_new = -1e6;
+            float s_new = g * state[kd * v_dim + vi] + sv_new * sK[kd];
+            if (s_new > 1e6f) s_new = 1e6f;
+            else if (s_new < -1e6f) s_new = -1e6f;
             state[kd * v_dim + vi] = s_new;
         }
     }
@@ -277,7 +277,7 @@ __global__ void gdn_chunk_step(
     const float* __restrict__ dt_bias,    // [num_v]
     const half* __restrict__ chunk_a,     // [N, num_v]
     const half* __restrict__ chunk_b,     // [N, num_v]
-    double* __restrict__ rec_state,       // FP64 state, updated in-place
+    float* __restrict__ rec_state,        // FP32 state, updated in-place
     half* __restrict__ chunk_out,         // [N, num_v * v_dim]
     int n_tokens,
     int num_k, int num_v, int k_dim, int v_dim
@@ -293,7 +293,7 @@ __global__ void gdn_chunk_step(
     float* sQ = smem;             // [k_dim+1] q_norm scaled, last slot = attn_score
     float* sK = smem + k_dim + 1; // [k_dim] k_norm
 
-    double* state = rec_state + head * k_dim * v_dim;
+    float* state = rec_state + head * k_dim * v_dim;
 
     for (int t = 0; t < n_tokens; t++) {
         const float* qkv = chunk_qkv + (size_t)t * qkv_dim;
@@ -330,30 +330,30 @@ __global__ void gdn_chunk_step(
 
         float attn_score = sQ[k_dim];
 
-        // Gate and beta in FP64
-        double alpha = (double)__half2float(a_proj[head]);
-        double dt = (double)dt_bias[head];
-        double ssm_a_val = (double)a_log[head];
-        double g_log = ssm_a_val * log(1.0 + exp(alpha + dt));
-        double g = exp(fmin(g_log, 50.0));
-        double beta = 1.0 / (1.0 + exp(-(double)__half2float(b_proj[head])));
+        // Gate and beta in FP32 (Volta has 1:32 fp64 throughput)
+        float alpha = __half2float(a_proj[head]);
+        float dt = dt_bias[head];
+        float ssm_a_val = a_log[head];
+        float g_log = ssm_a_val * logf(1.0f + expf(alpha + dt));
+        float g = expf(fminf(g_log, 50.0f));
+        float beta = 1.0f / (1.0f + expf(-__half2float(b_proj[head])));
 
         // Per-v state update + output
         for (int vi = threadIdx.x; vi < v_dim; vi += blockDim.x) {
-            double sum1 = 0.0, sum2 = 0.0;
+            float sum1 = 0.0f, sum2 = 0.0f;
             for (int kd = 0; kd < k_dim; kd++) {
-                double s = state[kd * v_dim + vi];
-                sum1 += s * (double)sK[kd];
-                sum2 += s * (double)sQ[kd];
+                float s = state[kd * v_dim + vi];
+                sum1 += s * sK[kd];
+                sum2 += s * sQ[kd];
             }
-            double sv_new = beta * ((double)v_raw[vi] - sum1 * g);
-            double out_val = sum2 * g + sv_new * (double)attn_score;
-            chunk_out[(size_t)t * v_total + head * v_dim + vi] = __float2half((float)out_val);
+            float sv_new = beta * (v_raw[vi] - sum1 * g);
+            float out_val = sum2 * g + sv_new * attn_score;
+            chunk_out[(size_t)t * v_total + head * v_dim + vi] = __float2half(out_val);
 
             for (int kd = 0; kd < k_dim; kd++) {
-                double s_new = g * state[kd * v_dim + vi] + sv_new * (double)sK[kd];
-                if (s_new > 1e6) s_new = 1e6;
-                else if (s_new < -1e6) s_new = -1e6;
+                float s_new = g * state[kd * v_dim + vi] + sv_new * sK[kd];
+                if (s_new > 1e6f) s_new = 1e6f;
+                else if (s_new < -1e6f) s_new = -1e6f;
                 state[kd * v_dim + vi] = s_new;
             }
         }
