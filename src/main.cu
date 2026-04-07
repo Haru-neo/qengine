@@ -497,13 +497,13 @@ int run_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, const SamplingPara
 
 // ============ Qwen serve mode: OpenAI-compatible HTTP API ============
 
-int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const Tokenizer& tok, const std::string& model_name, const std::string& api_key = "") {
+int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const Tokenizer& tok, const std::string& model_name, const std::string& api_key = "", int max_seq = 4096) {
     QwenModel model;
     model.gpu = &gpu_model;
     model.init_config(gguf);
     model.alloc_buffers();
     model.init_gdn_states();
-    model.init_attention(4096);
+    model.init_attention(max_seq);
 
     int H = model.cfg.hidden_size;
     int V = model.cfg.vocab_size;
@@ -961,6 +961,7 @@ int main(int argc, char** argv) {
     // Parse sampling params and flags
     SamplingParams sp;
     int serve_port = 0;
+    int max_seq = 4096;
     std::string prompt_text, api_key;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--serve") == 0 && i + 1 < argc) {
@@ -969,6 +970,10 @@ int main(int argc, char** argv) {
             prompt_text = argv[++i];
         } else if (strcmp(argv[i], "--api-key") == 0 && i + 1 < argc) {
             api_key = argv[++i];
+        } else if (strcmp(argv[i], "--max-seq") == 0 && i + 1 < argc) {
+            max_seq = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+            max_seq = atoi(argv[++i]);
         }
     }
     int tok_start = parse_sampling_args(argc, argv, sp);
@@ -1008,7 +1013,7 @@ int main(int argc, char** argv) {
       size_t d = model_name.find(".gguf"); if (d != std::string::npos) model_name = model_name.substr(0, d); }
 
     if (serve_port > 0 && arch == "qwen35") {
-        ret = serve_qwen(gguf, gpu_model, n_gpus, serve_port, tokenizer, model_name, api_key);
+        ret = serve_qwen(gguf, gpu_model, n_gpus, serve_port, tokenizer, model_name, api_key, max_seq);
     } else if (serve_port > 0) {
         ret = serve_gemma(gguf, gpu_model, n_gpus, serve_port);
     } else if (chat_mode && arch == "qwen35") {
