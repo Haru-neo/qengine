@@ -527,12 +527,14 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     cudaSetDevice(last_gpu);
     half* logits_buf; cudaMalloc(&logits_buf, V * sizeof(half));
     half* norm_buf; cudaMalloc(&norm_buf, H * sizeof(half));
+    float* norm_buf_f32; cudaMalloc(&norm_buf_f32, H * sizeof(float));
+    float* logits_buf_f32; cudaMalloc(&logits_buf_f32, V * sizeof(float));
     float* host_transfer; cudaMallocHost(&host_transfer, H * sizeof(float));
     float* host_chunk_transfer; cudaMallocHost(&host_chunk_transfer, CHUNK_SIZE * H * sizeof(float));
     QuantInput qi_logits;
 
     SamplingParams sp;
-    sp.rep_penalty = 1.1f;
+    sp.rep_penalty = 1.0f;  // match llama.cpp default; users can set via request
     Sampler sampler;
     sampler.init(sp, V);
 
@@ -627,18 +629,19 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
 
             if (step >= (int)prompt_ids.size() - 1) {
                 cudaSetDevice(last_gpu); cudaDeviceSynchronize();
-                // Convert fp32 hidden to fp16 for output norm + projection
-                float_to_half_kernel<<<(H+255)/256, 256>>>(h, gpu_hidden_half[last_gpu], H);
+                // FP32 path: hidden_fp32 → RMSNorm → fp32 → output_projection → fp32 logits
                 if (out_norm_t->type == GGML_TYPE_F32)
-                    rms_norm_f32w(norm_buf, gpu_hidden_half[last_gpu], (float*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
+                    rms_norm_f32_full(norm_buf_f32, h, (float*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
                 else
-                    rms_norm(norm_buf, gpu_hidden_half[last_gpu], (half*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
-                qi_logits.quantize(norm_buf, H, 0);
-                quant_gemv(out_w->data, out_w->type, norm_buf, logits_buf, H, V, &qi_logits);
+                    rms_norm_f32_full_h_w(norm_buf_f32, h, (half*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
+                quant_gemv_f32(out_w->data, out_w->type, norm_buf_f32, logits_buf_f32, H, V, &qi_logits);
                 cudaDeviceSynchronize();
 
+                std::vector<float> h_logits_f32(V);
+                cudaMemcpy(h_logits_f32.data(), logits_buf_f32, V * sizeof(float), cudaMemcpyDeviceToHost);
+                // Cast to half for sampler (sampler API uses half*)
                 std::vector<half> h_logits(V);
-                cudaMemcpy(h_logits.data(), logits_buf, V * sizeof(half), cudaMemcpyDeviceToHost);
+                for (int i = 0; i < V; i++) h_logits[i] = __float2half(h_logits_f32[i]);
 
                 std::vector<int> ctx = prompt_ids;
                 ctx.insert(ctx.end(), generated.begin(), generated.end());

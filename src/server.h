@@ -543,6 +543,9 @@ struct HttpServer {
             if (freq_pen > -999.0f) sampling_params->freq_penalty = freq_pen;
             float pres_pen = json_get_float(body, "presence_penalty", -999.0f);
             if (pres_pen > -999.0f) sampling_params->pres_penalty = pres_pen;
+            // OpenAI doesn't have repetition_penalty but vLLM/llama.cpp accept it
+            float rep_pen = json_get_float(body, "repetition_penalty", -1.0f);
+            if (rep_pen > 0.0f) sampling_params->rep_penalty = rep_pen;
         }
 
         if (messages.empty()) {

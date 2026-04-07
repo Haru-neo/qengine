@@ -75,19 +75,47 @@ __global__ void apply_rope_kernel(
     int half_rope = rope_dim / 2;
     int total = num_heads * half_rope;
     if (idx >= total) return;
-    
+
     int head = idx / half_rope;
     int i = idx % half_rope;
-    
+
     half* base = x + head * head_dim;
     float x0 = __half2float(base[i]);
     float x1 = __half2float(base[i + half_rope]);
-    
+
     float s = sin_t[i];
     float c = cos_t[i];
-    
+
     base[i]             = __float2half(x0 * c - x1 * s);
     base[i + half_rope] = __float2half(x1 * c + x0 * s);
+}
+
+// FP32 variant
+__global__ void apply_rope_kernel_f32(
+    float* __restrict__ x,
+    const float* __restrict__ sin_t,
+    const float* __restrict__ cos_t,
+    int num_heads,
+    int head_dim,
+    int rope_dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int half_rope = rope_dim / 2;
+    int total = num_heads * half_rope;
+    if (idx >= total) return;
+
+    int head = idx / half_rope;
+    int i = idx % half_rope;
+
+    float* base = x + head * head_dim;
+    float x0 = base[i];
+    float x1 = base[i + half_rope];
+
+    float s = sin_t[i];
+    float c = cos_t[i];
+
+    base[i]             = x0 * c - x1 * s;
+    base[i + half_rope] = x1 * c + x0 * s;
 }
 
 // ============ Head-wise RMSNorm ============
@@ -102,9 +130,9 @@ __global__ void head_rms_norm_kernel(
 ) {
     int head = blockIdx.x;
     if (head >= num_heads) return;
-    
+
     half* xh = x + head * head_dim;
-    
+
     extern __shared__ float sdata[];
     float sum = 0.0f;
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
@@ -118,9 +146,40 @@ __global__ void head_rms_norm_kernel(
         __syncthreads();
     }
     float rms = rsqrtf(sdata[0] / head_dim + eps);
-    
+
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
         xh[i] = __float2half(__half2float(xh[i]) * rms * weight[i]);
+}
+
+// FP32 variant
+__global__ void head_rms_norm_kernel_f32(
+    float* __restrict__ x,
+    const float* __restrict__ weight,
+    int num_heads,
+    int head_dim,
+    float eps
+) {
+    int head = blockIdx.x;
+    if (head >= num_heads) return;
+
+    float* xh = x + head * head_dim;
+
+    extern __shared__ float sdata[];
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float v = xh[i];
+        sum += v * v;
+    }
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float rms = rsqrtf(sdata[0] / head_dim + eps);
+
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
+        xh[i] = xh[i] * rms * weight[i];
 }
 
 // ============ Attention Score (single query vs cached keys) ============
@@ -137,6 +196,16 @@ __global__ void store_kv_fp32_kernel(
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) dst[idx] = __half2float(src[idx]);
+}
+
+// FP32→FP32 store (no-op type-wise; just copy)
+__global__ void store_kv_f32_f32_kernel(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = src[idx];
 }
 
 __global__ void attn_score_kernel(
@@ -164,6 +233,37 @@ __global__ void attn_score_kernel(
         sum += __half2float(qh[i]) * kh[i];
 
     // Warp reduce
+    for (int off = 16; off > 0; off >>= 1)
+        sum += __shfl_xor_sync(0xffffffff, sum, off);
+
+    if (threadIdx.x == 0)
+        scores[q_head * seq_len + pos] = sum * scale;
+}
+
+// FP32 Q variant
+__global__ void attn_score_kernel_f32(
+    const float* __restrict__ q,
+    const float* __restrict__ k_cache,
+    float* __restrict__ scores,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    float scale
+) {
+    int q_head = blockIdx.x;
+    int pos = blockIdx.y;
+    if (q_head >= num_q_heads || pos >= seq_len) return;
+
+    int kv_head = q_head / (num_q_heads / num_kv_heads);
+
+    const float* qh = q + q_head * head_dim;
+    const float* kh = k_cache + pos * num_kv_heads * head_dim + kv_head * head_dim;
+
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
+        sum += qh[i] * kh[i];
+
     for (int off = 16; off > 0; off >>= 1)
         sum += __shfl_xor_sync(0xffffffff, sum, off);
 
@@ -248,6 +348,31 @@ __global__ void attn_value_kernel(
     }
 }
 
+// FP32 output variant
+__global__ void attn_value_kernel_f32(
+    const float* __restrict__ scores,
+    const float* __restrict__ v_cache,
+    float* __restrict__ output,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len
+) {
+    int q_head = blockIdx.x;
+    if (q_head >= num_q_heads) return;
+
+    int kv_head = q_head / (num_q_heads / num_kv_heads);
+    const float* sc = scores + q_head * seq_len;
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float sum = 0.0f;
+        for (int pos = 0; pos < seq_len; pos++) {
+            sum += sc[pos] * v_cache[pos * num_kv_heads * head_dim + kv_head * head_dim + d];
+        }
+        output[q_head * head_dim + d] = sum;
+    }
+}
+
 // ============ Apply output gate: out *= sigmoid(gate) ============
 
 __global__ void apply_gate_sigmoid(
@@ -263,11 +388,39 @@ __global__ void apply_gate_sigmoid(
     output[idx] = __float2half(o * sig);
 }
 
+__global__ void apply_gate_sigmoid_f32(
+    float* __restrict__ output,
+    const float* __restrict__ gate,
+    int size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float o = output[idx];
+    float g = gate[idx];
+    float sig = 1.0f / (1.0f + expf(-g));
+    output[idx] = o * sig;
+}
+
 // Deinterleave Q+Gate: [h0_q(hd)|h0_g(hd)|h1_q(hd)|h1_g(hd)...] → q[N*hd], gate[N*hd]
 __global__ void deinterleave_qg_kernel(
     const half* __restrict__ src,   // [num_heads * head_dim * 2]
     half* __restrict__ q_out,       // [num_heads * head_dim]
     half* __restrict__ gate_out,    // [num_heads * head_dim]
+    int num_heads,
+    int head_dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_heads * head_dim) return;
+    int head = idx / head_dim;
+    int d = idx % head_dim;
+    q_out[idx]    = src[head * head_dim * 2 + d];
+    gate_out[idx] = src[head * head_dim * 2 + head_dim + d];
+}
+
+__global__ void deinterleave_qg_kernel_f32(
+    const float* __restrict__ src,
+    float* __restrict__ q_out,
+    float* __restrict__ gate_out,
     int num_heads,
     int head_dim
 ) {
