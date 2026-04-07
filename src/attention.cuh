@@ -232,12 +232,24 @@ __global__ void attn_score_kernel(
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
         sum += __half2float(qh[i]) * kh[i];
 
-    // Warp reduce
+    // Warp-level reduce
     for (int off = 16; off > 0; off >>= 1)
         sum += __shfl_xor_sync(0xffffffff, sum, off);
 
-    if (threadIdx.x == 0)
-        scores[q_head * seq_len + pos] = sum * scale;
+    // Cross-warp reduce via shared memory (BUG fix: was missing)
+    __shared__ float warp_sums[8];  // up to 8 warps for blockDim 256
+    int warp_id = threadIdx.x >> 5;
+    int lane_id = threadIdx.x & 31;
+    int n_warps = (blockDim.x + 31) >> 5;
+    if (lane_id == 0) warp_sums[warp_id] = sum;
+    __syncthreads();
+    if (warp_id == 0) {
+        sum = (lane_id < n_warps) ? warp_sums[lane_id] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1)
+            sum += __shfl_xor_sync(0xffffffff, sum, off);
+        if (lane_id == 0)
+            scores[q_head * seq_len + pos] = sum * scale;
+    }
 }
 
 // FP32 Q variant
@@ -264,11 +276,24 @@ __global__ void attn_score_kernel_f32(
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
         sum += qh[i] * kh[i];
 
+    // Warp-level reduce
     for (int off = 16; off > 0; off >>= 1)
         sum += __shfl_xor_sync(0xffffffff, sum, off);
 
-    if (threadIdx.x == 0)
-        scores[q_head * seq_len + pos] = sum * scale;
+    // Cross-warp reduce
+    __shared__ float warp_sums[8];
+    int warp_id = threadIdx.x >> 5;
+    int lane_id = threadIdx.x & 31;
+    int n_warps = (blockDim.x + 31) >> 5;
+    if (lane_id == 0) warp_sums[warp_id] = sum;
+    __syncthreads();
+    if (warp_id == 0) {
+        sum = (lane_id < n_warps) ? warp_sums[lane_id] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1)
+            sum += __shfl_xor_sync(0xffffffff, sum, off);
+        if (lane_id == 0)
+            scores[q_head * seq_len + pos] = sum * scale;
+    }
 }
 
 // ============ Softmax (per row) ============
