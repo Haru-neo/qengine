@@ -384,13 +384,15 @@ __global__ void dequant_embd_q6k_row_v2(
     out[idx] = __float2half(d * b->scales[is + quarter*2] * q);
 }
 
-// Q8_0: 32 elements per block, half scale + int8 quants
+// Q8_0: 32 elements per block, int8 quants + half scale
+// Layout matches block_q8_0_aligned in quant_gemv.cuh (qs first, then pad+d)
+// because gpu_loader.h repacks all on-disk Q8_0 tensors at load time.
 __global__ void dequant_embd_q8_0_row(
     const void* __restrict__ embd, half* __restrict__ out, int token_id, int H
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= H) return;
-    struct bq8_0 { half d; int8_t qs[32]; };
+    struct __align__(4) bq8_0 { int8_t qs[32]; uint16_t pad; half d; };
     int blocks_per_row = H / 32;
     const bq8_0* row = (const bq8_0*)embd + (size_t)token_id * blocks_per_row;
     int blk = idx / 32;

@@ -8,6 +8,7 @@
 #include <mutex>
 #include <atomic>
 #include "gguf.h"
+#include "quant_gemv.cuh"  // for q8_0_repack_kernel and block_q8_0_aligned
 
 struct GPUTensor {
     void* data = nullptr;
@@ -102,6 +103,31 @@ struct GPUModel {
                     break;
                 }
                 cudaMemcpyAsync(gt.data, ti->data, gt.byte_size, cudaMemcpyHostToDevice, stream);
+
+                // Q8_0 repack: convert GGUF {half d; int8_t qs[32]} (34 B) to
+                // GPU-resident block_q8_0_aligned {qs[32]; pad; d} (36 B) so the
+                // dp4a GEMV kernel can use 4-byte aligned int loads. Halves the
+                // weight memory transactions vs the u16-load fallback.
+                if (ti->type == GGML_TYPE_Q8_0) {
+                    int n_blocks = (int)(gt.byte_size / 34);
+                    size_t new_bytes = (size_t)n_blocks * 36;
+                    void* repacked = nullptr;
+                    cudaError_t err2 = cudaMalloc(&repacked, new_bytes);
+                    if (err2 != cudaSuccess) {
+                        fprintf(stderr, "GPU %d: q8_0 repack alloc failed for %s: %s\n",
+                            gpu_id, name.c_str(), cudaGetErrorString(err2));
+                        failed = true;
+                        break;
+                    }
+                    int rt = 256;
+                    int rb = (n_blocks + rt - 1) / rt;
+                    q8_0_repack_kernel<<<rb, rt, 0, stream>>>(gt.data, repacked, n_blocks);
+                    cudaStreamSynchronize(stream);
+                    cudaFree(gt.data);
+                    gt.data = repacked;
+                    gt.byte_size = new_bytes;
+                }
+
                 per_gpu_tensors[gpu_id][name] = gt;
                 local_bytes += gt.byte_size;
             }

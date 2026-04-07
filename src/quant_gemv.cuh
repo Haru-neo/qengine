@@ -8,8 +8,31 @@
 
 typedef struct { half d; half dmin; uint8_t scales[12]; uint8_t qh[32]; uint8_t qs[128]; } block_q5_K;
 typedef struct { uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; half d; } block_q6_K;
+// GGUF on-disk Q8_0 layout (34 bytes, qs at offset 2 — never 4-byte aligned).
+// Used only by the q8_0 repack kernel that converts to block_q8_0_aligned at
+// load time.
 typedef struct { half d; int8_t qs[32]; } block_q8_0_32;
+// GPU-resident Q8_0 layout: qs lives at offset 0 with 4-byte alignment so the
+// dp4a kernel can read 32-bit words directly. 36 bytes per block (vs 34 in
+// GGUF) — ~6% extra VRAM in exchange for halving weight memory transactions
+// in gemv_q8_0_q8.
+typedef struct __align__(4) { int8_t qs[32]; uint16_t pad; half d; } block_q8_0_aligned;
 typedef struct { half2 ds; int8_t qs[QK8]; } block_q8_1;
+
+// Repack a flat array of GGUF block_q8_0_32 (34 B each) into the GPU-resident
+// block_q8_0_aligned (36 B each). 1 thread per block. The src and dst buffers
+// MUST be different (the strides differ).
+__global__ void q8_0_repack_kernel(const void* __restrict__ src, void* __restrict__ dst, int n_blocks) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_blocks) return;
+    const block_q8_0_32* sb = (const block_q8_0_32*)src + idx;
+    block_q8_0_aligned* db = (block_q8_0_aligned*)dst + idx;
+    half d = sb->d;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) db->qs[i] = sb->qs[i];
+    db->d = d;
+    db->pad = 0;
+}
 
 __global__ void quantize_input_q8_1(const half* __restrict__ x, block_q8_1* __restrict__ out, int K) {
     int blk = blockIdx.x * blockDim.x + threadIdx.x;
@@ -163,7 +186,7 @@ __global__ void gemv_q6_K_q8(
 
 __global__ void gemv_q8_0(const void* __restrict__ w, const half* __restrict__ x, half* __restrict__ y, int K, int N) {
     int row=blockIdx.x; if(row>=N)return; int bpr=K/32;
-    const block_q8_0_32* wr=(const block_q8_0_32*)w+(size_t)row*bpr; float s=0.0f;
+    const block_q8_0_aligned* wr=(const block_q8_0_aligned*)w+(size_t)row*bpr; float s=0.0f;
     for(int b=threadIdx.x;b<bpr;b+=blockDim.x){float d=__half2float(wr[b].d),bs=0.0f;
     #pragma unroll
     for(int j=0;j<32;j++)bs+=(float)wr[b].qs[j]*__half2float(x[b*32+j]);s+=d*bs;}
@@ -193,33 +216,26 @@ __global__ void gemv_q8_0_q8(
     const int row = blockIdx.x;
     if (row >= N) return;
     const int bpr = K / 32;
-    const block_q8_0_32* w_row = (const block_q8_0_32*)weight + (size_t)row * bpr;
+    const block_q8_0_aligned* w_row = (const block_q8_0_aligned*)weight + (size_t)row * bpr;
 
     float thread_sum = 0.0f;
     for (int b = threadIdx.x; b < bpr; b += blockDim.x) {
-        const block_q8_0_32* wb = &w_row[b];
+        const block_q8_0_aligned* wb = &w_row[b];
         const block_q8_1* xb = &x_q8[b];
         float d_w = __half2float(wb->d);
         float d_x = __half2float(xb->ds.x);
 
-        // wb->qs is 2-byte aligned (offset 2 from wb base, wb itself is 2-byte
-        // aligned). On Volta sm70 ld.global.u32 requires 4-byte alignment so
-        // we can't read whole ints, but ld.global.u16 only needs 2-byte align,
-        // which is half the memory transactions of byte-by-byte loads.
-        const uint16_t* wp16 = (const uint16_t*)wb->qs;
+        // After the load-time repack to block_q8_0_aligned, qs sits at offset
+        // 0 of every block and the per-block stride (36 B) is divisible by 4,
+        // so wb->qs is 4-byte aligned and we can use ld.global.u32 directly —
+        // 8 int loads per block instead of 16 u16 loads or 32 byte loads.
+        const int* wp32 = (const int*)wb->qs;
         const int* x_qs = (const int*)xb->qs;  // 4-byte aligned (half2 prefix)
 
         int isum = 0;
         #pragma unroll
         for (int j = 0; j < 8; j++) {
-            // Two u16 loads → assemble little-endian 32-bit word for dp4a.
-            // dp4a interprets the 4 bytes as signed int8 — sign bits land
-            // in bits 7/15/23/31, which is exactly where the int8 sign bits
-            // sit when packed little-endian.
-            int w_lo = wp16[2*j+0];
-            int w_hi = wp16[2*j+1];
-            int wq = w_lo | (w_hi << 16);
-            isum = __dp4a(wq, x_qs[j], isum);
+            isum = __dp4a(wp32[j], x_qs[j], isum);
         }
         thread_sum += d_w * d_x * (float)isum;
     }
@@ -255,8 +271,8 @@ struct QuantInput {
 
 inline void quant_gemv(void* weight,ggml_type type,half* input,half* output,int K,int N,
                        QuantInput* qi=nullptr,cudaStream_t stream=0){
-    // 128 threads for better occupancy with K=5120
-    int threads = 128;
+    // 128 threads for better occupancy with K=5120; pick larger for big K
+    int threads = (K >= 8192) ? 256 : 128;
     // When qi is provided we ASSUME the caller has already called
     // qi->quantize(input, K, stream) — every call site in model.cuh,
     // gemma_model.cuh, and main.cu does this immediately before its first
