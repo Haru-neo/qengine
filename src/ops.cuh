@@ -155,73 +155,6 @@ inline void rms_norm_f32in_f32w(half* out, const float* x, const float* weight, 
     rms_norm_f32in_f32w_kernel<<<rows, threads, threads * sizeof(float), stream>>>(x, weight, out, hidden_size, eps);
 }
 
-// Pure FP32 variants — input fp32, output fp32 (no fp16 cast at the end)
-__global__ void rms_norm_f32_full_kernel(
-    const float* __restrict__ x,
-    const float* __restrict__ weight,  // F32 weight
-    float* __restrict__ out,
-    int hidden_size,
-    float eps
-) {
-    int row = blockIdx.x;
-    const float* x_row = x + row * hidden_size;
-    float* out_row = out + row * hidden_size;
-    extern __shared__ float sdata[];
-    float sum = 0.0f;
-    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
-        float v = x_row[i];
-        sum += v * v;
-    }
-    sdata[threadIdx.x] = sum;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
-        __syncthreads();
-    }
-    float rms = rsqrtf(sdata[0] / hidden_size + eps);
-    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
-        out_row[i] = x_row[i] * rms * weight[i];
-    }
-}
-
-__global__ void rms_norm_f32_full_h_w_kernel(
-    const float* __restrict__ x,
-    const half* __restrict__ weight,  // F16 weight
-    float* __restrict__ out,
-    int hidden_size,
-    float eps
-) {
-    int row = blockIdx.x;
-    const float* x_row = x + row * hidden_size;
-    float* out_row = out + row * hidden_size;
-    extern __shared__ float sdata[];
-    float sum = 0.0f;
-    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
-        float v = x_row[i];
-        sum += v * v;
-    }
-    sdata[threadIdx.x] = sum;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
-        __syncthreads();
-    }
-    float rms = rsqrtf(sdata[0] / hidden_size + eps);
-    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
-        out_row[i] = x_row[i] * rms * __half2float(weight[i]);
-    }
-}
-
-inline void rms_norm_f32_full(float* out, const float* x, const float* weight, int rows, int hidden_size, float eps, cudaStream_t stream = 0) {
-    int threads = min(hidden_size, 256);
-    rms_norm_f32_full_kernel<<<rows, threads, threads * sizeof(float), stream>>>(x, weight, out, hidden_size, eps);
-}
-
-inline void rms_norm_f32_full_h_w(float* out, const float* x, const half* weight, int rows, int hidden_size, float eps, cudaStream_t stream = 0) {
-    int threads = min(hidden_size, 256);
-    rms_norm_f32_full_h_w_kernel<<<rows, threads, threads * sizeof(float), stream>>>(x, weight, out, hidden_size, eps);
-}
-
 // FP32 residual add: hidden_f32 += proj_out (half)
 __global__ void add_kernel_f32(float* __restrict__ x, const half* __restrict__ residual, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -296,7 +229,6 @@ __global__ void silu_mul_kernel(half* __restrict__ a, const half* __restrict__ b
 }
 
 // Fused GeLU(tanh approx)(a) * b — used by Gemma's GeGLU FFN
-// gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 __global__ void gelu_tanh_mul_kernel(half* __restrict__ a, const half* __restrict__ b, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
@@ -305,24 +237,6 @@ __global__ void gelu_tanh_mul_kernel(half* __restrict__ a, const half* __restric
         float inner = k * (va + 0.044715f * va * va * va);
         float gelu = 0.5f * va * (1.0f + tanhf(inner));
         a[idx] = __float2half(gelu * __half2float(b[idx]));
-    }
-}
-
-// FP32 variant: a (and output) is fp32, b is fp32
-__global__ void silu_mul_kernel_f32(float* __restrict__ a, const float* __restrict__ b, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        float va = a[idx];
-        float silu = va / (1.0f + expf(-va));
-        a[idx] = silu * b[idx];
-    }
-}
-
-// FP32 residual add: x += residual (both fp32)
-__global__ void add_kernel_f32_f32(float* __restrict__ x, const float* __restrict__ residual, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        x[idx] = x[idx] + residual[idx];
     }
 }
 

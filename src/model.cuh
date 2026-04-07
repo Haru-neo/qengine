@@ -24,12 +24,12 @@ struct QwenConfig {
 };
 
 struct LayerBuffers {
-    float* norm_out;      // [hidden_size] FP32
-    float* attn_out;      // [hidden_size] or larger FP32 (also used for QKV projection output)
-    float* mlp_gate;      // [intermediate_size] FP32
-    float* mlp_up;        // [intermediate_size] FP32
-    float* mlp_down;      // [hidden_size] FP32
-    float* residual;      // [hidden_size] FP32 (unused; kept for size compat)
+    half* norm_out;      // [hidden_size]
+    half* attn_out;      // [hidden_size] or larger
+    half* mlp_gate;      // [intermediate_size]
+    half* mlp_up;        // [intermediate_size]
+    half* mlp_down;      // [hidden_size]
+    half* residual;      // [hidden_size]
 };
 
 struct QwenModel {
@@ -65,22 +65,22 @@ struct QwenModel {
     // Chunk size for parallel scan during prompt processing
     static constexpr int CHUNK_SIZE = 64;
 
-    // GDN temp buffers per GPU (all FP32)
+    // GDN temp buffers per GPU
     struct GDNBuffers {
         float* conv_out;    // [qkv_dim] FP32
-        float* core_out;    // [num_v * v_dim] FP32
-        float* normed_out;  // [num_v * v_dim] FP32
-        float* proj_out;    // [hidden_size] FP32
+        half* core_out;     // [num_v * v_dim]
+        half* normed_out;   // [num_v * v_dim]
+        half* proj_out;     // [hidden_size]
 
         // Chunk buffers (per-token data accumulated for chunked GDN)
         float* chunk_qkv;     // [CHUNK_SIZE * qkv_dim] FP32 conv1d outputs
-        float* chunk_a_proj;  // [CHUNK_SIZE * num_v] FP32
-        float* chunk_b_proj;  // [CHUNK_SIZE * num_v] FP32
-        float* chunk_z_out;   // [CHUNK_SIZE * num_v * v_dim] FP32
-        float* chunk_core_out;// [CHUNK_SIZE * num_v * v_dim] FP32
-        float* chunk_normed;  // [CHUNK_SIZE * num_v * v_dim] FP32
-        float* chunk_proj_out;// [CHUNK_SIZE * hidden_size] FP32
-        float* chunk_norm_out;// [CHUNK_SIZE * hidden_size] FP32
+        half*  chunk_a_proj;  // [CHUNK_SIZE * num_v]
+        half*  chunk_b_proj;  // [CHUNK_SIZE * num_v]
+        half*  chunk_z_out;   // [CHUNK_SIZE * num_v * v_dim]
+        half*  chunk_core_out;// [CHUNK_SIZE * num_v * v_dim]
+        half*  chunk_normed;  // [CHUNK_SIZE * num_v * v_dim]
+        half*  chunk_proj_out;// [CHUNK_SIZE * hidden_size]
+        half*  chunk_norm_out;// [CHUNK_SIZE * hidden_size]
     };
     GDNBuffers gdn_bufs[4];
 
@@ -89,31 +89,31 @@ struct QwenModel {
         int I = cfg.intermediate_size;
         for (int g = 0; g < gpu->num_gpus; g++) {
             cudaSetDevice(g);
-            cudaMalloc(&bufs[g].norm_out, H * sizeof(float));
-            cudaMalloc(&bufs[g].attn_out, std::max(H * 4, cfg.num_q_heads * cfg.head_dim * 2) * sizeof(float));
-            cudaMalloc(&bufs[g].mlp_gate, I * sizeof(float));
-            cudaMalloc(&bufs[g].mlp_up, I * sizeof(float));
-            cudaMalloc(&bufs[g].mlp_down, H * sizeof(float));
-            cudaMalloc(&bufs[g].residual, H * sizeof(float));
+            cudaMalloc(&bufs[g].norm_out, H * sizeof(half));
+            cudaMalloc(&bufs[g].attn_out, std::max(H * 4, cfg.num_q_heads * cfg.head_dim * 2) * sizeof(half));
+            cudaMalloc(&bufs[g].mlp_gate, I * sizeof(half));
+            cudaMalloc(&bufs[g].mlp_up, I * sizeof(half));
+            cudaMalloc(&bufs[g].mlp_down, H * sizeof(half));
+            cudaMalloc(&bufs[g].residual, H * sizeof(half));
 
             // GDN buffers (over-allocate for 27B max)
             int qkv_dim = 2 * 16 * 128 + 48 * 128;  // 10240
             int v_total = 48 * 128;  // 6144
             int num_v_max = 48;
             cudaMalloc(&gdn_bufs[g].conv_out, qkv_dim * sizeof(float));
-            cudaMalloc(&gdn_bufs[g].core_out, v_total * sizeof(float));
-            cudaMalloc(&gdn_bufs[g].normed_out, v_total * sizeof(float));
-            cudaMalloc(&gdn_bufs[g].proj_out, H * sizeof(float));
+            cudaMalloc(&gdn_bufs[g].core_out, v_total * sizeof(half));
+            cudaMalloc(&gdn_bufs[g].normed_out, v_total * sizeof(half));
+            cudaMalloc(&gdn_bufs[g].proj_out, H * sizeof(half));
 
             // Chunk buffers
             cudaMalloc(&gdn_bufs[g].chunk_qkv,      CHUNK_SIZE * qkv_dim * sizeof(float));
-            cudaMalloc(&gdn_bufs[g].chunk_a_proj,   CHUNK_SIZE * num_v_max * sizeof(float));
-            cudaMalloc(&gdn_bufs[g].chunk_b_proj,   CHUNK_SIZE * num_v_max * sizeof(float));
-            cudaMalloc(&gdn_bufs[g].chunk_z_out,    CHUNK_SIZE * v_total * sizeof(float));
-            cudaMalloc(&gdn_bufs[g].chunk_core_out, CHUNK_SIZE * v_total * sizeof(float));
-            cudaMalloc(&gdn_bufs[g].chunk_normed,   CHUNK_SIZE * v_total * sizeof(float));
-            cudaMalloc(&gdn_bufs[g].chunk_proj_out, CHUNK_SIZE * H * sizeof(float));
-            cudaMalloc(&gdn_bufs[g].chunk_norm_out, CHUNK_SIZE * H * sizeof(float));
+            cudaMalloc(&gdn_bufs[g].chunk_a_proj,   CHUNK_SIZE * num_v_max * sizeof(half));
+            cudaMalloc(&gdn_bufs[g].chunk_b_proj,   CHUNK_SIZE * num_v_max * sizeof(half));
+            cudaMalloc(&gdn_bufs[g].chunk_z_out,    CHUNK_SIZE * v_total * sizeof(half));
+            cudaMalloc(&gdn_bufs[g].chunk_core_out, CHUNK_SIZE * v_total * sizeof(half));
+            cudaMalloc(&gdn_bufs[g].chunk_normed,   CHUNK_SIZE * v_total * sizeof(half));
+            cudaMalloc(&gdn_bufs[g].chunk_proj_out, CHUNK_SIZE * H * sizeof(half));
+            cudaMalloc(&gdn_bufs[g].chunk_norm_out, CHUNK_SIZE * H * sizeof(half));
         }
     }
 
@@ -123,7 +123,7 @@ struct QwenModel {
         return "blk." + std::to_string(layer) + "." + suffix;
     }
 
-    // MLP: gate_proj(SiLU) * up_proj -> down_proj  (all FP32)
+    // MLP: gate_proj(SiLU) * up_proj -> down_proj
     void forward_mlp(int layer, float* hidden, cudaStream_t stream) {
         int g = gpu->layer_gpu[layer];
         auto& buf = bufs[g];
@@ -140,21 +140,22 @@ struct QwenModel {
             return;
         }
 
-        // RMSNorm: FP32 in -> FP32 out
+        // RMSNorm: read FP32 hidden, output FP16 norm_out
         if (norm_w->type == GGML_TYPE_F32) {
-            rms_norm_f32_full(buf.norm_out, hidden, (float*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+            rms_norm_f32in_f32w(buf.norm_out, hidden, (float*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
         } else {
-            rms_norm_f32_full_h_w(buf.norm_out, hidden, (half*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+            rms_norm_f32in(buf.norm_out, hidden, (half*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
         }
 
-        // gate / up / down all in FP32 path
-        quant_gemv_f32(gate_w->data, gate_w->type, buf.norm_out, buf.mlp_gate, H, I, &gpu_qi[g], stream);
-        quant_gemv_f32(up_w->data,   up_w->type,   buf.norm_out, buf.mlp_up,   H, I, &gpu_qi[g], stream);
-        silu_mul_kernel_f32<<<(I+255)/256, 256, 0, stream>>>(buf.mlp_gate, buf.mlp_up, I);
-        quant_gemv_f32(down_w->data, down_w->type, buf.mlp_gate, buf.mlp_down, I, H, &gpu_qi_inter[g], stream);
+        gpu_qi[g].quantize(buf.norm_out, H, stream);
+        quant_gemv(gate_w->data, gate_w->type, buf.norm_out, buf.mlp_gate, H, I, &gpu_qi[g], stream);
+        quant_gemv(up_w->data, up_w->type, buf.norm_out, buf.mlp_up, H, I, &gpu_qi[g], stream);
+        silu_mul_kernel<<<(I+255)/256, 256, 0, stream>>>(buf.mlp_gate, buf.mlp_up, I);
+        gpu_qi_inter[g].quantize(buf.mlp_gate, I, stream);
+        quant_gemv(down_w->data, down_w->type, buf.mlp_gate, buf.mlp_down, I, H, &gpu_qi_inter[g], stream);
 
-        // Residual add: hidden_fp32 += mlp_down_fp32
-        add_kernel_f32_f32<<<(H+255)/256, 256, 0, stream>>>(hidden, buf.mlp_down, H);
+        // Residual add into FP32 hidden
+        add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(hidden, buf.mlp_down, H);
     }
 
 
@@ -164,31 +165,33 @@ struct QwenModel {
     TurboQuantCache tq_cache;
     int cur_seq_len = 0;
     
-    // Attention temp buffers (per GPU) — all FP32
+    // Attention temp buffers (per GPU)
     struct AttnBuffers {
-        float* q_proj;      // [num_q * head_dim * 2] (Q + gate concat)
-        float* k_proj;      // [num_kv * head_dim]
-        float* v_proj;      // [num_kv * head_dim]
+        half* q_proj;      // [num_q * head_dim * 2] (Q + gate)
+        half* k_proj;      // [num_kv * head_dim]
+        half* v_proj;      // [num_kv * head_dim]
         float* attn_scores; // [num_q * max_seq]
-        float* gate_buf;    // [num_q * head_dim] for output gate
-        float* attn_out;    // [num_q * head_dim]
+        half* gate_buf;     // [num_q * head_dim] for output gate
+        half* attn_out;     // [num_q * head_dim]
     };
     AttnBuffers attn_bufs[4];
-
+    
     void init_attention(int max_seq) {
         int num_q = cfg.num_q_heads;    // 24
         int num_kv = cfg.num_kv_heads;  // 4
         int hd = cfg.head_dim;          // 256
         float theta = 10000000.0f;
-
+        
+        // RoPE on each GPU that has attention layers
         for (int g = 0; g < gpu->num_gpus; g++) {
             cudaSetDevice(g);
-            cudaMalloc(&attn_bufs[g].q_proj, num_q * hd * 2 * sizeof(float));
-            cudaMalloc(&attn_bufs[g].k_proj, num_kv * hd * sizeof(float));
-            cudaMalloc(&attn_bufs[g].v_proj, num_kv * hd * sizeof(float));
+            // Alloc attention buffers
+            cudaMalloc(&attn_bufs[g].q_proj, num_q * hd * 2 * sizeof(half));
+            cudaMalloc(&attn_bufs[g].k_proj, num_kv * hd * sizeof(half));
+            cudaMalloc(&attn_bufs[g].v_proj, num_kv * hd * sizeof(half));
             cudaMalloc(&attn_bufs[g].attn_scores, num_q * max_seq * sizeof(float));
-            cudaMalloc(&attn_bufs[g].attn_out, num_q * hd * sizeof(float));
-            cudaMalloc(&attn_bufs[g].gate_buf, num_q * hd * sizeof(float));
+            cudaMalloc(&attn_bufs[g].attn_out, num_q * hd * sizeof(half));
+            cudaMalloc(&attn_bufs[g].gate_buf, num_q * hd * sizeof(half));
         }
         
         // RoPE table (same on all GPUs — just put on GPU 0 for now, copy as needed)
@@ -211,79 +214,45 @@ struct QwenModel {
     }
     
     // Attention forward (seq_len=1, token generation)
-    // ============ TurboQuant KV Cache (3-bit, ~10x compression) ============
-    // Compressed K/V stored as block_tq3. Dequantized on-the-fly into a
-    // shared per-GPU dequant buffer for use by the attention kernels.
+    // ============ FP32 KV Cache (precision for long contexts) ============
     struct KVCache {
-        block_tq3* k_tq3;  // [max_seq * blocks_per_token]
-        block_tq3* v_tq3;
+        float* k;  // [max_seq, num_kv * head_dim]
+        float* v;  // [max_seq, num_kv * head_dim]
     };
     std::unordered_map<int, KVCache> kv_caches;
     int kv_max_seq = 0;
-    int kv_blocks_per_token = 0;  // num_kv * head_dim / TQ_BLOCK_SIZE
-
-    // Per-GPU shared dequant buffers (one set per GPU, reused across layers)
-    float* dequant_k_buf[4] = {nullptr, nullptr, nullptr, nullptr};
-    float* dequant_v_buf[4] = {nullptr, nullptr, nullptr, nullptr};
 
     void init_kv_cache(int max_seq) {
         kv_max_seq = max_seq;
         int num_kv = cfg.num_kv_heads;
         int hd = cfg.head_dim;
-        int kv_dim = num_kv * hd;
-
-        // Verify kv_dim is multiple of TQ_BLOCK_SIZE (=128)
-        if (kv_dim % TQ_BLOCK_SIZE != 0) {
-            fprintf(stderr, "TQ KV cache: kv_dim=%d not multiple of %d\n", kv_dim, TQ_BLOCK_SIZE);
-            return;
-        }
-        kv_blocks_per_token = kv_dim / TQ_BLOCK_SIZE;
-
-        size_t tq_bytes_per_layer = (size_t)max_seq * kv_blocks_per_token * sizeof(block_tq3);
-        size_t dequant_bytes = (size_t)max_seq * kv_dim * sizeof(float);
+        int kv_size = max_seq * num_kv * hd * sizeof(float);
 
         for (int layer = 0; layer < cfg.num_layers; layer++) {
             if (!is_attn_layer(layer)) continue;
             int g = gpu->layer_gpu[layer];
             cudaSetDevice(g);
             KVCache kv;
-            cudaMalloc(&kv.k_tq3, tq_bytes_per_layer);
-            cudaMalloc(&kv.v_tq3, tq_bytes_per_layer);
-            cudaMemset(kv.k_tq3, 0, tq_bytes_per_layer);
-            cudaMemset(kv.v_tq3, 0, tq_bytes_per_layer);
+            cudaMalloc(&kv.k, kv_size);
+            cudaMalloc(&kv.v, kv_size);
+            cudaMemset(kv.k, 0, kv_size);
+            cudaMemset(kv.v, 0, kv_size);
             kv_caches[layer] = kv;
         }
-
-        // Allocate one shared dequant buffer per GPU (max_seq sized) +
-        // initialize the constant random sign vector for randomized Hadamard
-        // transform (must match between encode and decode).
-        for (int g = 0; g < gpu->num_gpus; g++) {
-            cudaSetDevice(g);
-            cudaMalloc(&dequant_k_buf[g], dequant_bytes);
-            cudaMalloc(&dequant_v_buf[g], dequant_bytes);
-            tq3_init_signs(g);
-        }
-
-        size_t total_tq = (size_t)kv_caches.size() * tq_bytes_per_layer * 2;  // K+V
-        size_t total_dequant = (size_t)gpu->num_gpus * dequant_bytes * 2;
-        size_t fp32_equiv = (size_t)kv_caches.size() * dequant_bytes * 2;
-        printf("KV cache (TurboQuant 3-bit): %d layers, %d max_seq, %.1f MB compressed (%.1fx vs FP32 %.1f MB) + %.1f MB shared dequant\n",
+        printf("KV cache (FP32): %d layers, %d max_seq, %.1f MB total\n",
             (int)kv_caches.size(), max_seq,
-            total_tq / 1e6,
-            (double)fp32_equiv / total_tq,
-            fp32_equiv / 1e6,
-            total_dequant / 1e6);
+            (float)kv_caches.size() * kv_size * 2 / 1e6);
     }
 
     void reset_kv_cache() {
         int num_kv = cfg.num_kv_heads;
         int hd = cfg.head_dim;
-        size_t tq_bytes_per_layer = (size_t)kv_max_seq * kv_blocks_per_token * sizeof(block_tq3);
+        int kv_size = kv_max_seq * num_kv * hd * sizeof(float);
         for (auto& [layer, kv] : kv_caches) {
             int g = gpu->layer_gpu[layer];
             cudaSetDevice(g);
-            cudaMemset(kv.k_tq3, 0, tq_bytes_per_layer);
-            cudaMemset(kv.v_tq3, 0, tq_bytes_per_layer);
+            cudaMemset(kv.k, 0, kv_size);
+            cudaMemset(kv.v, 0, kv_size);
         }
     }
 
@@ -293,6 +262,7 @@ struct QwenModel {
         int num_q = cfg.num_q_heads;
         int num_kv = cfg.num_kv_heads;
         int hd = cfg.head_dim;
+        int gqa_ratio = num_q / num_kv;
         float eps = cfg.rms_norm_eps;
         float scale = 1.0f / sqrtf((float)hd);
         auto& ab = attn_bufs[g];
@@ -306,86 +276,87 @@ struct QwenModel {
         auto* k_norm_w = t(blk(layer, "attn_k_norm.weight"));
         auto* o_w = t(blk(layer, "attn_output.weight"));
 
-        float* norm_out = bufs[g].norm_out;
+        half* norm_out = bufs[g].norm_out;
         int total_qg = num_q * hd;
         int kv_dim = num_kv * hd;
-        int seq_len = pos + 1;
+        int seq_len = pos + 1;  // including current token
 
-        // 1. RMSNorm: FP32 in -> FP32 out
+        // 1. RMSNorm (FP32 hidden in)
         if (norm_w->type == GGML_TYPE_F32)
-            rms_norm_f32_full(norm_out, hidden, (float*)norm_w->data, 1, H, eps, stream);
+            rms_norm_f32in_f32w(norm_out, hidden, (float*)norm_w->data, 1, H, eps, stream);
         else
-            rms_norm_f32_full_h_w(norm_out, hidden, (half*)norm_w->data, 1, H, eps, stream);
+            rms_norm_f32in(norm_out, hidden, (half*)norm_w->data, 1, H, eps, stream);
 
-        // 2. Q/K/V projections (FP32 path)
+        // 2. Q/K/V projections
         int q_out_dim = q_w->dims[1];
-        quant_gemv_f32(q_w->data, q_w->type, norm_out, ab.q_proj, H, q_out_dim, &gpu_qi[g], stream);
-        quant_gemv_f32(k_w->data, k_w->type, norm_out, ab.k_proj, H, kv_dim, &gpu_qi[g], stream);
-        quant_gemv_f32(v_w->data, v_w->type, norm_out, ab.v_proj, H, kv_dim, &gpu_qi[g], stream);
+        gpu_qi[g].quantize(norm_out, H, stream);
+        quant_gemv(q_w->data, q_w->type, norm_out, ab.q_proj, H, q_out_dim, &gpu_qi[g], stream);
+        quant_gemv(k_w->data, k_w->type, norm_out, ab.k_proj, H, kv_dim, &gpu_qi[g], stream);
+        quant_gemv(v_w->data, v_w->type, norm_out, ab.v_proj, H, kv_dim, &gpu_qi[g], stream);
 
         // 3. Deinterleave Q and gate
-        float* q_buf = ab.attn_out;
-        float* gate_buf = ab.gate_buf;
-        deinterleave_qg_kernel_f32<<<(total_qg+255)/256, 256, 0, stream>>>(
+        half* q_buf = ab.attn_out;
+        half* gate_buf = ab.gate_buf;
+        deinterleave_qg_kernel<<<(total_qg+255)/256, 256, 0, stream>>>(
             ab.q_proj, q_buf, gate_buf, num_q, hd);
 
-        // 4. Head RMSNorm (q_norm/k_norm weights are F32)
+        // 4. Head RMSNorm
         int tn = min(hd, 128);
-        head_rms_norm_kernel_f32<<<num_q, tn, tn * sizeof(float), stream>>>(
+        // Debug: print weight types once
+        static bool printed_norm_types = false;
+        if (!printed_norm_types && layer == 3) {
+            printf("[DBG L3] q_norm type=%d (F32=0,F16=1), k_norm type=%d, attn_norm type=%d\n",
+                   q_norm_w->type, k_norm_w->type, norm_w->type);
+            printed_norm_types = true;
+        }
+        head_rms_norm_kernel<<<num_q, tn, tn * sizeof(float), stream>>>(
             q_buf, (float*)q_norm_w->data, num_q, hd, eps);
-        head_rms_norm_kernel_f32<<<num_kv, tn, tn * sizeof(float), stream>>>(
+        head_rms_norm_kernel<<<num_kv, tn, tn * sizeof(float), stream>>>(
             ab.k_proj, (float*)k_norm_w->data, num_kv, hd, eps);
 
-        // 5. RoPE (FP32)
+        // 5. RoPE
         int rope_dim = rope.rope_dim;
         int half_rope = rope_dim / 2;
         float* sin_pos = rope.sin_table(g) + pos * half_rope;
         float* cos_pos = rope.cos_table(g) + pos * half_rope;
-        apply_rope_kernel_f32<<<(num_q * half_rope + 255)/256, 256, 0, stream>>>(
+        apply_rope_kernel<<<(num_q * half_rope + 255)/256, 256, 0, stream>>>(
             q_buf, sin_pos, cos_pos, num_q, hd, rope_dim);
-        apply_rope_kernel_f32<<<(num_kv * half_rope + 255)/256, 256, 0, stream>>>(
+        apply_rope_kernel<<<(num_kv * half_rope + 255)/256, 256, 0, stream>>>(
             ab.k_proj, sin_pos, cos_pos, num_kv, hd, rope_dim);
 
-        // 6. TurboQuant store: quantize K, V (fp32) → tq3 at position pos
-        size_t tq_offset = (size_t)pos * kv_blocks_per_token;
-        tq3_quantize_kernel_f32<<<(kv_blocks_per_token+31)/32, 32, 0, stream>>>(
-            ab.k_proj, kv.k_tq3 + tq_offset, kv_blocks_per_token);
-        tq3_quantize_kernel_f32<<<(kv_blocks_per_token+31)/32, 32, 0, stream>>>(
-            ab.v_proj, kv.v_tq3 + tq_offset, kv_blocks_per_token);
+        // 6. Store K, V into FP32 cache at position pos (convert from fp16)
+        float* k_cache_pos = kv.k + (size_t)pos * kv_dim;
+        float* v_cache_pos = kv.v + (size_t)pos * kv_dim;
+        store_kv_fp32_kernel<<<(kv_dim+255)/256, 256, 0, stream>>>(ab.k_proj, k_cache_pos, kv_dim);
+        store_kv_fp32_kernel<<<(kv_dim+255)/256, 256, 0, stream>>>(ab.v_proj, v_cache_pos, kv_dim);
 
-        // 6b. Dequantize entire history [0..pos] into the per-GPU shared buffer
-        int total_blocks = seq_len * kv_blocks_per_token;
-        tq3_dequantize_kernel_f32<<<(total_blocks+31)/32, 32, 0, stream>>>(
-            kv.k_tq3, dequant_k_buf[g], total_blocks);
-        tq3_dequantize_kernel_f32<<<(total_blocks+31)/32, 32, 0, stream>>>(
-            kv.v_tq3, dequant_v_buf[g], total_blocks);
-
-        // 7. Attention scores (FP32 Q, FP32 dequantized K)
+        // 7. Attention: Q[num_q, hd] @ K_cache[seq_len, num_kv, hd]^T → scores → softmax → @ V
         dim3 score_grid(num_q, seq_len);
-        attn_score_kernel_f32<<<score_grid, min(hd, 256), 0, stream>>>(
-            q_buf, dequant_k_buf[g], ab.attn_scores,
+        attn_score_kernel<<<score_grid, min(hd, 256), 0, stream>>>(
+            q_buf, kv.k, ab.attn_scores,
             num_q, num_kv, hd, seq_len, scale);
 
-        // Softmax (already FP32)
+        // Softmax over seq_len for each q head
         { int st = 1; while(st < seq_len && st < 256) st <<= 1;
         softmax_kernel<<<num_q, st, st * sizeof(float), stream>>>(
             ab.attn_scores, num_q, seq_len); }
 
-        // Weighted sum of V (FP32 output, dequantized V)
-        attn_value_kernel_f32<<<num_q, min(hd, 256), 0, stream>>>(
-            ab.attn_scores, dequant_v_buf[g], q_buf,
+        // Weighted sum of V
+        attn_value_kernel<<<num_q, min(hd, 256), 0, stream>>>(
+            ab.attn_scores, kv.v, q_buf,
             num_q, num_kv, hd, seq_len);
 
-        // 8. Output gate: out *= sigmoid(gate)  (FP32)
-        apply_gate_sigmoid_f32<<<(total_qg+255)/256, 256, 0, stream>>>(
+        // 8. Output gate: out *= sigmoid(gate)
+        apply_gate_sigmoid<<<(total_qg+255)/256, 256, 0, stream>>>(
             q_buf, gate_buf, total_qg);
 
-        // 9. Output projection (FP32 path)
-        float* proj_out = bufs[g].mlp_down;
-        quant_gemv_f32(o_w->data, o_w->type, q_buf, proj_out, num_q * hd, H, &gpu_qi_inter[g], stream);
+        // 9. Output projection
+        half* proj_out = bufs[g].mlp_down;
+        gpu_qi_inter[g].quantize(q_buf, num_q * hd, stream);
+        quant_gemv(o_w->data, o_w->type, q_buf, proj_out, num_q * hd, H, &gpu_qi_inter[g], stream);
 
-        // 10. Residual: hidden_fp32 += proj_out_fp32
-        add_kernel_f32_f32<<<(H+255)/256, 256, 0, stream>>>(hidden, proj_out, H);
+        // 10. Residual into FP32 hidden
+        add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(hidden, proj_out, H);
     }
 
     // ============ GDN Forward ============
@@ -491,42 +462,44 @@ struct QwenModel {
         auto* ssm_norm_w = t(blk(layer, "ssm_norm.weight"));
         auto* out_w   = t(blk(layer, "ssm_out.weight"));
 
-        // Temp buffers (reuse attn_out which is large enough) — all FP32
-        float* norm_out = buf.norm_out;
-        float* qkv_out = buf.attn_out;  // [qkv_dim]
-        float* z_out = buf.mlp_gate;    // reuse, [num_v * v_dim]
-        float* a_out = buf.mlp_up;      // reuse, [num_v]
-        float* b_out = buf.mlp_down;    // reuse, [num_v]
+        // Temp buffers (reuse attn_out which is large enough)
+        half* norm_out = buf.norm_out;
+        half* qkv_out = buf.attn_out;  // [qkv_dim]
+        half* z_out = buf.mlp_gate;    // reuse, [num_v * v_dim]
+        half* a_out = buf.mlp_up;      // reuse, [num_v]  
+        half* b_out = buf.mlp_down;    // reuse, [num_v]
 
-        // 1. RMSNorm: FP32 in -> FP32 out
+        // 1. RMSNorm (FP32 hidden in)
         if (norm_w->type == GGML_TYPE_F32)
-            rms_norm_f32_full(norm_out, hidden, (float*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+            rms_norm_f32in_f32w(norm_out, hidden, (float*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
         else
-            rms_norm_f32_full_h_w(norm_out, hidden, (half*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+            rms_norm_f32in(norm_out, hidden, (half*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
 
-        // 2. Projections: QKV, Z(gate), alpha, beta (FP32 path)
-        quant_gemv_f32(qkv_w->data, qkv_w->type, norm_out, qkv_out, H, qkv_dim, &gpu_qi[g], stream);
-        quant_gemv_f32(gate_w->data, gate_w->type, norm_out, z_out, H, num_v * v_dim, &gpu_qi[g], stream);
-        quant_gemv_f32(alpha_w->data, alpha_w->type, norm_out, a_out, H, num_v, &gpu_qi[g], stream);
-        quant_gemv_f32(beta_w->data, beta_w->type, norm_out, b_out, H, num_v, &gpu_qi[g], stream);
+        // 2. Projections: QKV, Z(gate), alpha, beta — quantize once, reuse
+        gpu_qi[g].quantize(norm_out, H, stream);
+        quant_gemv(qkv_w->data, qkv_w->type, norm_out, qkv_out, H, qkv_dim, &gpu_qi[g], stream);
+        quant_gemv(gate_w->data, gate_w->type, norm_out, z_out, H, num_v * v_dim, &gpu_qi[g], stream);
+        quant_gemv(alpha_w->data, alpha_w->type, norm_out, a_out, H, num_v, &gpu_qi[g], stream);
+        quant_gemv(beta_w->data, beta_w->type, norm_out, b_out, H, num_v, &gpu_qi[g], stream);
 
-        // 3. Conv1d update (FP32 input now)
+        // 3. Conv1d update (FP32)
         float* conv_out = gdn_bufs[g].conv_out;
         int kw = 4;
         int threads_conv = min(qkv_dim, 256);
         int blocks_conv = (qkv_dim + threads_conv - 1) / threads_conv;
-        conv1d_update_silu_f32<<<blocks_conv, threads_conv, 0, stream>>>(
+        conv1d_update_silu<<<blocks_conv, threads_conv, 0, stream>>>(
             gdn_states[layer].conv_state,
             qkv_out,
-            (float*)conv_w->data,
+            (float*)conv_w->data,  // conv weight is F32
             conv_out,
             qkv_dim, kw
         );
 
-        // 4. Recurrent GDN step (FP32 alpha/beta input, FP32 output)
-        float* core_out = gdn_bufs[g].core_out;
+        // 4. Recurrent GDN step
+        half* core_out = gdn_bufs[g].core_out;
+        // shared mem: sQ[k_dim+1] + sK[k_dim] floats (last sQ slot stores attn_score)
         int gdn_smem = (2 * cfg.linear_k_dim + 1) * sizeof(float);
-        gdn_recurrent_step_f32<<<num_v, min(v_dim, 128), gdn_smem, stream>>>(
+        gdn_recurrent_step<<<num_v, min(v_dim, 128), gdn_smem, stream>>>(
             conv_out,
             (float*)a_log_t->data,
             (float*)dt_bias_t->data,
@@ -537,30 +510,127 @@ struct QwenModel {
             num_k, num_v, k_dim, v_dim
         );
 
-        // 5. RMSNorm Gated (FP32 in/out)
-        float* normed_out = gdn_bufs[g].normed_out;
-        rms_norm_gated_kernel_f32<<<num_v, min(v_dim, 128), 128 * sizeof(float), stream>>>(
+        // 5. RMSNorm Gated
+        half* normed_out = gdn_bufs[g].normed_out;
+        rms_norm_gated_kernel<<<num_v, min(v_dim, 128), 128 * sizeof(float), stream>>>(
             core_out, z_out, (float*)ssm_norm_w->data, normed_out,
             num_v, v_dim, 1e-6f
         );
 
-        // 6. Output projection (FP32)
-        float* proj_out = gdn_bufs[g].proj_out;
-        quant_gemv_f32(out_w->data, out_w->type, normed_out, proj_out, num_v * v_dim, H, &gpu_qi_inter[g], stream);
+        // 6. Output projection
+        half* proj_out = gdn_bufs[g].proj_out;
+        gpu_qi_inter[g].quantize(normed_out, num_v * v_dim, stream);
+        quant_gemv(out_w->data, out_w->type, normed_out, proj_out, num_v * v_dim, H, &gpu_qi_inter[g], stream);
 
-        // 7. Residual: hidden_fp32 += proj_out_fp32
-        add_kernel_f32_f32<<<(H+255)/256, 256, 0, stream>>>(hidden, proj_out, H);
-
+        // 7. Residual add into FP32 hidden
+        add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(hidden, proj_out, H);
     }
 
     // ============ Chunked GDN forward (process N tokens together) ============
-    // For now, just iterate per-token through forward_gdn (which is fully FP32).
-    // The previous chunked-kernel approach used FP16 intermediates which lost
-    // precision; per-token FP32 is more accurate at the cost of some speed.
+    // hidden_chunk: [n_tokens, H] FP32 — read & updated in-place
     void forward_gdn_chunk(int layer, float* hidden_chunk, int n_tokens, cudaStream_t stream) {
+        int g = gpu->layer_gpu[layer];
+        auto& buf = bufs[g];
+        auto& gb = gdn_bufs[g];
         int H = cfg.hidden_size;
+        int num_k = cfg.linear_k_heads;
+        int num_v = cfg.linear_v_heads;
+        int k_dim = cfg.linear_k_dim;
+        int v_dim = cfg.linear_v_dim;
+        int qkv_dim = 2 * num_k * k_dim + num_v * v_dim;
+        int v_total = num_v * v_dim;
+
+        auto* norm_w  = t(blk(layer, "attn_norm.weight"));
+        auto* qkv_w   = t(blk(layer, "attn_qkv.weight"));
+        auto* gate_w  = t(blk(layer, "attn_gate.weight"));
+        auto* alpha_w = t(blk(layer, "ssm_alpha.weight"));
+        auto* beta_w  = t(blk(layer, "ssm_beta.weight"));
+        auto* conv_w  = t(blk(layer, "ssm_conv1d.weight"));
+        auto* a_log_t = t(blk(layer, "ssm_a"));
+        auto* dt_bias_t = t(blk(layer, "ssm_dt.bias"));
+        auto* ssm_norm_w = t(blk(layer, "ssm_norm.weight"));
+        auto* out_w   = t(blk(layer, "ssm_out.weight"));
+
+        // For each token: RMSNorm + QKV/Z/alpha/beta projections (per-token GEMV)
+        // Outputs go into chunk buffers.
+        // We use buf.attn_out as a per-token qkv_out staging area (size >= qkv_dim).
+        // Need to also project Z, alpha, beta separately per token into chunk slots.
         for (int t = 0; t < n_tokens; t++) {
-            forward_gdn(layer, hidden_chunk + (size_t)t * H, stream);
+            float* h_t = hidden_chunk + (size_t)t * H;
+            half* nrm = gb.chunk_norm_out + (size_t)t * H;
+
+            // RMSNorm: FP32 hidden in → FP16 norm out
+            if (norm_w->type == GGML_TYPE_F32)
+                rms_norm_f32in_f32w(nrm, h_t, (float*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+            else
+                rms_norm_f32in(nrm, h_t, (half*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+
+            gpu_qi[g].quantize(nrm, H, stream);
+            // QKV projection → buf.attn_out (fp16), then convert to fp32 chunk_qkv slot
+            quant_gemv(qkv_w->data, qkv_w->type, nrm, buf.attn_out, H, qkv_dim, &gpu_qi[g], stream);
+            half_to_float_kernel<<<(qkv_dim+255)/256, 256, 0, stream>>>(
+                buf.attn_out, gb.chunk_qkv + (size_t)t * qkv_dim, qkv_dim);
+            // Z (gate) projection
+            quant_gemv(gate_w->data, gate_w->type, nrm,
+                       gb.chunk_z_out + (size_t)t * v_total, H, num_v * v_dim, &gpu_qi[g], stream);
+            // alpha, beta projections
+            quant_gemv(alpha_w->data, alpha_w->type, nrm,
+                       gb.chunk_a_proj + (size_t)t * num_v, H, num_v, &gpu_qi[g], stream);
+            quant_gemv(beta_w->data, beta_w->type, nrm,
+                       gb.chunk_b_proj + (size_t)t * num_v, H, num_v, &gpu_qi[g], stream);
+        }
+
+        // Conv1d update (per-token) — input is fp16 (buf.attn_out per token)
+        // Output is fp32 directly into chunk_qkv slot.
+        // We re-do qkv proj per token because conv1d needs fp16 input;
+        // alternatively we already stored fp32 qkv into chunk_qkv above.
+        // For simplicity: convert chunk_qkv (fp32) → fp16 buf.attn_out, conv1d → fp32.
+        {
+            int kw = 4;
+            int threads = min(qkv_dim, 256);
+            int blocks  = (qkv_dim + threads - 1) / threads;
+            for (int t = 0; t < n_tokens; t++) {
+                float_to_half_kernel<<<(qkv_dim+255)/256, 256, 0, stream>>>(
+                    gb.chunk_qkv + (size_t)t * qkv_dim, buf.attn_out, qkv_dim);
+                conv1d_update_silu<<<blocks, threads, 0, stream>>>(
+                    gdn_states[layer].conv_state, buf.attn_out, (float*)conv_w->data,
+                    gb.chunk_qkv + (size_t)t * qkv_dim, qkv_dim, kw);
+            }
+        }
+
+        // Chunked GDN recurrent step (single kernel call for all N tokens)
+        {
+            int gdn_smem = (2 * k_dim + 1) * sizeof(float);
+            gdn_chunk_step<<<num_v, min(v_dim, 128), gdn_smem, stream>>>(
+                gb.chunk_qkv,
+                (float*)a_log_t->data,
+                (float*)dt_bias_t->data,
+                gb.chunk_a_proj,
+                gb.chunk_b_proj,
+                gdn_states[layer].rec_state,
+                gb.chunk_core_out,
+                n_tokens, num_k, num_v, k_dim, v_dim
+            );
+        }
+
+        // RMSNorm gated (chunked) + output projection (per-token) + residual (per-token)
+        {
+            // Chunked rms_norm_gated
+            int total_blocks = num_v * n_tokens;
+            rms_norm_gated_chunk_kernel<<<total_blocks, min(v_dim, 128), 128*sizeof(float), stream>>>(
+                gb.chunk_core_out, gb.chunk_z_out, (float*)ssm_norm_w->data,
+                gb.chunk_normed, num_v, v_dim, n_tokens, 1e-6f);
+
+            // Per-token output projection + residual into FP32 hidden
+            for (int t = 0; t < n_tokens; t++) {
+                half* normed_t = gb.chunk_normed + (size_t)t * v_total;
+                half* proj_t   = gb.chunk_proj_out + (size_t)t * H;
+                gpu_qi_inter[g].quantize(normed_t, num_v * v_dim, stream);
+                quant_gemv(out_w->data, out_w->type, normed_t, proj_t,
+                           num_v * v_dim, H, &gpu_qi_inter[g], stream);
+                add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(
+                    hidden_chunk + (size_t)t * H, proj_t, H);
+            }
         }
     }
 
