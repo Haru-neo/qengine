@@ -211,45 +211,79 @@ struct QwenModel {
     }
     
     // Attention forward (seq_len=1, token generation)
-    // ============ FP32 KV Cache (precision for long contexts) ============
+    // ============ TurboQuant KV Cache (3-bit, ~10x compression) ============
+    // Compressed K/V stored as block_tq3. Dequantized on-the-fly into a
+    // shared per-GPU dequant buffer for use by the attention kernels.
     struct KVCache {
-        float* k;  // [max_seq, num_kv * head_dim]
-        float* v;  // [max_seq, num_kv * head_dim]
+        block_tq3* k_tq3;  // [max_seq * blocks_per_token]
+        block_tq3* v_tq3;
     };
     std::unordered_map<int, KVCache> kv_caches;
     int kv_max_seq = 0;
+    int kv_blocks_per_token = 0;  // num_kv * head_dim / TQ_BLOCK_SIZE
+
+    // Per-GPU shared dequant buffers (one set per GPU, reused across layers)
+    float* dequant_k_buf[4] = {nullptr, nullptr, nullptr, nullptr};
+    float* dequant_v_buf[4] = {nullptr, nullptr, nullptr, nullptr};
 
     void init_kv_cache(int max_seq) {
         kv_max_seq = max_seq;
         int num_kv = cfg.num_kv_heads;
         int hd = cfg.head_dim;
-        int kv_size = max_seq * num_kv * hd * sizeof(float);
+        int kv_dim = num_kv * hd;
+
+        // Verify kv_dim is multiple of TQ_BLOCK_SIZE (=128)
+        if (kv_dim % TQ_BLOCK_SIZE != 0) {
+            fprintf(stderr, "TQ KV cache: kv_dim=%d not multiple of %d\n", kv_dim, TQ_BLOCK_SIZE);
+            return;
+        }
+        kv_blocks_per_token = kv_dim / TQ_BLOCK_SIZE;
+
+        size_t tq_bytes_per_layer = (size_t)max_seq * kv_blocks_per_token * sizeof(block_tq3);
+        size_t dequant_bytes = (size_t)max_seq * kv_dim * sizeof(float);
 
         for (int layer = 0; layer < cfg.num_layers; layer++) {
             if (!is_attn_layer(layer)) continue;
             int g = gpu->layer_gpu[layer];
             cudaSetDevice(g);
             KVCache kv;
-            cudaMalloc(&kv.k, kv_size);
-            cudaMalloc(&kv.v, kv_size);
-            cudaMemset(kv.k, 0, kv_size);
-            cudaMemset(kv.v, 0, kv_size);
+            cudaMalloc(&kv.k_tq3, tq_bytes_per_layer);
+            cudaMalloc(&kv.v_tq3, tq_bytes_per_layer);
+            cudaMemset(kv.k_tq3, 0, tq_bytes_per_layer);
+            cudaMemset(kv.v_tq3, 0, tq_bytes_per_layer);
             kv_caches[layer] = kv;
         }
-        printf("KV cache (FP32): %d layers, %d max_seq, %.1f MB total\n",
+
+        // Allocate one shared dequant buffer per GPU (max_seq sized) +
+        // initialize the constant random sign vector for randomized Hadamard
+        // transform (must match between encode and decode).
+        for (int g = 0; g < gpu->num_gpus; g++) {
+            cudaSetDevice(g);
+            cudaMalloc(&dequant_k_buf[g], dequant_bytes);
+            cudaMalloc(&dequant_v_buf[g], dequant_bytes);
+            tq3_init_signs(g);
+        }
+
+        size_t total_tq = (size_t)kv_caches.size() * tq_bytes_per_layer * 2;  // K+V
+        size_t total_dequant = (size_t)gpu->num_gpus * dequant_bytes * 2;
+        size_t fp32_equiv = (size_t)kv_caches.size() * dequant_bytes * 2;
+        printf("KV cache (TurboQuant 3-bit): %d layers, %d max_seq, %.1f MB compressed (%.1fx vs FP32 %.1f MB) + %.1f MB shared dequant\n",
             (int)kv_caches.size(), max_seq,
-            (float)kv_caches.size() * kv_size * 2 / 1e6);
+            total_tq / 1e6,
+            (double)fp32_equiv / total_tq,
+            fp32_equiv / 1e6,
+            total_dequant / 1e6);
     }
 
     void reset_kv_cache() {
         int num_kv = cfg.num_kv_heads;
         int hd = cfg.head_dim;
-        int kv_size = kv_max_seq * num_kv * hd * sizeof(float);
+        size_t tq_bytes_per_layer = (size_t)kv_max_seq * kv_blocks_per_token * sizeof(block_tq3);
         for (auto& [layer, kv] : kv_caches) {
             int g = gpu->layer_gpu[layer];
             cudaSetDevice(g);
-            cudaMemset(kv.k, 0, kv_size);
-            cudaMemset(kv.v, 0, kv_size);
+            cudaMemset(kv.k_tq3, 0, tq_bytes_per_layer);
+            cudaMemset(kv.v_tq3, 0, tq_bytes_per_layer);
         }
     }
 
@@ -312,16 +346,24 @@ struct QwenModel {
         apply_rope_kernel_f32<<<(num_kv * half_rope + 255)/256, 256, 0, stream>>>(
             ab.k_proj, sin_pos, cos_pos, num_kv, hd, rope_dim);
 
-        // 6. Store K, V into FP32 cache (no precision loss; both FP32 now)
-        float* k_cache_pos = kv.k + (size_t)pos * kv_dim;
-        float* v_cache_pos = kv.v + (size_t)pos * kv_dim;
-        store_kv_f32_f32_kernel<<<(kv_dim+255)/256, 256, 0, stream>>>(ab.k_proj, k_cache_pos, kv_dim);
-        store_kv_f32_f32_kernel<<<(kv_dim+255)/256, 256, 0, stream>>>(ab.v_proj, v_cache_pos, kv_dim);
+        // 6. TurboQuant store: quantize K, V (fp32) → tq3 at position pos
+        size_t tq_offset = (size_t)pos * kv_blocks_per_token;
+        tq3_quantize_kernel_f32<<<(kv_blocks_per_token+31)/32, 32, 0, stream>>>(
+            ab.k_proj, kv.k_tq3 + tq_offset, kv_blocks_per_token);
+        tq3_quantize_kernel_f32<<<(kv_blocks_per_token+31)/32, 32, 0, stream>>>(
+            ab.v_proj, kv.v_tq3 + tq_offset, kv_blocks_per_token);
 
-        // 7. Attention scores (FP32 Q)
+        // 6b. Dequantize entire history [0..pos] into the per-GPU shared buffer
+        int total_blocks = seq_len * kv_blocks_per_token;
+        tq3_dequantize_kernel_f32<<<(total_blocks+31)/32, 32, 0, stream>>>(
+            kv.k_tq3, dequant_k_buf[g], total_blocks);
+        tq3_dequantize_kernel_f32<<<(total_blocks+31)/32, 32, 0, stream>>>(
+            kv.v_tq3, dequant_v_buf[g], total_blocks);
+
+        // 7. Attention scores (FP32 Q, FP32 dequantized K)
         dim3 score_grid(num_q, seq_len);
         attn_score_kernel_f32<<<score_grid, min(hd, 256), 0, stream>>>(
-            q_buf, kv.k, ab.attn_scores,
+            q_buf, dequant_k_buf[g], ab.attn_scores,
             num_q, num_kv, hd, seq_len, scale);
 
         // Softmax (already FP32)
@@ -329,9 +371,9 @@ struct QwenModel {
         softmax_kernel<<<num_q, st, st * sizeof(float), stream>>>(
             ab.attn_scores, num_q, seq_len); }
 
-        // Weighted sum of V (FP32 output)
+        // Weighted sum of V (FP32 output, dequantized V)
         attn_value_kernel_f32<<<num_q, min(hd, 256), 0, stream>>>(
-            ab.attn_scores, kv.v, q_buf,
+            ab.attn_scores, dequant_v_buf[g], q_buf,
             num_q, num_kv, hd, seq_len);
 
         // 8. Output gate: out *= sigmoid(gate)  (FP32)
