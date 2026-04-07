@@ -172,6 +172,59 @@ __global__ void gemv_q8_0(const void* __restrict__ w, const half* __restrict__ x
     if(l==0)sm[w2]=s;__syncthreads();
     if(w2==0&&l<nw){s=sm[l];for(int o=16;o>0;o>>=1)s+=__shfl_xor_sync(0xffffffff,s,o);if(l==0)y[row]=__float2half(s);}
 }
+
+// Q8_0 weight × Q8_1 input via dp4a (much faster — int8 dot products)
+// The input gets quantized once via QuantInput::quantize and reused across
+// multiple GEMV calls (q, k, v share the same RMSNorm output, etc).
+//
+// Block layout: 1 block per output row, 128 threads (= 4 warps).
+// For K=5120: 160 q8_0/q8_1 blocks per row → ~1.25 blocks/thread.
+//
+// IMPORTANT: block_q8_0_32 is { half d; int8_t qs[32]; } so qs starts at
+// byte offset 2 from each block — NOT 4-byte aligned. We pack bytes
+// manually to avoid misaligned int loads. block_q8_1 is { half2 ds; int8_t qs[32]; }
+// so its qs IS 4-byte aligned and we can read directly as int.
+__global__ void gemv_q8_0_q8(
+    const void* __restrict__ weight,
+    const block_q8_1* __restrict__ x_q8,
+    half* __restrict__ output,
+    const int K, const int N
+) {
+    const int row = blockIdx.x;
+    if (row >= N) return;
+    const int bpr = K / 32;
+    const block_q8_0_32* w_row = (const block_q8_0_32*)weight + (size_t)row * bpr;
+
+    float thread_sum = 0.0f;
+    for (int b = threadIdx.x; b < bpr; b += blockDim.x) {
+        const block_q8_0_32* wb = &w_row[b];
+        const block_q8_1* xb = &x_q8[b];
+        float d_w = __half2float(wb->d);
+        float d_x = __half2float(xb->ds.x);
+
+        // Weight qs (unaligned): pack 4 bytes at a time via byte load.
+        // The compiler will fuse adjacent uint8 loads into wider loads where
+        // legal. Treat the int8_t bytes as signed for sign-extension correctness.
+        const int8_t* wp = wb->qs;
+        const int* x_qs = (const int*)xb->qs;  // 4-byte aligned (half2 prefix)
+
+        int isum = 0;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            // Pack 4 signed bytes into one 32-bit int (little-endian).
+            int wq = (int)((uint8_t)wp[4*j+0])
+                   | ((int)((uint8_t)wp[4*j+1]) << 8)
+                   | ((int)((uint8_t)wp[4*j+2]) << 16)
+                   | ((int)((uint8_t)wp[4*j+3]) << 24);
+            isum = __dp4a(wq, x_qs[j], isum);
+        }
+        thread_sum += d_w * d_x * (float)isum;
+    }
+    for (int off=16;off>0;off>>=1) thread_sum+=__shfl_xor_sync(0xffffffff,thread_sum,off);
+    __shared__ float sm[8]; int w2=threadIdx.x>>5,l=threadIdx.x&31,nw=blockDim.x>>5;
+    if(l==0)sm[w2]=thread_sum; __syncthreads();
+    if(w2==0&&l<nw){float v=sm[l]; for(int o=16;o>0;o>>=1)v+=__shfl_xor_sync(0xffffffff,v,o); if(l==0)output[row]=__float2half(v);}
+}
 __global__ void gemv_fp16(const half* __restrict__ w,const half* __restrict__ x,half* __restrict__ y,int K,int N){
     int row=blockIdx.x;if(row>=N)return;float s=0.0f;
     for(int i=threadIdx.x;i<K;i+=blockDim.x)s+=__half2float(w[(size_t)row*K+i])*__half2float(x[i]);
@@ -199,12 +252,13 @@ struct QuantInput {
 
 inline void quant_gemv(void* weight,ggml_type type,half* input,half* output,int K,int N,
                        QuantInput* qi=nullptr,cudaStream_t stream=0){
-    // Use 128 threads for better occupancy with K=5120
+    // 128 threads for better occupancy with K=5120
     int threads = 128;
-    if(qi&&(type==GGML_TYPE_Q5_K||type==GGML_TYPE_Q6_K)){
+    if(qi&&(type==GGML_TYPE_Q5_K||type==GGML_TYPE_Q6_K||type==GGML_TYPE_Q8_0)){
         qi->quantize(input,K,stream);
-        if(type==GGML_TYPE_Q5_K)gemv_q5_K_q8<<<N,threads,0,stream>>>(weight,qi->q8_buf,output,K,N);
-        else                    gemv_q6_K_q8<<<N,threads,0,stream>>>(weight,qi->q8_buf,output,K,N);
+        if(type==GGML_TYPE_Q5_K)      gemv_q5_K_q8<<<N,threads,0,stream>>>(weight,qi->q8_buf,output,K,N);
+        else if(type==GGML_TYPE_Q6_K) gemv_q6_K_q8<<<N,threads,0,stream>>>(weight,qi->q8_buf,output,K,N);
+        else                          gemv_q8_0_q8<<<N,threads,0,stream>>>(weight,qi->q8_buf,output,K,N);
     } else {
         switch(type){
         case GGML_TYPE_Q5_K:case GGML_TYPE_Q6_K:{
@@ -212,7 +266,9 @@ inline void quant_gemv(void* weight,ggml_type type,half* input,half* output,int 
             if(type==GGML_TYPE_Q5_K)gemv_q5_K_q8<<<N,threads,0,stream>>>(weight,tmp.q8_buf,output,K,N);
             else                    gemv_q6_K_q8<<<N,threads,0,stream>>>(weight,tmp.q8_buf,output,K,N);
             cudaStreamSynchronize(stream);tmp.free_buf();break;}
-        case GGML_TYPE_Q8_0:gemv_q8_0<<<N,256,0,stream>>>(weight,input,output,K,N);break;
+        case GGML_TYPE_Q8_0:{
+            // No QuantInput provided — fall back to the slower fp16-input path
+            gemv_q8_0<<<N,256,0,stream>>>(weight,input,output,K,N);break;}
         case GGML_TYPE_F16: gemv_fp16<<<N,256,0,stream>>>((half*)weight,input,output,K,N);break;
         case GGML_TYPE_F32: gemv_f32<<<N,256,0,stream>>>((float*)weight,input,output,K,N);break;
         default:fprintf(stderr,"quant_gemv: unsupported type %d\n",type);
