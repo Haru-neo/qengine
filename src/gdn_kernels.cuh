@@ -98,28 +98,62 @@ __global__ void gdn_recurrent_step(
     float* sQ = smem;
     float* sK = smem + k_dim + 1;
 
-    // 1. L2 norm Q and K
-    if (threadIdx.x == 0) {
-        float q_norm_sq = 0.0f, k_norm_sq = 0.0f;
-        for (int i = 0; i < k_dim; i++) {
-            float qv = q_raw[i];
-            float kv = k_raw[i];
-            q_norm_sq += qv * qv;
-            k_norm_sq += kv * kv;
+    // 1. L2 norm Q and K — parallel reduction across all threads in the block.
+    // Previous version had thread 0 do this serially (~256 FP ops in flight),
+    // wasting the other (blockDim.x - 1) threads. With blockDim.x = 128 and
+    // k_dim = 128 we get exactly 1 element per thread for the norm pass.
+    float q_norm_sq = 0.0f, k_norm_sq = 0.0f;
+    for (int i = threadIdx.x; i < k_dim; i += blockDim.x) {
+        float qv = q_raw[i];
+        float kv = k_raw[i];
+        q_norm_sq += qv * qv;
+        k_norm_sq += kv * kv;
+    }
+    // Warp + cross-warp reduce
+    for (int off = 16; off > 0; off >>= 1) {
+        q_norm_sq += __shfl_xor_sync(0xffffffff, q_norm_sq, off);
+        k_norm_sq += __shfl_xor_sync(0xffffffff, k_norm_sq, off);
+    }
+    __shared__ float warp_q[32], warp_k[32];
+    int warp_id = threadIdx.x >> 5;
+    int lane    = threadIdx.x & 31;
+    int n_warps = (blockDim.x + 31) >> 5;
+    if (lane == 0) { warp_q[warp_id] = q_norm_sq; warp_k[warp_id] = k_norm_sq; }
+    __syncthreads();
+    if (warp_id == 0) {
+        q_norm_sq = (lane < n_warps) ? warp_q[lane] : 0.0f;
+        k_norm_sq = (lane < n_warps) ? warp_k[lane] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1) {
+            q_norm_sq += __shfl_xor_sync(0xffffffff, q_norm_sq, off);
+            k_norm_sq += __shfl_xor_sync(0xffffffff, k_norm_sq, off);
         }
-        float q_inv = rsqrtf(q_norm_sq + 1e-6f);
-        float k_inv = rsqrtf(k_norm_sq + 1e-6f);
-        float scale = rsqrtf((float)k_dim);
-        float attn_score = 0.0f;
-        for (int i = 0; i < k_dim; i++) {
-            float q_n = q_raw[i] * q_inv;
-            float k_n = k_raw[i] * k_inv;
-            sQ[i] = q_n * scale;
-            sK[i] = k_n;
-            attn_score += q_n * k_n;
-        }
-        attn_score *= scale;
-        sQ[k_dim] = attn_score;
+        if (lane == 0) { warp_q[0] = q_norm_sq; warp_k[0] = k_norm_sq; }
+    }
+    __syncthreads();
+    float q_inv = rsqrtf(warp_q[0] + 1e-6f);
+    float k_inv = rsqrtf(warp_k[0] + 1e-6f);
+    float scale = rsqrtf((float)k_dim);
+
+    // Normalize Q and K, write to shared mem, accumulate attention score in parallel.
+    float my_attn = 0.0f;
+    for (int i = threadIdx.x; i < k_dim; i += blockDim.x) {
+        float q_n = q_raw[i] * q_inv;
+        float k_n = k_raw[i] * k_inv;
+        sQ[i] = q_n * scale;
+        sK[i] = k_n;
+        my_attn += q_n * k_n;
+    }
+    // Reduce attention score across the block
+    for (int off = 16; off > 0; off >>= 1)
+        my_attn += __shfl_xor_sync(0xffffffff, my_attn, off);
+    __shared__ float warp_a[32];
+    if (lane == 0) warp_a[warp_id] = my_attn;
+    __syncthreads();
+    if (warp_id == 0) {
+        my_attn = (lane < n_warps) ? warp_a[lane] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1)
+            my_attn += __shfl_xor_sync(0xffffffff, my_attn, off);
+        if (lane == 0) sQ[k_dim] = my_attn * scale;
     }
     __syncthreads();
 

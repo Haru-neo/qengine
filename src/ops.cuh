@@ -428,3 +428,40 @@ __global__ void softcap_kernel(half* __restrict__ x, float scale, int N) {
         x[idx] = __float2half(scale * tanhf(v / scale));
     }
 }
+
+// Single-block argmax over an fp16 array of length N. Writes the winning
+// index to out_idx[0]. Used by the temp=0 greedy sampling fast path so we
+// don't have to copy the full V*2 byte logits buffer over PCIe each token —
+// instead just copy the 4-byte int. With V≈248 K, this saves ~2 ms/token
+// on PCIe 1.0 x1 hardware.
+//
+// Designed to be launched with 1024 threads, 1 block. Each thread scans a
+// strided slice of N values. Block reduces via shared memory.
+__global__ void argmax_half_kernel(const half* __restrict__ logits, int N, int* __restrict__ out_idx) {
+    __shared__ float s_val[1024];
+    __shared__ int   s_idx[1024];
+
+    float my_max = -1e38f;
+    int   my_arg = 0;
+    for (int i = threadIdx.x; i < N; i += blockDim.x) {
+        float v = __half2float(logits[i]);
+        if (v > my_max) { my_max = v; my_arg = i; }
+    }
+    s_val[threadIdx.x] = my_max;
+    s_idx[threadIdx.x] = my_arg;
+    __syncthreads();
+
+    // Block reduction (assumes blockDim.x is a power of two ≤ 1024)
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            float a = s_val[threadIdx.x];
+            float b = s_val[threadIdx.x + stride];
+            if (b > a) {
+                s_val[threadIdx.x] = b;
+                s_idx[threadIdx.x] = s_idx[threadIdx.x + stride];
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out_idx[0] = s_idx[0];
+}

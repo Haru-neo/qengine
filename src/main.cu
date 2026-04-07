@@ -530,6 +530,11 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     float* host_transfer; cudaMallocHost(&host_transfer, H * sizeof(float));
     float* host_chunk_transfer; cudaMallocHost(&host_chunk_transfer, CHUNK_SIZE * H * sizeof(float));
     QuantInput qi_logits;
+    // GPU argmax fast path: when temp=0 and rep_penalty=1.0 we can pick the
+    // winning token entirely on-device and only transfer 4 bytes back over
+    // the slow PCIe 1.0 x1 bus instead of V*2 bytes (~500 KB).
+    int*  d_argmax;       cudaMalloc(&d_argmax, sizeof(int));
+    int*  h_argmax_pinned; cudaMallocHost(&h_argmax_pinned, sizeof(int));
 
     SamplingParams sp;
     sp.rep_penalty = 1.0f;  // match llama.cpp default; users can set via repetition_penalty in request
@@ -635,14 +640,29 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     rms_norm(norm_buf, gpu_hidden_half[last_gpu], (half*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
                 qi_logits.quantize(norm_buf, H, 0);
                 quant_gemv(out_w->data, out_w->type, norm_buf, logits_buf, H, V, &qi_logits);
-                cudaDeviceSynchronize();
-
-                std::vector<half> h_logits(V);
-                cudaMemcpy(h_logits.data(), logits_buf, V * sizeof(half), cudaMemcpyDeviceToHost);
 
                 std::vector<int> ctx = prompt_ids;
                 ctx.insert(ctx.end(), generated.begin(), generated.end());
-                int max_idx = sampler.sample(h_logits.data(), V, ctx);
+
+                // Greedy fast path: temp<=0 + no rep penalty → argmax on the
+                // GPU and only ship 4 bytes home over the slow PCIe x1 bus
+                // instead of V*2 ≈ 500 KB.
+                int max_idx;
+                const auto& sp_now = sampler.params();
+                bool greedy_fast = (sp_now.temperature <= 0.0f)
+                                && (sp_now.rep_penalty == 1.0f)
+                                && (sp_now.freq_penalty == 0.0f)
+                                && (sp_now.pres_penalty == 0.0f);
+                if (greedy_fast) {
+                    argmax_half_kernel<<<1, 1024>>>(logits_buf, V, d_argmax);
+                    cudaMemcpy(h_argmax_pinned, d_argmax, sizeof(int), cudaMemcpyDeviceToHost);
+                    max_idx = h_argmax_pinned[0];
+                } else {
+                    cudaDeviceSynchronize();
+                    std::vector<half> h_logits(V);
+                    cudaMemcpy(h_logits.data(), logits_buf, V * sizeof(half), cudaMemcpyDeviceToHost);
+                    max_idx = sampler.sample(h_logits.data(), V, ctx);
+                }
 
                 if (step >= (int)prompt_ids.size()) {
                     if (!got_first_tok) { t_first = std::chrono::high_resolution_clock::now(); got_first_tok = true; }
@@ -731,14 +751,27 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     rms_norm(norm_buf, gpu_hidden_half[last_gpu], (half*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
                 qi_logits.quantize(norm_buf, H, 0);
                 quant_gemv(out_w->data, out_w->type, norm_buf, logits_buf, H, V, &qi_logits);
-                cudaDeviceSynchronize();
-
-                std::vector<half> h_logits(V);
-                cudaMemcpy(h_logits.data(), logits_buf, V * sizeof(half), cudaMemcpyDeviceToHost);
 
                 std::vector<int> ctx = prompt_ids;
                 ctx.insert(ctx.end(), generated.begin(), generated.end());
-                int max_idx = sampler.sample(h_logits.data(), V, ctx);
+
+                // Greedy fast path: see comment in the non-streaming generate.
+                int max_idx;
+                const auto& sp_now = sampler.params();
+                bool greedy_fast = (sp_now.temperature <= 0.0f)
+                                && (sp_now.rep_penalty == 1.0f)
+                                && (sp_now.freq_penalty == 0.0f)
+                                && (sp_now.pres_penalty == 0.0f);
+                if (greedy_fast) {
+                    argmax_half_kernel<<<1, 1024>>>(logits_buf, V, d_argmax);
+                    cudaMemcpy(h_argmax_pinned, d_argmax, sizeof(int), cudaMemcpyDeviceToHost);
+                    max_idx = h_argmax_pinned[0];
+                } else {
+                    cudaDeviceSynchronize();
+                    std::vector<half> h_logits(V);
+                    cudaMemcpy(h_logits.data(), logits_buf, V * sizeof(half), cudaMemcpyDeviceToHost);
+                    max_idx = sampler.sample(h_logits.data(), V, ctx);
+                }
 
                 generated.push_back(max_idx);
                 if (step >= (int)prompt_ids.size()) {
