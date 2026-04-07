@@ -7,9 +7,13 @@
 #define QK8 32
 
 typedef struct { half d; half dmin; uint8_t scales[12]; uint8_t qh[32]; uint8_t qs[128]; } block_q5_K;
+typedef struct { half d; half dmin; uint8_t scales[12]; uint8_t qs[128]; } block_q4_K;
 typedef struct { uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; half d; } block_q6_K;
 typedef struct { half d; int8_t qs[32]; } block_q8_0_32;
 typedef struct { half2 ds; int8_t qs[QK8]; } block_q8_1;
+// Q5_1: 32 elements per block, half d (scale) + half m (min) + 4 bytes qh (5th bit) + 16 bytes qs (4-bit packed)
+typedef struct { half d; half m; uint8_t qh[4]; uint8_t qs[16]; } block_q5_1;
+static_assert(sizeof(block_q5_1) == 24, "Q5_1 block must be 24 bytes");
 
 __global__ void quantize_input_q8_1(const half* __restrict__ x, block_q8_1* __restrict__ out, int K) {
     int blk = blockIdx.x * blockDim.x + threadIdx.x;
@@ -92,6 +96,200 @@ __global__ void gemv_q5_K_q8(
     __shared__ float sm[8]; int w2=threadIdx.x>>5,l=threadIdx.x&31,nw=blockDim.x>>5;
     if(l==0)sm[w2]=thread_sum; __syncthreads();
     if(w2==0&&l<nw){float v=sm[l]; for(int o=16;o>0;o>>=1)v+=__shfl_xor_sync(0xffffffff,v,o); if(l==0)output[row]=__float2half(v);}
+}
+
+// ============ Q5_1 GEMV ============
+// Q5_1 block: 32 elements, half d + half m + 4 bytes qh + 16 bytes qs
+// element[i] = d * (qs_4bit[i] | (qh_bit[i] << 4)) + m
+// dot(x, w_block) = d * Σ(x[i] * q5[i]) + m * Σ(x[i])
+// We use q8_1 input: x_q8 holds int8 quantized x with scale d8 and sum s8.
+// Σ(x[i] * q5[i]) = Σ((d8 * x_q8[i]) * q5[i]) = d8 * Σ(x_q8[i] * q5[i])
+// Σ(x[i]) = s8
+// → dot = d * d8 * Σ(x_q8 * q5) + m * s8
+__global__ void gemv_q5_1_q8(
+    const void* __restrict__ weight,
+    const block_q8_1* __restrict__ x_q8,
+    half* __restrict__ output,
+    const int K, const int N
+) {
+    const int row = blockIdx.x;
+    if (row >= N) return;
+    const int nblocks = K / 32;  // q5_1 block = 32 elements = same as q8_1 block
+    const block_q5_1* w_row = (const block_q5_1*)weight + (size_t)row * nblocks;
+
+    float thread_sum = 0.0f;
+    for (int b = threadIdx.x; b < nblocks; b += blockDim.x) {
+        const block_q5_1* wb = &w_row[b];
+        const block_q8_1* xb = &x_q8[b];
+        float d_w = __half2float(wb->d);
+        float m_w = __half2float(wb->m);
+        float d_x = __half2float(xb->ds.x);
+        float s_x = __half2float(xb->ds.y);
+
+        // Pack qh into a uint32 for fast bit extraction
+        uint32_t qh = (uint32_t)wb->qh[0] | ((uint32_t)wb->qh[1] << 8) |
+                      ((uint32_t)wb->qh[2] << 16) | ((uint32_t)wb->qh[3] << 24);
+
+        int isum = 0;
+        #pragma unroll
+        for (int j = 0; j < 32; j += 8) {
+            // Each qs byte holds two 4-bit values: low nibble = elem j, high nibble = elem j+16
+            // Layout: qs[0] holds (elem 0, elem 16), qs[1] holds (elem 1, elem 17), ...
+            // We need 8 consecutive elements [j, j+1, ..., j+7] but they're scattered.
+            // For simplicity, just accumulate one element at a time using fp accumulator —
+            // simpler than packing for dp4a given the unusual layout.
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                int idx = j + k;
+                int qs_idx = idx % 16;
+                uint8_t qs_byte = wb->qs[qs_idx];
+                int q4 = (idx < 16) ? (qs_byte & 0xF) : (qs_byte >> 4);
+                int qh_bit = (qh >> idx) & 1;
+                int q5 = q4 | (qh_bit << 4);  // [0..31]
+                isum += (int)xb->qs[idx] * q5;
+            }
+        }
+        thread_sum += d_w * d_x * (float)isum + m_w * s_x;
+    }
+    for (int off=16;off>0;off>>=1) thread_sum+=__shfl_xor_sync(0xffffffff,thread_sum,off);
+    __shared__ float sm[8]; int w2=threadIdx.x>>5,l=threadIdx.x&31,nw=blockDim.x>>5;
+    if(l==0)sm[w2]=thread_sum; __syncthreads();
+    if(w2==0&&l<nw){float v=sm[l]; for(int o=16;o>0;o>>=1)v+=__shfl_xor_sync(0xffffffff,v,o); if(l==0)output[row]=__float2half(v);}
+}
+
+__global__ void gemv_q5_1_q8_f32o(
+    const void* __restrict__ weight,
+    const block_q8_1* __restrict__ x_q8,
+    float* __restrict__ output,
+    const int K, const int N
+) {
+    const int row = blockIdx.x;
+    if (row >= N) return;
+    const int nblocks = K / 32;
+    const block_q5_1* w_row = (const block_q5_1*)weight + (size_t)row * nblocks;
+
+    float thread_sum = 0.0f;
+    for (int b = threadIdx.x; b < nblocks; b += blockDim.x) {
+        const block_q5_1* wb = &w_row[b];
+        const block_q8_1* xb = &x_q8[b];
+        float d_w = __half2float(wb->d);
+        float m_w = __half2float(wb->m);
+        float d_x = __half2float(xb->ds.x);
+        float s_x = __half2float(xb->ds.y);
+
+        uint32_t qh = (uint32_t)wb->qh[0] | ((uint32_t)wb->qh[1] << 8) |
+                      ((uint32_t)wb->qh[2] << 16) | ((uint32_t)wb->qh[3] << 24);
+
+        int isum = 0;
+        #pragma unroll
+        for (int idx = 0; idx < 32; idx++) {
+            int qs_idx = idx % 16;
+            uint8_t qs_byte = wb->qs[qs_idx];
+            int q4 = (idx < 16) ? (qs_byte & 0xF) : (qs_byte >> 4);
+            int qh_bit = (qh >> idx) & 1;
+            int q5 = q4 | (qh_bit << 4);
+            isum += (int)xb->qs[idx] * q5;
+        }
+        thread_sum += d_w * d_x * (float)isum + m_w * s_x;
+    }
+    for (int off=16;off>0;off>>=1) thread_sum+=__shfl_xor_sync(0xffffffff,thread_sum,off);
+    __shared__ float sm[8]; int w2=threadIdx.x>>5,l=threadIdx.x&31,nw=blockDim.x>>5;
+    if(l==0)sm[w2]=thread_sum; __syncthreads();
+    if(w2==0&&l<nw){float v=sm[l]; for(int o=16;o>0;o>>=1)v+=__shfl_xor_sync(0xffffffff,v,o); if(l==0)output[row]=v;}
+}
+
+// ============ Q4_K GEMV — dp4a + vec ============
+// Q4_K block: 256 elements, half d + half dmin + 12 bytes scales + 128 bytes qs
+// Each sub-block (32 elements) shares one (sc, mn) pair packed into the
+// 12-byte scales array using the same 6-bit packing as Q5_K (since Q4_K and
+// Q5_K share scale layout — Q5_K just adds a high bit on top of 4 bits).
+// qs layout: 8 sub-blocks of 32 elements each, with each pair (sub i, sub i+4)
+// of sub-blocks sharing one byte (low 4 bits = sub i, high 4 bits = sub i+4).
+// Same as Q5_K but without the qh bit.
+
+__global__ void gemv_q4_K_q8(
+    const void* __restrict__ weight,
+    const block_q8_1* __restrict__ x_q8,
+    half* __restrict__ output,
+    const int K, const int N
+) {
+    const int row = blockIdx.x;
+    if (row >= N) return;
+    const int bpr = K / QK_K;
+    const int nsub = K / QK8;
+    const block_q4_K* w_row = (const block_q4_K*)weight + (size_t)row * bpr;
+
+    float thread_sum = 0.0f;
+    for (int sb = threadIdx.x; sb < nsub; sb += blockDim.x) {
+        int blk_idx = sb >> 3, sub = sb & 7;
+        const block_q4_K* b = &w_row[blk_idx];
+        const block_q8_1* q8 = &x_q8[sb];
+        float d4 = __half2float(b->d), dmin = __half2float(b->dmin);
+        float d8 = __half2float(q8->ds.x), s8 = __half2float(q8->ds.y);
+        const uint8_t* s = b->scales;
+        uint8_t sc, mn;
+        if (sub < 4) { sc = s[sub]&63; mn = s[sub+4]&63; }
+        else { sc = (s[sub+4]&0xF)|((s[sub-4]>>6)<<4); mn = (s[sub+4]>>4)|((s[sub]>>6)<<4); }
+        const uint8_t* ql_ptr = b->qs + (sub >> 1) * 32;
+        int ql_shift = (sub & 1) * 4;
+        int isum = 0;
+        #pragma unroll
+        for (int j = 0; j < 32; j += 4) {
+            uint8_t q0 = (ql_ptr[j]   >> ql_shift) & 0xF;
+            uint8_t q1 = (ql_ptr[j+1] >> ql_shift) & 0xF;
+            uint8_t q2 = (ql_ptr[j+2] >> ql_shift) & 0xF;
+            uint8_t q3 = (ql_ptr[j+3] >> ql_shift) & 0xF;
+            isum = __dp4a(q0|(q1<<8)|(q2<<16)|(q3<<24), *(const int*)&q8->qs[j], isum);
+        }
+        thread_sum += d4*sc*d8*isum - dmin*mn*s8;
+    }
+    for (int off=16;off>0;off>>=1) thread_sum+=__shfl_xor_sync(0xffffffff,thread_sum,off);
+    __shared__ float sm[8]; int w2=threadIdx.x>>5,l=threadIdx.x&31,nw=blockDim.x>>5;
+    if(l==0)sm[w2]=thread_sum; __syncthreads();
+    if(w2==0&&l<nw){float v=sm[l]; for(int o=16;o>0;o>>=1)v+=__shfl_xor_sync(0xffffffff,v,o); if(l==0)output[row]=__float2half(v);}
+}
+
+// FP32 output variant
+__global__ void gemv_q4_K_q8_f32o(
+    const void* __restrict__ weight,
+    const block_q8_1* __restrict__ x_q8,
+    float* __restrict__ output,
+    const int K, const int N
+) {
+    const int row = blockIdx.x;
+    if (row >= N) return;
+    const int bpr = K / QK_K;
+    const int nsub = K / QK8;
+    const block_q4_K* w_row = (const block_q4_K*)weight + (size_t)row * bpr;
+
+    float thread_sum = 0.0f;
+    for (int sb = threadIdx.x; sb < nsub; sb += blockDim.x) {
+        int blk_idx = sb >> 3, sub = sb & 7;
+        const block_q4_K* b = &w_row[blk_idx];
+        const block_q8_1* q8 = &x_q8[sb];
+        float d4 = __half2float(b->d), dmin = __half2float(b->dmin);
+        float d8 = __half2float(q8->ds.x), s8 = __half2float(q8->ds.y);
+        const uint8_t* s = b->scales;
+        uint8_t sc, mn;
+        if (sub < 4) { sc = s[sub]&63; mn = s[sub+4]&63; }
+        else { sc = (s[sub+4]&0xF)|((s[sub-4]>>6)<<4); mn = (s[sub+4]>>4)|((s[sub]>>6)<<4); }
+        const uint8_t* ql_ptr = b->qs + (sub >> 1) * 32;
+        int ql_shift = (sub & 1) * 4;
+        int isum = 0;
+        #pragma unroll
+        for (int j = 0; j < 32; j += 4) {
+            uint8_t q0 = (ql_ptr[j]   >> ql_shift) & 0xF;
+            uint8_t q1 = (ql_ptr[j+1] >> ql_shift) & 0xF;
+            uint8_t q2 = (ql_ptr[j+2] >> ql_shift) & 0xF;
+            uint8_t q3 = (ql_ptr[j+3] >> ql_shift) & 0xF;
+            isum = __dp4a(q0|(q1<<8)|(q2<<16)|(q3<<24), *(const int*)&q8->qs[j], isum);
+        }
+        thread_sum += d4*sc*d8*isum - dmin*mn*s8;
+    }
+    for (int off=16;off>0;off>>=1) thread_sum+=__shfl_xor_sync(0xffffffff,thread_sum,off);
+    __shared__ float sm[8]; int w2=threadIdx.x>>5,l=threadIdx.x&31,nw=blockDim.x>>5;
+    if(l==0)sm[w2]=thread_sum; __syncthreads();
+    if(w2==0&&l<nw){float v=sm[l]; for(int o=16;o>0;o>>=1)v+=__shfl_xor_sync(0xffffffff,v,o); if(l==0)output[row]=v;}
 }
 
 // ============ Q6_K GEMV — dp4a + vec ============
@@ -378,16 +576,20 @@ inline void quant_gemv(void* weight,ggml_type type,half* input,half* output,int 
                        QuantInput* qi=nullptr,cudaStream_t stream=0){
     // Use 128 threads for better occupancy with K=5120
     int threads = 128;
-    if(qi&&(type==GGML_TYPE_Q5_K||type==GGML_TYPE_Q6_K)){
+    if(qi&&(type==GGML_TYPE_Q4_K||type==GGML_TYPE_Q5_K||type==GGML_TYPE_Q6_K||type==GGML_TYPE_Q5_1)){
         qi->quantize(input,K,stream);
-        if(type==GGML_TYPE_Q5_K)gemv_q5_K_q8<<<N,threads,0,stream>>>(weight,qi->q8_buf,output,K,N);
-        else                    gemv_q6_K_q8<<<N,threads,0,stream>>>(weight,qi->q8_buf,output,K,N);
+        if(type==GGML_TYPE_Q4_K)      gemv_q4_K_q8<<<N,threads,0,stream>>>(weight,qi->q8_buf,output,K,N);
+        else if(type==GGML_TYPE_Q5_K) gemv_q5_K_q8<<<N,threads,0,stream>>>(weight,qi->q8_buf,output,K,N);
+        else if(type==GGML_TYPE_Q6_K) gemv_q6_K_q8<<<N,threads,0,stream>>>(weight,qi->q8_buf,output,K,N);
+        else                          gemv_q5_1_q8<<<N,threads,0,stream>>>(weight,qi->q8_buf,output,K,N);
     } else {
         switch(type){
-        case GGML_TYPE_Q5_K:case GGML_TYPE_Q6_K:{
+        case GGML_TYPE_Q4_K:case GGML_TYPE_Q5_K:case GGML_TYPE_Q6_K:case GGML_TYPE_Q5_1:{
             QuantInput tmp;tmp.quantize(input,K,stream);
-            if(type==GGML_TYPE_Q5_K)gemv_q5_K_q8<<<N,threads,0,stream>>>(weight,tmp.q8_buf,output,K,N);
-            else                    gemv_q6_K_q8<<<N,threads,0,stream>>>(weight,tmp.q8_buf,output,K,N);
+            if(type==GGML_TYPE_Q4_K)      gemv_q4_K_q8<<<N,threads,0,stream>>>(weight,tmp.q8_buf,output,K,N);
+            else if(type==GGML_TYPE_Q5_K) gemv_q5_K_q8<<<N,threads,0,stream>>>(weight,tmp.q8_buf,output,K,N);
+            else if(type==GGML_TYPE_Q6_K) gemv_q6_K_q8<<<N,threads,0,stream>>>(weight,tmp.q8_buf,output,K,N);
+            else                          gemv_q5_1_q8<<<N,threads,0,stream>>>(weight,tmp.q8_buf,output,K,N);
             cudaStreamSynchronize(stream);tmp.free_buf();break;}
         case GGML_TYPE_Q8_0:gemv_q8_0<<<N,256,0,stream>>>(weight,input,output,K,N);break;
         case GGML_TYPE_F16: gemv_fp16<<<N,256,0,stream>>>((half*)weight,input,output,K,N);break;
@@ -401,16 +603,18 @@ inline void quant_gemv(void* weight,ggml_type type,half* input,half* output,int 
 inline void quant_gemv_f32(void* weight,ggml_type type,float* input,float* output,int K,int N,
                            QuantInput* qi=nullptr,cudaStream_t stream=0){
     int threads = 128;
-    if(qi&&(type==GGML_TYPE_Q5_K||type==GGML_TYPE_Q6_K)){
+    if(qi&&(type==GGML_TYPE_Q4_K||type==GGML_TYPE_Q5_K||type==GGML_TYPE_Q6_K)){
         qi->quantize_f32(input,K,stream);
-        if(type==GGML_TYPE_Q5_K)gemv_q5_K_q8_f32o<<<N,threads,0,stream>>>(weight,qi->q8_buf,output,K,N);
-        else                    gemv_q6_K_q8_f32o<<<N,threads,0,stream>>>(weight,qi->q8_buf,output,K,N);
+        if(type==GGML_TYPE_Q4_K)      gemv_q4_K_q8_f32o<<<N,threads,0,stream>>>(weight,qi->q8_buf,output,K,N);
+        else if(type==GGML_TYPE_Q5_K) gemv_q5_K_q8_f32o<<<N,threads,0,stream>>>(weight,qi->q8_buf,output,K,N);
+        else                          gemv_q6_K_q8_f32o<<<N,threads,0,stream>>>(weight,qi->q8_buf,output,K,N);
     } else {
         switch(type){
-        case GGML_TYPE_Q5_K:case GGML_TYPE_Q6_K:{
+        case GGML_TYPE_Q4_K:case GGML_TYPE_Q5_K:case GGML_TYPE_Q6_K:{
             QuantInput tmp;tmp.quantize_f32(input,K,stream);
-            if(type==GGML_TYPE_Q5_K)gemv_q5_K_q8_f32o<<<N,threads,0,stream>>>(weight,tmp.q8_buf,output,K,N);
-            else                    gemv_q6_K_q8_f32o<<<N,threads,0,stream>>>(weight,tmp.q8_buf,output,K,N);
+            if(type==GGML_TYPE_Q4_K)      gemv_q4_K_q8_f32o<<<N,threads,0,stream>>>(weight,tmp.q8_buf,output,K,N);
+            else if(type==GGML_TYPE_Q5_K) gemv_q5_K_q8_f32o<<<N,threads,0,stream>>>(weight,tmp.q8_buf,output,K,N);
+            else                          gemv_q6_K_q8_f32o<<<N,threads,0,stream>>>(weight,tmp.q8_buf,output,K,N);
             cudaStreamSynchronize(stream);tmp.free_buf();break;}
         case GGML_TYPE_Q8_0:gemv_q8_0_f32<<<N,256,0,stream>>>(weight,input,output,K,N);break;
         case GGML_TYPE_F16: gemv_fp16_f32<<<N,256,0,stream>>>((half*)weight,input,output,K,N);break;

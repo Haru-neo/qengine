@@ -295,6 +295,19 @@ __global__ void silu_mul_kernel(half* __restrict__ a, const half* __restrict__ b
     }
 }
 
+// Fused GeLU(tanh approx)(a) * b — used by Gemma's GeGLU FFN
+// gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+__global__ void gelu_tanh_mul_kernel(half* __restrict__ a, const half* __restrict__ b, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float va = __half2float(a[idx]);
+        const float k = 0.7978845608f;  // sqrt(2/pi)
+        float inner = k * (va + 0.044715f * va * va * va);
+        float gelu = 0.5f * va * (1.0f + tanhf(inner));
+        a[idx] = __float2half(gelu * __half2float(b[idx]));
+    }
+}
+
 // FP32 variant: a (and output) is fp32, b is fp32
 __global__ void silu_mul_kernel_f32(float* __restrict__ a, const float* __restrict__ b, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;

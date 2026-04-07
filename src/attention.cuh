@@ -252,6 +252,48 @@ __global__ void attn_score_kernel(
     }
 }
 
+// FP16 K-cache variant (Gemma uses fp16 KV cache)
+__global__ void attn_score_kernel_h(
+    const half* __restrict__ q,         // [num_q_heads * head_dim]
+    const half* __restrict__ k_cache,   // [seq_len * num_kv_heads * head_dim] FP16
+    float* __restrict__ scores,         // [num_q_heads * seq_len]
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    float scale
+) {
+    int q_head = blockIdx.x;
+    int pos = blockIdx.y;
+    if (q_head >= num_q_heads || pos >= seq_len) return;
+
+    int kv_head = q_head / (num_q_heads / num_kv_heads);
+
+    const half* qh = q + q_head * head_dim;
+    const half* kh = k_cache + pos * num_kv_heads * head_dim + kv_head * head_dim;
+
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
+        sum += __half2float(qh[i]) * __half2float(kh[i]);
+
+    for (int off = 16; off > 0; off >>= 1)
+        sum += __shfl_xor_sync(0xffffffff, sum, off);
+
+    __shared__ float warp_sums[8];
+    int warp_id = threadIdx.x >> 5;
+    int lane_id = threadIdx.x & 31;
+    int n_warps = (blockDim.x + 31) >> 5;
+    if (lane_id == 0) warp_sums[warp_id] = sum;
+    __syncthreads();
+    if (warp_id == 0) {
+        sum = (lane_id < n_warps) ? warp_sums[lane_id] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1)
+            sum += __shfl_xor_sync(0xffffffff, sum, off);
+        if (lane_id == 0)
+            scores[q_head * seq_len + pos] = sum * scale;
+    }
+}
+
 // FP32 Q variant
 __global__ void attn_score_kernel_f32(
     const float* __restrict__ q,
@@ -368,6 +410,31 @@ __global__ void attn_value_kernel(
         float sum = 0.0f;
         for (int pos = 0; pos < seq_len; pos++) {
             sum += sc[pos] * v_cache[pos * num_kv_heads * head_dim + kv_head * head_dim + d];
+        }
+        output[q_head * head_dim + d] = __float2half(sum);
+    }
+}
+
+// FP16 V-cache variant (Gemma uses fp16 KV cache)
+__global__ void attn_value_kernel_h(
+    const float* __restrict__ scores,
+    const half* __restrict__ v_cache,
+    half* __restrict__ output,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len
+) {
+    int q_head = blockIdx.x;
+    if (q_head >= num_q_heads) return;
+
+    int kv_head = q_head / (num_q_heads / num_kv_heads);
+    const float* sc = scores + q_head * seq_len;
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float sum = 0.0f;
+        for (int pos = 0; pos < seq_len; pos++) {
+            sum += sc[pos] * __half2float(v_cache[pos * num_kv_heads * head_dim + kv_head * head_dim + d]);
         }
         output[q_head * head_dim + d] = __float2half(sum);
     }

@@ -252,3 +252,25 @@ inline uint64_t TensorInfo::byte_size() const {
         default: return ne * 2;  // assume fp16
     }
 }
+
+// Bytes for one row (single dim along row_dim) of a quantized tensor.
+// Used by gemma MoE expert tensor row stride math.
+inline size_t ggml_row_bytes(ggml_type type, int row_dim) {
+    switch (type) {
+        case GGML_TYPE_F32:  return (size_t)row_dim * 4;
+        case GGML_TYPE_F16:  return (size_t)row_dim * 2;
+        case GGML_TYPE_BF16: return (size_t)row_dim * 2;
+        case GGML_TYPE_Q4_0: return (size_t)row_dim / 32 * 18;
+        case GGML_TYPE_Q4_1: return (size_t)row_dim / 32 * 20;
+        case GGML_TYPE_Q5_0: return (size_t)row_dim / 32 * 22;
+        case GGML_TYPE_Q5_1: return (size_t)row_dim / 32 * 24;
+        case GGML_TYPE_Q8_0: return (size_t)row_dim / 32 * 34;
+        case GGML_TYPE_Q2_K: return (size_t)row_dim / 256 * 84;
+        case GGML_TYPE_Q3_K: return (size_t)row_dim / 256 * 110;
+        case GGML_TYPE_Q4_K: return (size_t)row_dim / 256 * 144;
+        case GGML_TYPE_Q5_K: return (size_t)row_dim / 256 * 176;
+        case GGML_TYPE_Q6_K: return (size_t)row_dim / 256 * 210;
+        case GGML_TYPE_Q8_K: return (size_t)row_dim / 256 * 292;
+        default: return (size_t)row_dim * 2;
+    }
+}
