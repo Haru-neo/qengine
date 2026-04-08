@@ -336,11 +336,61 @@ struct QwenModel {
     std::unordered_map<int, KVCache> kv_caches;
     int kv_max_seq = 0;
 
+    // ============ TurboQuant 3-bit KV cache (optional, MTP_TQ=1) ============
+    // Drop-in replacement for the fp16 KV cache that compresses K/V to ~52
+    // bytes per 128-element block (~4.7x smaller than fp16). On the read
+    // path the active range [0..seq_len) is dequantized into
+    // tq_k_buf / tq_v_buf which are then fed to the existing attn_score and
+    // attn_value kernels — no kernel rewrite required.
+    struct TQKVCache {
+        block_tq3* k;       // [max_seq, blocks_per_token]
+        block_tq3* v;
+        int blocks_per_token;
+    };
+    std::unordered_map<int, TQKVCache> tq_kv_caches;
+    half* tq_k_buf[4] = {nullptr,nullptr,nullptr,nullptr};  // per-GPU dequant scratch
+    half* tq_v_buf[4] = {nullptr,nullptr,nullptr,nullptr};
+    bool use_turboquant = false;
+
     void init_kv_cache(int max_seq) {
         kv_max_seq = max_seq;
         int num_kv = cfg.num_kv_heads;
         int hd = cfg.head_dim;
-        int kv_size = max_seq * num_kv * hd * sizeof(half);
+        int kv_dim = num_kv * hd;
+        int kv_size = max_seq * kv_dim * sizeof(half);
+        use_turboquant = (getenv("MTP_TQ") != nullptr);
+
+        if (use_turboquant) {
+            // 3-bit TurboQuant cache. blocks_per_token = kv_dim / 128.
+            // For Qwen35: 4*256 / 128 = 8 blocks per token, 52 B each
+            // = 416 B per token (vs 2048 B fp16) → 4.92x compression.
+            int bpt = kv_dim / TQ_BLOCK_SIZE;
+            for (int g = 0; g < gpu->num_gpus; g++) tq3_init_signs(g);
+            size_t per_layer_bytes = (size_t)max_seq * bpt * sizeof(block_tq3);
+            for (int layer = 0; layer < cfg.num_layers; layer++) {
+                if (!is_attn_layer(layer)) continue;
+                int g = gpu->layer_gpu[layer];
+                cudaSetDevice(g);
+                TQKVCache kv;
+                kv.blocks_per_token = bpt;
+                cudaMalloc(&kv.k, per_layer_bytes);
+                cudaMalloc(&kv.v, per_layer_bytes);
+                cudaMemset(kv.k, 0, per_layer_bytes);
+                cudaMemset(kv.v, 0, per_layer_bytes);
+                tq_kv_caches[layer] = kv;
+            }
+            // Per-GPU dequant scratch (size = max_seq * kv_dim half)
+            for (int g = 0; g < gpu->num_gpus; g++) {
+                cudaSetDevice(g);
+                cudaMalloc(&tq_k_buf[g], (size_t)max_seq * kv_dim * sizeof(half));
+                cudaMalloc(&tq_v_buf[g], (size_t)max_seq * kv_dim * sizeof(half));
+            }
+            float total_mb = (float)tq_kv_caches.size() * per_layer_bytes * 2 / 1e6;
+            float fp16_mb  = (float)tq_kv_caches.size() * kv_size * 2 / 1e6;
+            printf("KV cache (TurboQuant 3-bit): %d layers, %d max_seq, %.1f MB total (vs %.1f MB fp16, %.2fx compression)\n",
+                (int)tq_kv_caches.size(), max_seq, total_mb, fp16_mb, fp16_mb / total_mb);
+            return;
+        }
 
         for (int layer = 0; layer < cfg.num_layers; layer++) {
             if (!is_attn_layer(layer)) continue;
@@ -361,7 +411,19 @@ struct QwenModel {
     void reset_kv_cache() {
         int num_kv = cfg.num_kv_heads;
         int hd = cfg.head_dim;
-        int kv_size = kv_max_seq * num_kv * hd * sizeof(half);
+        int kv_dim = num_kv * hd;
+        if (use_turboquant) {
+            int bpt = kv_dim / TQ_BLOCK_SIZE;
+            size_t sz = (size_t)kv_max_seq * bpt * sizeof(block_tq3);
+            for (auto& [layer, kv] : tq_kv_caches) {
+                int g = gpu->layer_gpu[layer];
+                cudaSetDevice(g);
+                cudaMemset(kv.k, 0, sz);
+                cudaMemset(kv.v, 0, sz);
+            }
+            return;
+        }
+        int kv_size = kv_max_seq * kv_dim * sizeof(half);
         for (auto& [layer, kv] : kv_caches) {
             int g = gpu->layer_gpu[layer];
             cudaSetDevice(g);
@@ -380,7 +442,6 @@ struct QwenModel {
         float eps = cfg.rms_norm_eps;
         float scale = 1.0f / sqrtf((float)hd);
         auto& ab = attn_bufs[g];
-        auto& kv = kv_caches[layer];
 
         auto* norm_w = t(blk(layer, "attn_norm.weight"));
         auto* q_w = t(blk(layer, "attn_q.weight"));
@@ -438,28 +499,49 @@ struct QwenModel {
         apply_rope_kernel<<<(num_kv * half_rope + 255)/256, 256, 0, stream>>>(
             ab.k_proj, sin_pos, cos_pos, num_kv, hd, rope_dim);
 
-        // 6. Store K, V into FP16 cache at position pos
-        half* k_cache_pos = kv.k + (size_t)pos * kv_dim;
-        half* v_cache_pos = kv.v + (size_t)pos * kv_dim;
-        cudaMemcpyAsync(k_cache_pos, ab.k_proj, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
-        cudaMemcpyAsync(v_cache_pos, ab.v_proj, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+        // 6. Store K, V at position pos (fp16 or TurboQuant 3-bit)
+        half* k_for_attn;
+        half* v_for_attn;
+        if (use_turboquant) {
+            auto& tq = tq_kv_caches[layer];
+            int bpt = tq.blocks_per_token;
+            // Quantize the just-computed K/V into the TQ slot for `pos`.
+            size_t off = (size_t)pos * bpt;
+            tq3_quantize_kernel<<<(bpt+31)/32, 32, 0, stream>>>(
+                ab.k_proj, &tq.k[off], bpt);
+            tq3_quantize_kernel<<<(bpt+31)/32, 32, 0, stream>>>(
+                ab.v_proj, &tq.v[off], bpt);
+            // Dequantize the active range [0..seq_len) into per-GPU scratch
+            int total = seq_len * bpt;
+            tq3_dequantize_kernel<<<(total+31)/32, 32, 0, stream>>>(
+                tq.k, tq_k_buf[g], total);
+            tq3_dequantize_kernel<<<(total+31)/32, 32, 0, stream>>>(
+                tq.v, tq_v_buf[g], total);
+            k_for_attn = tq_k_buf[g];
+            v_for_attn = tq_v_buf[g];
+        } else {
+            auto& kv = kv_caches[layer];
+            half* k_cache_pos = kv.k + (size_t)pos * kv_dim;
+            half* v_cache_pos = kv.v + (size_t)pos * kv_dim;
+            cudaMemcpyAsync(k_cache_pos, ab.k_proj, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+            cudaMemcpyAsync(v_cache_pos, ab.v_proj, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+            k_for_attn = kv.k;
+            v_for_attn = kv.v;
+        }
 
-        // 7. Attention: Q[num_q, hd] @ K_cache[seq_len, num_kv, hd]^T → scores → softmax → @ V
-        // FP16 KV cache variant — uses attn_score_kernel_h / attn_value_kernel_h
-        // Both have the cross-warp reduction fix.
+        // 7. Attention: Q[num_q, hd] @ K[seq_len, num_kv, hd]^T → softmax → @ V
+        // Same kernels for both fp16 and TQ paths — TQ just dequants ahead.
         dim3 score_grid(num_q, seq_len);
         attn_score_kernel_h<<<score_grid, min(hd, 256), 0, stream>>>(
-            q_buf, kv.k, ab.attn_scores,
+            q_buf, k_for_attn, ab.attn_scores,
             num_q, num_kv, hd, seq_len, scale);
 
-        // Softmax over seq_len for each q head
         { int st = 1; while(st < seq_len && st < 256) st <<= 1;
         softmax_kernel<<<num_q, st, st * sizeof(float), stream>>>(
             ab.attn_scores, num_q, seq_len); }
 
-        // Weighted sum of V (fp16 V cache)
         attn_value_kernel_h<<<num_q, min(hd, 256), 0, stream>>>(
-            ab.attn_scores, kv.v, q_buf,
+            ab.attn_scores, v_for_attn, q_buf,
             num_q, num_kv, hd, seq_len);
 
         // 8. Output gate: out *= sigmoid(gate)
@@ -954,7 +1036,6 @@ struct QwenModel {
         float scale = 1.0f / sqrtf((float)hd);
         auto& abA = attn_bufs[g];   auto& abB = attn_bufs2[g];
         auto& bA  = bufs[g];        auto& bB  = bufs2[g];
-        auto& kv  = kv_caches[layer];
 
         auto* norm_w   = t(blk(layer, "attn_norm.weight"));
         auto* q_w      = t(blk(layer, "attn_q.weight"));
@@ -1018,19 +1099,37 @@ struct QwenModel {
                 q_buf, sin_pos, cos_pos, num_q, hd, rope_dim);
             apply_rope_kernel<<<(num_kv * half_rope + 255)/256, 256, 0, stream>>>(
                 ab.k_proj, sin_pos, cos_pos, num_kv, hd, rope_dim);
-            half* k_cache_pos = kv.k + (size_t)pos * kv_dim;
-            half* v_cache_pos = kv.v + (size_t)pos * kv_dim;
-            cudaMemcpyAsync(k_cache_pos, ab.k_proj, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(v_cache_pos, ab.v_proj, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+            half* k_for_attn;
+            half* v_for_attn;
+            if (use_turboquant) {
+                auto& tq = tq_kv_caches[layer];
+                int bpt = tq.blocks_per_token;
+                size_t off = (size_t)pos * bpt;
+                tq3_quantize_kernel<<<(bpt+31)/32, 32, 0, stream>>>(ab.k_proj, &tq.k[off], bpt);
+                tq3_quantize_kernel<<<(bpt+31)/32, 32, 0, stream>>>(ab.v_proj, &tq.v[off], bpt);
+                int total = (pos + 1) * bpt;
+                tq3_dequantize_kernel<<<(total+31)/32, 32, 0, stream>>>(tq.k, tq_k_buf[g], total);
+                tq3_dequantize_kernel<<<(total+31)/32, 32, 0, stream>>>(tq.v, tq_v_buf[g], total);
+                k_for_attn = tq_k_buf[g];
+                v_for_attn = tq_v_buf[g];
+            } else {
+                auto& kv = kv_caches[layer];
+                half* k_cache_pos = kv.k + (size_t)pos * kv_dim;
+                half* v_cache_pos = kv.v + (size_t)pos * kv_dim;
+                cudaMemcpyAsync(k_cache_pos, ab.k_proj, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+                cudaMemcpyAsync(v_cache_pos, ab.v_proj, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+                k_for_attn = kv.k;
+                v_for_attn = kv.v;
+            }
             int seq_len = pos + 1;
             dim3 score_grid(num_q, seq_len);
             attn_score_kernel_h<<<score_grid, min(hd, 256), 0, stream>>>(
-                q_buf, kv.k, ab.attn_scores, num_q, num_kv, hd, seq_len, scale);
+                q_buf, k_for_attn, ab.attn_scores, num_q, num_kv, hd, seq_len, scale);
             { int st = 1; while(st < seq_len && st < 256) st <<= 1;
             softmax_kernel<<<num_q, st, st * sizeof(float), stream>>>(
                 ab.attn_scores, num_q, seq_len); }
             attn_value_kernel_h<<<num_q, min(hd, 256), 0, stream>>>(
-                ab.attn_scores, kv.v, q_buf, num_q, num_kv, hd, seq_len);
+                ab.attn_scores, v_for_attn, q_buf, num_q, num_kv, hd, seq_len);
             apply_gate_sigmoid<<<(total_qg+255)/256, 256, 0, stream>>>(
                 q_buf, gate_buf, total_qg);
         };
