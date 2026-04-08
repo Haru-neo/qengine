@@ -575,8 +575,12 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         }
     }
 
-    // Now that mtp_loaded is known, allocate spec-decoding buffers if requested.
-    spec_enabled = (mtp_loaded && getenv("MTP_SPEC") != nullptr);
+    // Speculative decoding is the default whenever the MTP head is loaded.
+    // Set MTP_SPEC_OFF=1 to fall back to the plain per-token loop. The
+    // per-iter MTP measurement (formerly gated by MTP_ON=1) is suppressed
+    // automatically when spec_enabled is true to avoid running MTP twice
+    // per iter — the spec branch already runs its own draft MTP.
+    spec_enabled = (mtp_loaded && getenv("MTP_SPEC_OFF") == nullptr);
     if (spec_enabled) {
         for (int g = 0; g < n_gpus; g++) {
             cudaSetDevice(g);
@@ -744,7 +748,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 // at the NEXT iter by comparing that iter's main max_idx to the
                 // draft we saved here. mtp_pending_draft / _step persist across
                 // iters for that purpose.
-                if (mtp_loaded && step >= (int)prompt_ids.size() - 1 && getenv("MTP_ON")) {
+                if (mtp_loaded && !spec_enabled && step >= (int)prompt_ids.size() - 1 && getenv("MTP_ON")) {
                     cudaError_t err_pre = cudaGetLastError();
                     if (err_pre != cudaSuccess && mtp_total_count == 0)
                         printf("[MTP] CUDA error BEFORE forward: %s\n", cudaGetErrorString(err_pre));
