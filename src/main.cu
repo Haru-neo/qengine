@@ -554,7 +554,18 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     MTPHead mtp;
     bool mtp_loaded = false;
     {
-        const char* mtp_path = "/home/paru/mtp_work/mtp_head.bin";
+        // Load the MTP head whose hidden size matches this model. The
+        // 27B and 9B Qwen3.5 share the same MTP architecture but have
+        // different dims, so we keep one bin per hidden size and pick
+        // by name. (Falls back to legacy mtp_head.bin if the sized
+        // file is not present, for backwards compat with prior fetches.)
+        char mtp_path_buf[256];
+        snprintf(mtp_path_buf, sizeof(mtp_path_buf),
+                 "/home/paru/mtp_work/mtp_head_%d.bin", model.cfg.hidden_size);
+        const char* mtp_path = mtp_path_buf;
+        if (access(mtp_path, R_OK) != 0) {
+            mtp_path = "/home/paru/mtp_work/mtp_head.bin";
+        }
         if (access(mtp_path, R_OK) == 0) {
             // Pull RoPE table for last_gpu, embd source from GPU 0, lm_head from last_gpu.
             mtp_loaded = mtp.load(
@@ -612,7 +623,14 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     auto generate = [&](const std::vector<int>& prompt_ids, int max_tokens) -> std::string {
         model.reset_all_states();
         std::vector<int> generated;
-        int max_gen = max_tokens > 0 ? max_tokens : 2048;
+        // No default cap on response length: if the caller doesn't pass
+        // max_tokens we let the model run all the way to the end of the
+        // KV context (minus a safety margin for the in-loop bound). It
+        // will still stop on EOS or one of the other stop tags. Caller
+        // can still set an explicit max_tokens to clip earlier.
+        int max_gen = max_tokens > 0
+                      ? max_tokens
+                      : std::max(64, max_seq - (int)prompt_ids.size() - 64);
         auto t0 = std::chrono::high_resolution_clock::now();
         auto t_first = t0;
         bool got_first_tok = false;
@@ -672,7 +690,11 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         }
 
         // ============ Phase 2: per-token loop (handles last prompt token + generation) ============
-        for (int step = prefill_len; step < (int)(prompt_ids.size() + max_gen + 4096); step++) {
+        // The +4096 used to be a "think buffer" so reasoning chains
+        // weren't counted against max_gen, but for unlimited responses
+        // we just cap at the actual KV context capacity instead.
+        int step_cap = std::min((int)prompt_ids.size() + max_gen + 4096, max_seq);
+        for (int step = prefill_len; step < step_cap; step++) {
             int token_id = step < (int)prompt_ids.size() ? prompt_ids[step] : generated.back();
 
             cudaSetDevice(0);
@@ -971,9 +993,14 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         model.reset_all_states();
         std::vector<int> generated;
         std::string utf8_buf;  // buffer for partial UTF-8 sequences
-        int max_gen = max_tokens > 0 ? max_tokens : 2048;
+        // Same uncapped default as the non-streaming path: run to end of
+        // context unless the caller explicitly limits via max_tokens.
+        int max_gen = max_tokens > 0
+                      ? max_tokens
+                      : std::max(64, max_seq - (int)prompt_ids.size() - 64);
 
-        for (int step = 0; step < (int)(prompt_ids.size() + max_gen); step++) {
+        int step_cap = std::min((int)prompt_ids.size() + max_gen, max_seq);
+        for (int step = 0; step < step_cap; step++) {
             int token_id = step < (int)prompt_ids.size() ? prompt_ids[step] : generated.back();
 
             cudaSetDevice(0);

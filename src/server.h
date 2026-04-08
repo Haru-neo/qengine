@@ -528,7 +528,11 @@ struct HttpServer {
 
     void handle_completions(int client_fd, const std::string& body) {
         auto messages = json_get_messages(body);
-        int max_tokens = json_get_int(body, "max_tokens", 500);
+        // 0 == "not set" — generate_fn / stream_generate_fn pick a sensible
+        // default (run until end of context or natural EOS). Don't clip to
+        // 500 here: the API caller may legitimately want a long response
+        // and the engine has the KV context room for it.
+        int max_tokens = json_get_int(body, "max_tokens", 0);
         bool stream = body.find("\"stream\"") != std::string::npos &&
                       (body.find("\"stream\":true") != std::string::npos ||
                        body.find("\"stream\": true") != std::string::npos);
