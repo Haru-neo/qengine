@@ -294,6 +294,102 @@ __global__ void attn_score_kernel_h(
     }
 }
 
+// ============ TurboQuant 3-bit fused attention score kernel ============
+// Block layout: ONE block per (kv_head, pos) processing all `gqa_ratio`
+// query heads that share the kv_head. Cooperative dequant of K[pos,
+// kv_head] runs once and is reused for all 6 dot products (Qwen3.5-27B
+// GQA = 24/4 = 6) — 6x less dequant work than the naive (q_head, pos)
+// layout.
+//
+// Launch: <<< dim3(num_kv_heads, seq_len), head_dim,
+//             head_dim*sizeof(float) >>>
+// Constraints: head_dim multiple of TQ_BLOCK_SIZE (128); blockDim.x ==
+// head_dim; gqa_ratio <= 8 (we keep accumulators in registers).
+__global__ void attn_score_kernel_tq3(
+    const half* __restrict__ q,            // [num_q_heads * head_dim]
+    const block_tq3* __restrict__ k_cache, // [seq_len * blocks_per_token]
+    float* __restrict__ scores,            // [num_q_heads * seq_len]
+    int num_q_heads, int num_kv_heads, int head_dim, int seq_len, float scale
+) {
+    int kv_head = blockIdx.x;
+    int pos     = blockIdx.y;
+    if (kv_head >= num_kv_heads || pos >= seq_len) return;
+
+    int gqa                = num_q_heads / num_kv_heads;
+    int blocks_per_token   = num_kv_heads * head_dim / TQ_BLOCK_SIZE;
+    int blocks_per_kv_head = head_dim / TQ_BLOCK_SIZE;
+
+    extern __shared__ float k_dequant[];   // [head_dim]
+
+    int tid  = threadIdx.x;
+    int bg   = tid / TQ_BLOCK_SIZE;
+    int lane = tid % TQ_BLOCK_SIZE;
+
+    // ── 1. Cooperative dequant of K[pos, kv_head] (head_dim elements,
+    //       which is blocks_per_kv_head separate block_tq3 each handled
+    //       by a 128-thread group).
+    if (bg < blocks_per_kv_head) {
+        const block_tq3* blk = &k_cache[(size_t)pos * blocks_per_token
+                                        + kv_head * blocks_per_kv_head + bg];
+        float* my = &k_dequant[bg * TQ_BLOCK_SIZE];
+
+        int byte_off = (lane * 3) >> 3;
+        int bit_off  = (lane * 3) & 7;
+        uint32_t packed = (uint32_t)blk->qs[byte_off];
+        if (byte_off + 1 < 48)
+            packed |= ((uint32_t)blk->qs[byte_off + 1]) << 8;
+        int idx = (packed >> bit_off) & 0x7;
+        my[lane] = d_tq3_centroids[idx];
+        __syncthreads();
+
+        for (int s = 1; s < TQ_BLOCK_SIZE; s <<= 1) {
+            float a = my[lane];
+            float b = my[lane ^ s];
+            __syncthreads();
+            if ((lane & s) == 0) my[lane] = a + b;
+            else                 my[lane] = b - a;
+            __syncthreads();
+        }
+        // Inverse RHT: 1/√d already applied via scale_norm; sign vector
+        // closes out the rotation. Encoder applies signs BEFORE the WHT,
+        // so we apply them AFTER iWHT (matrix transpose order).
+        float scale_norm = rsqrtf((float)TQ_BLOCK_SIZE) * blk->norm;
+        my[lane] *= d_tq3_signs[lane] * scale_norm;
+    }
+    __syncthreads();
+
+    // ── 2. Compute Q · K_dequant for each of the gqa query heads sharing
+    //       this kv_head. We hold the K element in a register and walk
+    //       through the gqa Q heads sequentially — cheap relative to the
+    //       dequant cost we just paid once.
+    float k_val = k_dequant[tid];
+    __shared__ float warp_sums[8];
+
+    #pragma unroll
+    for (int qi = 0; qi < 8; qi++) {
+        if (qi >= gqa) break;
+        int q_head = kv_head * gqa + qi;
+        const half* qh = q + q_head * head_dim;
+        float prod = __half2float(qh[tid]) * k_val;
+
+        for (int off = 16; off > 0; off >>= 1)
+            prod += __shfl_xor_sync(0xffffffff, prod, off);
+        int warp_id = tid >> 5;
+        int lane_id = tid & 31;
+        int n_warps = (blockDim.x + 31) >> 5;
+        if (lane_id == 0) warp_sums[warp_id] = prod;
+        __syncthreads();
+        if (warp_id == 0) {
+            prod = (lane_id < n_warps) ? warp_sums[lane_id] : 0.0f;
+            for (int off = 16; off > 0; off >>= 1)
+                prod += __shfl_xor_sync(0xffffffff, prod, off);
+            if (lane_id == 0)
+                scores[q_head * seq_len + pos] = prod * scale;
+        }
+        __syncthreads();
+    }
+}
+
 // FP32 Q variant
 __global__ void attn_score_kernel_f32(
     const float* __restrict__ q,
@@ -437,6 +533,88 @@ __global__ void attn_value_kernel_h(
             sum += sc[pos] * __half2float(v_cache[pos * num_kv_heads * head_dim + kv_head * head_dim + d]);
         }
         output[q_head * head_dim + d] = __float2half(sum);
+    }
+}
+
+// ============ TurboQuant 3-bit fused attention value kernel ============
+// Each cuda block handles ONE (kv_head, d_block) and computes the partial
+// V output for all `gqa_ratio` query heads that share this kv_head. For
+// each position we read ONE block_tq3 (52 B), dequant cooperatively into
+// shared memory, and accumulate into a small per-thread per-q_head
+// register array. The dequant cost is therefore amortized over
+// gqa_ratio * head_dim work per position, instead of paying it once per
+// (q_head, d) pair as the dequant-first approach did.
+//
+// Launch: <<< dim3(num_kv_heads, blocks_per_kv_head), TQ_BLOCK_SIZE,
+//             TQ_BLOCK_SIZE * sizeof(float) >>>
+__global__ void attn_value_kernel_tq3(
+    const float* __restrict__ scores,        // [num_q_heads * seq_len]
+    const block_tq3* __restrict__ v_cache,   // [seq_len * blocks_per_token]
+    half* __restrict__ output,               // [num_q_heads * head_dim]
+    int num_q_heads, int num_kv_heads, int head_dim, int seq_len
+) {
+    int kv_head = blockIdx.x;
+    int d_block = blockIdx.y;
+    int gqa     = num_q_heads / num_kv_heads;
+    int blocks_per_token   = num_kv_heads * head_dim / TQ_BLOCK_SIZE;
+    int blocks_per_kv_head = head_dim / TQ_BLOCK_SIZE;
+
+    int lane = threadIdx.x;  // 0..127
+
+    // Per-q_head accumulator. Hardcoded max 8 to avoid runtime alloc; the
+    // actual number used is `gqa` (=6 for Qwen3.5-27B).
+    float acc[8];
+    #pragma unroll
+    for (int q = 0; q < 8; q++) acc[q] = 0.0f;
+
+    extern __shared__ float v_smem[];  // [TQ_BLOCK_SIZE]
+
+    for (int pos = 0; pos < seq_len; pos++) {
+        const block_tq3* blk = &v_cache[(size_t)pos * blocks_per_token
+                                        + kv_head * blocks_per_kv_head + d_block];
+
+        // Cooperative dequant of one block into v_smem.
+        int byte_off = (lane * 3) >> 3;
+        int bit_off  = (lane * 3) & 7;
+        uint32_t packed = (uint32_t)blk->qs[byte_off];
+        if (byte_off + 1 < 48)
+            packed |= ((uint32_t)blk->qs[byte_off + 1]) << 8;
+        int idx = (packed >> bit_off) & 0x7;
+        v_smem[lane] = d_tq3_centroids[idx];
+        __syncthreads();
+
+        for (int s = 1; s < TQ_BLOCK_SIZE; s <<= 1) {
+            float a = v_smem[lane];
+            float b = v_smem[lane ^ s];
+            __syncthreads();
+            if ((lane & s) == 0) v_smem[lane] = a + b;
+            else                 v_smem[lane] = b - a;
+            __syncthreads();
+        }
+        // Inverse RHT (encoder applies signs before WHT; decoder closes
+        // it out after iWHT to match the matrix transpose order).
+        float scale_norm = rsqrtf((float)TQ_BLOCK_SIZE) * blk->norm;
+        float v_val = v_smem[lane] * d_tq3_signs[lane] * scale_norm;
+        __syncthreads();
+
+        // Multiply this V slot into all gqa accumulators.
+        #pragma unroll
+        for (int q = 0; q < 8; q++) {
+            if (q >= gqa) break;
+            int q_head = kv_head * gqa + q;
+            float sc = scores[q_head * seq_len + pos];
+            acc[q] += sc * v_val;
+        }
+    }
+
+    // Write outputs: this thread owns d = d_block * 128 + lane for every
+    // q_head in the GQA group.
+    int d = d_block * TQ_BLOCK_SIZE + lane;
+    #pragma unroll
+    for (int q = 0; q < 8; q++) {
+        if (q >= gqa) break;
+        int q_head = kv_head * gqa + q;
+        output[q_head * head_dim + d] = __float2half(acc[q]);
     }
 }
 

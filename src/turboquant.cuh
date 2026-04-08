@@ -139,19 +139,26 @@ __global__ void tq3_quantize_kernel(
         return;
     }
     
-    // Normalize
+    // Normalize to unit sphere
     float inv_norm = 1.0f / norm;
     for (int i = 0; i < TQ_BLOCK_SIZE; i++)
         data[i] *= inv_norm;
-    
-    // Apply WHT rotation
+
+    // Randomized Hadamard transform: Π·x = (1/√d) · H · (D ⊙ x)
+    //   1. Multiply by random ±1 signs (decorrelates outlier channels — see
+    //      the d_tq3_signs comment; without this, outlier-heavy channels
+    //      do not get spread evenly into a Beta distribution and the
+    //      Lloyd-Max bins saturate).
+    for (int i = 0; i < TQ_BLOCK_SIZE; i++)
+        data[i] *= d_tq3_signs[i];
+    //   2. Walsh-Hadamard + 1/√d normalization (handled inside fast_wht_128)
     fast_wht_128(data);
-    
+
     // Quantize each coordinate with Lloyd-Max
     uint8_t indices[TQ_BLOCK_SIZE];
     for (int i = 0; i < TQ_BLOCK_SIZE; i++)
         indices[i] = tq3_find_bin(data[i]);
-    
+
     // Pack 3-bit indices (groups of 8 → 3 bytes)
     for (int g = 0; g < TQ_BLOCK_SIZE / 8; g++)
         pack_3bit_8(&out->qs[g * 3], &indices[g * 8]);
@@ -181,8 +188,11 @@ __global__ void tq3_dequantize_kernel(
             data[g * 8 + j] = d_tq3_centroids[indices[j]];
     }
 
-    // Inverse WHT
+    // Inverse randomized Hadamard transform: Π^T·y = D ⊙ (1/√d · H · y)
+    //   (WHT is self-inverse with 1/√d normalization)
     fast_iwht_128(data);
+    for (int i = 0; i < TQ_BLOCK_SIZE; i++)
+        data[i] *= d_tq3_signs[i];
 
     // Restore norm
     for (int i = 0; i < TQ_BLOCK_SIZE; i++)
