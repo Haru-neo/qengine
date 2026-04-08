@@ -83,9 +83,19 @@ struct GGUFFile {
         struct stat st;
         fstat(fd, &st);
         mmap_size = st.st_size;
-        
+
+        // Hint to the kernel that we will read sequentially. The loader
+        // fan-out across GPU threads otherwise looks random to the disk
+        // (each thread reads a different range of the file at the same
+        // time), defeating the kernel read-ahead and capping us to ~50
+        // MB/s per thread. fadvise on the fd reaches the page cache
+        // prefetcher; madvise on the mapping reaches the VMA hinting
+        // code. Both are best-effort.
+        posix_fadvise(fd, 0, mmap_size, POSIX_FADV_SEQUENTIAL);
+
         mmap_addr = mmap(nullptr, mmap_size, PROT_READ, MAP_PRIVATE, fd, 0);
         if (mmap_addr == MAP_FAILED) { perror("mmap"); return false; }
+        madvise(mmap_addr, mmap_size, MADV_SEQUENTIAL);
         
         uint8_t* p = (uint8_t*)mmap_addr;
         uint8_t* end = p + mmap_size;

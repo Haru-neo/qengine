@@ -136,7 +136,7 @@ struct QwenModel {
         }
     }
 
-    void alloc_buffers_n2() {
+    void alloc_buffers_n2(int max_seq = 4096) {
         if (n2_buffers_ready) return;
         int H = cfg.hidden_size;
         int I = cfg.intermediate_size;
@@ -162,7 +162,7 @@ struct QwenModel {
             cudaMalloc(&attn_bufs2[g].q_proj,      num_q  * hd * 2 * sizeof(half));
             cudaMalloc(&attn_bufs2[g].k_proj,      num_kv * hd * sizeof(half));
             cudaMalloc(&attn_bufs2[g].v_proj,      num_kv * hd * sizeof(half));
-            cudaMalloc(&attn_bufs2[g].attn_scores, num_q  * 4096 * sizeof(float));
+            cudaMalloc(&attn_bufs2[g].attn_scores, (size_t)num_q * max_seq * sizeof(float));
             cudaMalloc(&attn_bufs2[g].attn_out,    num_q  * hd * sizeof(half));
             cudaMalloc(&attn_bufs2[g].gate_buf,    num_q  * hd * sizeof(half));
         }

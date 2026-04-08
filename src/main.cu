@@ -498,7 +498,7 @@ int run_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, const SamplingPara
 
 // ============ Qwen serve mode: OpenAI-compatible HTTP API ============
 
-int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const Tokenizer& tok, const std::string& model_name, const std::string& api_key = "", int max_seq = 4096) {
+int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const Tokenizer& tok, const std::string& model_name, const std::string& api_key = "", int max_seq = 262144) {
     QwenModel model;
     model.gpu = &gpu_model;
     model.init_config(gguf);
@@ -593,7 +593,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         cudaMalloc(&d_argmax_b,   sizeof(int));
         cudaMallocHost(&h_argmax_pinned_b, sizeof(int));
         cudaMallocHost(&host_transfer_b, H * sizeof(float));
-        model.alloc_buffers_n2();
+        model.alloc_buffers_n2(max_seq);
         model.alloc_gdn_snapshots();
         printf("[SPEC] speculative decoding enabled (MTP K=1, MLP batched)\n");
     }
@@ -1259,7 +1259,7 @@ int main(int argc, char** argv) {
     // Parse sampling params and flags
     SamplingParams sp;
     int serve_port = 0;
-    int max_seq = 4096;
+    int max_seq = 262144;  // 256K — TurboQuant 3-bit KV makes this affordable
     std::string prompt_text, api_key;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--serve") == 0 && i + 1 < argc) {

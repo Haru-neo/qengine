@@ -7,6 +7,7 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <algorithm>
 #include "gguf.h"
 #include "quant_gemv.cuh"  // for q8_0_repack_kernel and block_q8_0_aligned
 
@@ -56,9 +57,9 @@ struct GPUModel {
             printf("  GPU %d: layers %d-%d\n", g, first, last);
         }
         
-        // Group tensors by target GPU
+        // Group tensors by target GPU.
         std::vector<std::vector<std::pair<std::string, TensorInfo*>>> gpu_tensors(n_gpus);
-        
+
         for (auto& [name, ti] : gguf.tensors) {
             int target_gpu = 0;
             if (name.substr(0, 4) == "blk.") {
@@ -71,6 +72,21 @@ struct GPUModel {
             }
             gpu_tensors[target_gpu].push_back({name, &ti});
         }
+
+        // Sort each bucket by file offset so the per-GPU loader thread
+        // walks the mmap region monotonically. gguf.tensors is an
+        // unordered_map (random iteration order), and the random pattern
+        // would defeat the kernel read-ahead we just hinted with
+        // POSIX_FADV_SEQUENTIAL. With this sort each thread now produces
+        // one sequential disk read stream over its layer range — four
+        // sequential streams in total, which an SSD handles roughly as
+        // well as one stream.
+        for (int g = 0; g < n_gpus; g++) {
+            std::sort(gpu_tensors[g].begin(), gpu_tensors[g].end(),
+                      [](const auto& a, const auto& b) {
+                          return a.second->data < b.second->data;
+                      });
+        }
         
         // Parallel load — one thread per GPU
         std::atomic<size_t> total_bytes{0};
@@ -78,15 +94,53 @@ struct GPUModel {
         std::mutex mtx;
         std::vector<std::unordered_map<std::string, GPUTensor>> per_gpu_tensors(n_gpus);
         std::atomic<bool> failed{false};
-        
+
+        // NOTE: We deliberately do NOT call cudaHostRegister on the mmap
+        // region. On this hardware (7.6 GB total RAM, 28 GB model file)
+        // the bottleneck is disk read, not PCIe — pinning would only
+        // matter if the cudaMemcpyAsync H2D path were the slow part, but
+        // here the file pages are getting faulted in from the SATA SSD
+        // and that's where the 200 MB/s ceiling comes from. We instead
+        // help the disk path by hinting POSIX_FADV_SEQUENTIAL +
+        // MADV_SEQUENTIAL (in gguf.h) and walking each per-GPU bucket
+        // in increasing file-offset order (above), so the four loader
+        // threads each produce one sequential read stream over its
+        // layer range instead of an unordered scatter.
+
         printf("\nLoading to %d GPUs in parallel...\n", n_gpus);
-        
+
+        // Per-thread pinned staging buffer size. The worst-case single
+        // tensor on Qwen3.5-27B is the lm_head at ~1.34 GB; bigger tensors
+        // are chunked. Allocating 256 MB per thread × 4 threads = 1 GB
+        // pinned host memory, which is well within the system RLIMIT_MEMLOCK
+        // (we measured 970 MB on this box, so we use 200 MB instead — see
+        // STAGE_BYTES below) and far smaller than the page-locked-whole-mmap
+        // approach that hit RLIMIT_MEMLOCK / OOM.
+        const size_t STAGE_BYTES = 200ull * 1024 * 1024;  // 200 MB
+
+        const uint8_t* mmap_base = (const uint8_t*)gguf.mmap_addr;
+        int gguf_fd = gguf.fd;
+
         auto load_fn = [&](int gpu_id) {
             cudaSetDevice(gpu_id);
             cudaStream_t stream;
             cudaStreamCreate(&stream);
             size_t local_bytes = 0;
-            
+
+            // Per-thread pinned staging buffer. cudaMemcpyAsync from
+            // pinned host memory runs as direct DMA at full PCIe speed
+            // and the transfer can overlap with subsequent CPU work
+            // (the next pread). Without pinning the H2D path is slower
+            // and the cudaMemcpyAsync degenerates to a blocking copy.
+            void* stage = nullptr;
+            cudaError_t st_err = cudaMallocHost(&stage, STAGE_BYTES);
+            if (st_err != cudaSuccess) {
+                fprintf(stderr, "GPU %d: pinned staging alloc failed: %s\n",
+                        gpu_id, cudaGetErrorString(st_err));
+                failed = true;
+                return;
+            }
+
             for (auto& [name, ti] : gpu_tensors[gpu_id]) {
                 GPUTensor gt;
                 gt.gpu_id = gpu_id;
@@ -94,7 +148,7 @@ struct GPUModel {
                 gt.n_dims = ti->n_dims;
                 memcpy(gt.dims, ti->dims, sizeof(gt.dims));
                 gt.byte_size = ti->byte_size();
-                
+
                 cudaError_t err = cudaMalloc(&gt.data, gt.byte_size);
                 if (err != cudaSuccess) {
                     fprintf(stderr, "GPU %d: alloc failed for %s: %s\n",
@@ -102,7 +156,29 @@ struct GPUModel {
                     failed = true;
                     break;
                 }
-                cudaMemcpyAsync(gt.data, ti->data, gt.byte_size, cudaMemcpyHostToDevice, stream);
+
+                // Copy this tensor in chunks: pread from the file straight
+                // into pinned staging, then cudaMemcpyAsync staging → GPU.
+                // We sync per chunk so we can reuse the staging buffer for
+                // the next chunk; the per-chunk overhead is small compared
+                // to the disk read.
+                size_t file_off = (size_t)((const uint8_t*)ti->data - mmap_base);
+                size_t copied = 0;
+                while (copied < gt.byte_size) {
+                    size_t chunk = std::min(STAGE_BYTES, gt.byte_size - copied);
+                    ssize_t got = pread(gguf_fd, stage, chunk, file_off + copied);
+                    if (got != (ssize_t)chunk) {
+                        fprintf(stderr, "GPU %d: pread short read on %s (off=%zu want=%zu got=%zd)\n",
+                                gpu_id, name.c_str(), file_off + copied, chunk, got);
+                        failed = true;
+                        break;
+                    }
+                    cudaMemcpyAsync((uint8_t*)gt.data + copied, stage, chunk,
+                                    cudaMemcpyHostToDevice, stream);
+                    cudaStreamSynchronize(stream);  // reuse stage for next chunk
+                    copied += chunk;
+                }
+                if (failed) break;
 
                 // Q8_0 repack: convert GGUF {half d; int8_t qs[32]} (34 B) to
                 // GPU-resident block_q8_0_aligned {qs[32]; pad; d} (36 B) so the
@@ -131,10 +207,11 @@ struct GPUModel {
                 per_gpu_tensors[gpu_id][name] = gt;
                 local_bytes += gt.byte_size;
             }
-            
+
             cudaStreamSynchronize(stream);
             cudaStreamDestroy(stream);
-            
+            cudaFreeHost(stage);
+
             std::lock_guard<std::mutex> lock(mtx);
             gpu_bytes[gpu_id] = local_bytes;
             total_bytes += local_bytes;
@@ -150,7 +227,7 @@ struct GPUModel {
         
         auto t1 = std::chrono::high_resolution_clock::now();
         double load_secs = std::chrono::duration<double>(t1 - t0).count();
-        
+
         if (failed) return false;
         
         // Merge per-GPU maps
