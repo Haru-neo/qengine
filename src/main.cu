@@ -853,11 +853,13 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         float_to_half_kernel<<<(H+255)/256, 256>>>(h_a, gpu_hidden_half[last_gpu],   H);
                         float_to_half_kernel<<<(H+255)/256, 256>>>(h_b, gpu_hidden_half_b[last_gpu], H);
                         if (out_norm_t->type == GGML_TYPE_F32) {
-                            rms_norm_f32w(norm_buf,   gpu_hidden_half[last_gpu],   (float*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
-                            rms_norm_f32w(norm_buf_b, gpu_hidden_half_b[last_gpu], (float*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
+                            rms_norm_f32w_n2(norm_buf, norm_buf_b,
+                                             gpu_hidden_half[last_gpu], gpu_hidden_half_b[last_gpu],
+                                             (float*)out_norm_t->data, H, model.cfg.rms_norm_eps, 0);
                         } else {
-                            rms_norm(norm_buf,   gpu_hidden_half[last_gpu],   (half*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
-                            rms_norm(norm_buf_b, gpu_hidden_half_b[last_gpu], (half*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
+                            rms_norm_n2(norm_buf, norm_buf_b,
+                                        gpu_hidden_half[last_gpu], gpu_hidden_half_b[last_gpu],
+                                        (half*)out_norm_t->data, H, model.cfg.rms_norm_eps, 0);
                         }
                         qi_logits.quantize(norm_buf,     H, 0);
                         qi_logits_b.quantize(norm_buf_b, H, 0);

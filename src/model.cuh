@@ -229,11 +229,13 @@ struct QwenModel {
         auto* down_w = t(blk(layer, "ffn_down.weight"));
 
         if (norm_w->type == GGML_TYPE_F32) {
-            rms_norm_f32in_f32w(bA.norm_out, hidden_a, (float*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
-            rms_norm_f32in_f32w(bB.norm_out, hidden_b, (float*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+            rms_norm_f32in_f32w_n2(bA.norm_out, bB.norm_out,
+                                   hidden_a, hidden_b,
+                                   (float*)norm_w->data, H, cfg.rms_norm_eps, stream);
         } else {
-            rms_norm_f32in(bA.norm_out, hidden_a, (half*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
-            rms_norm_f32in(bB.norm_out, hidden_b, (half*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+            rms_norm_f32in_n2(bA.norm_out, bB.norm_out,
+                              hidden_a, hidden_b,
+                              (half*)norm_w->data, H, cfg.rms_norm_eps, stream);
         }
 
         gpu_qi[g].quantize(bA.norm_out, H, stream);
@@ -248,8 +250,10 @@ struct QwenModel {
                       bA.mlp_up, bB.mlp_up,
                       H, I, &gpu_qi[g], &gpu_qi2[g], stream);
 
-        silu_mul_kernel<<<(I+255)/256, 256, 0, stream>>>(bA.mlp_gate, bA.mlp_up, I);
-        silu_mul_kernel<<<(I+255)/256, 256, 0, stream>>>(bB.mlp_gate, bB.mlp_up, I);
+        { dim3 sg((I+255)/256, 2);
+          silu_mul_n2_kernel<<<sg, 256, 0, stream>>>(
+              bA.mlp_gate, bA.mlp_up,
+              bB.mlp_gate, bB.mlp_up, I); }
 
         gpu_qi_inter[g].quantize(bA.mlp_gate, I, stream);
         gpu_qi_inter2[g].quantize(bB.mlp_gate, I, stream);
@@ -259,8 +263,10 @@ struct QwenModel {
                       bA.mlp_down, bB.mlp_down,
                       I, H, &gpu_qi_inter[g], &gpu_qi_inter2[g], stream);
 
-        add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(hidden_a, bA.mlp_down, H);
-        add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(hidden_b, bB.mlp_down, H);
+        { dim3 ag((H+255)/256, 2);
+          add_kernel_f32_n2<<<ag, 256, 0, stream>>>(
+              hidden_a, bA.mlp_down,
+              hidden_b, bB.mlp_down, H); }
     }
 
     // ============ Attention state ============
@@ -962,13 +968,15 @@ struct QwenModel {
         int kv_dim   = num_kv * hd;
         int q_out_dim = q_w->dims[1];
 
-        // 1. RMSNorm both tokens
+        // 1. RMSNorm both tokens (fused n2)
         if (norm_w->type == GGML_TYPE_F32) {
-            rms_norm_f32in_f32w(bA.norm_out, hidden_a, (float*)norm_w->data, 1, H, eps, stream);
-            rms_norm_f32in_f32w(bB.norm_out, hidden_b, (float*)norm_w->data, 1, H, eps, stream);
+            rms_norm_f32in_f32w_n2(bA.norm_out, bB.norm_out,
+                                   hidden_a, hidden_b,
+                                   (float*)norm_w->data, H, eps, stream);
         } else {
-            rms_norm_f32in(bA.norm_out, hidden_a, (half*)norm_w->data, 1, H, eps, stream);
-            rms_norm_f32in(bB.norm_out, hidden_b, (half*)norm_w->data, 1, H, eps, stream);
+            rms_norm_f32in_n2(bA.norm_out, bB.norm_out,
+                              hidden_a, hidden_b,
+                              (half*)norm_w->data, H, eps, stream);
         }
 
         // 2. Quantize both norm outputs
@@ -1037,9 +1045,11 @@ struct QwenModel {
                       bA.mlp_down,  bB.mlp_down,
                       num_q * hd, H, &gpu_qi_inter[g], &gpu_qi_inter2[g], stream);
 
-        // 6. Residual add into FP32 hidden (both tokens)
-        add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(hidden_a, bA.mlp_down, H);
-        add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(hidden_b, bB.mlp_down, H);
+        // 6. Residual add into FP32 hidden (both tokens, fused n2)
+        { dim3 ag((H+255)/256, 2);
+          add_kernel_f32_n2<<<ag, 256, 0, stream>>>(
+              hidden_a, bA.mlp_down,
+              hidden_b, bB.mlp_down, H); }
     }
 
     // Batched GDN forward for two tokens. The 5 projections (qkv, gate,
@@ -1071,13 +1081,15 @@ struct QwenModel {
         auto* ssm_norm_w = t(blk(layer, "ssm_norm.weight"));
         auto* out_w   = t(blk(layer, "ssm_out.weight"));
 
-        // 1. RMSNorm both tokens (FP32 hidden in)
+        // 1. RMSNorm both tokens (fused n2)
         if (norm_w->type == GGML_TYPE_F32) {
-            rms_norm_f32in_f32w(bA.norm_out, hidden_a, (float*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
-            rms_norm_f32in_f32w(bB.norm_out, hidden_b, (float*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+            rms_norm_f32in_f32w_n2(bA.norm_out, bB.norm_out,
+                                   hidden_a, hidden_b,
+                                   (float*)norm_w->data, H, cfg.rms_norm_eps, stream);
         } else {
-            rms_norm_f32in(bA.norm_out, hidden_a, (half*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
-            rms_norm_f32in(bB.norm_out, hidden_b, (half*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+            rms_norm_f32in_n2(bA.norm_out, bB.norm_out,
+                              hidden_a, hidden_b,
+                              (half*)norm_w->data, H, cfg.rms_norm_eps, stream);
         }
 
         // 2. Quantize both norm outputs once
@@ -1152,9 +1164,11 @@ struct QwenModel {
                       gA.proj_out,   gB.proj_out,
                       num_v * v_dim, H, &gpu_qi_inter[g], &gpu_qi_inter2[g], stream);
 
-        // 8. Residual add into FP32 hidden (both tokens)
-        add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(hidden_a, gA.proj_out, H);
-        add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(hidden_b, gB.proj_out, H);
+        // 8. Residual add into FP32 hidden (both tokens, fused n2)
+        { dim3 ag((H+255)/256, 2);
+          add_kernel_f32_n2<<<ag, 256, 0, stream>>>(
+              hidden_a, gA.proj_out,
+              hidden_b, gB.proj_out, H); }
     }
 
     // ============ GDN state snapshot/restore (for spec rollback) ============

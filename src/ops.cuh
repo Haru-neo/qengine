@@ -155,11 +155,177 @@ inline void rms_norm_f32in_f32w(half* out, const float* x, const float* weight, 
     rms_norm_f32in_f32w_kernel<<<rows, threads, threads * sizeof(float), stream>>>(x, weight, out, hidden_size, eps);
 }
 
+// Half-input fused N=2 RMSNorm with FP32 weight (for the output_norm
+// step in the spec branch where the input comes pre-converted to half).
+__global__ void rms_norm_f32w_n2_kernel(
+    const half* __restrict__ x_a, const half* __restrict__ x_b,
+    const float* __restrict__ weight,
+    half* __restrict__ out_a, half* __restrict__ out_b,
+    int hidden_size, float eps
+) {
+    const half* x = (blockIdx.y == 0) ? x_a : x_b;
+    half* out     = (blockIdx.y == 0) ? out_a : out_b;
+    extern __shared__ float sdata[];
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float v = __half2float(x[i]);
+        sum += v * v;
+    }
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float rms = rsqrtf(sdata[0] / hidden_size + eps);
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        out[i] = __float2half(__half2float(x[i]) * rms * weight[i]);
+    }
+}
+
+inline void rms_norm_f32w_n2(half* out_a, half* out_b,
+                             const half* x_a, const half* x_b,
+                             const float* weight, int hidden_size,
+                             float eps, cudaStream_t stream = 0) {
+    int threads = min(hidden_size, 256);
+    dim3 grid(1, 2);
+    rms_norm_f32w_n2_kernel<<<grid, threads, threads * sizeof(float), stream>>>(
+        x_a, x_b, weight, out_a, out_b, hidden_size, eps);
+}
+
+// Half-input/half-weight fused N=2 RMSNorm
+__global__ void rms_norm_n2_kernel(
+    const half* __restrict__ x_a, const half* __restrict__ x_b,
+    const half* __restrict__ weight,
+    half* __restrict__ out_a, half* __restrict__ out_b,
+    int hidden_size, float eps
+) {
+    const half* x = (blockIdx.y == 0) ? x_a : x_b;
+    half* out     = (blockIdx.y == 0) ? out_a : out_b;
+    extern __shared__ float sdata[];
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float v = __half2float(x[i]);
+        sum += v * v;
+    }
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float rms = rsqrtf(sdata[0] / hidden_size + eps);
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        out[i] = __float2half(__half2float(x[i]) * rms * __half2float(weight[i]));
+    }
+}
+
+inline void rms_norm_n2(half* out_a, half* out_b,
+                        const half* x_a, const half* x_b,
+                        const half* weight, int hidden_size,
+                        float eps, cudaStream_t stream = 0) {
+    int threads = min(hidden_size, 256);
+    dim3 grid(1, 2);
+    rms_norm_n2_kernel<<<grid, threads, threads * sizeof(float), stream>>>(
+        x_a, x_b, weight, out_a, out_b, hidden_size, eps);
+}
+
+// Fused N=2 RMSNorm — processes two non-contiguous (x_a, x_b) inputs in
+// one kernel launch. Saves the per-launch CPU overhead in the spec
+// decoding hot path (forward_*_n2 invokes this once per layer instead of
+// twice). blockIdx.y selects the token: 0 → a, 1 → b.
+__global__ void rms_norm_f32in_f32w_n2_kernel(
+    const float* __restrict__ x_a, const float* __restrict__ x_b,
+    const float* __restrict__ weight,
+    half* __restrict__ out_a, half* __restrict__ out_b,
+    int hidden_size, float eps
+) {
+    const float* x = (blockIdx.y == 0) ? x_a : x_b;
+    half* out      = (blockIdx.y == 0) ? out_a : out_b;
+    extern __shared__ float sdata[];
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float v = x[i]; sum += v * v;
+    }
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float rms = rsqrtf(sdata[0] / hidden_size + eps);
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        out[i] = __float2half(x[i] * rms * weight[i]);
+    }
+}
+
+__global__ void rms_norm_f32in_n2_kernel(
+    const float* __restrict__ x_a, const float* __restrict__ x_b,
+    const half* __restrict__ weight,
+    half* __restrict__ out_a, half* __restrict__ out_b,
+    int hidden_size, float eps
+) {
+    const float* x = (blockIdx.y == 0) ? x_a : x_b;
+    half* out      = (blockIdx.y == 0) ? out_a : out_b;
+    extern __shared__ float sdata[];
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float v = x[i]; sum += v * v;
+    }
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float rms = rsqrtf(sdata[0] / hidden_size + eps);
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        out[i] = __float2half(x[i] * rms * __half2float(weight[i]));
+    }
+}
+
+inline void rms_norm_f32in_n2(half* out_a, half* out_b,
+                              const float* x_a, const float* x_b,
+                              const half* weight, int hidden_size,
+                              float eps, cudaStream_t stream = 0) {
+    int threads = min(hidden_size, 256);
+    dim3 grid(1, 2);
+    rms_norm_f32in_n2_kernel<<<grid, threads, threads * sizeof(float), stream>>>(
+        x_a, x_b, weight, out_a, out_b, hidden_size, eps);
+}
+
+inline void rms_norm_f32in_f32w_n2(half* out_a, half* out_b,
+                                   const float* x_a, const float* x_b,
+                                   const float* weight, int hidden_size,
+                                   float eps, cudaStream_t stream = 0) {
+    int threads = min(hidden_size, 256);
+    dim3 grid(1, 2);
+    rms_norm_f32in_f32w_n2_kernel<<<grid, threads, threads * sizeof(float), stream>>>(
+        x_a, x_b, weight, out_a, out_b, hidden_size, eps);
+}
+
 // FP32 residual add: hidden_f32 += proj_out (half)
 __global__ void add_kernel_f32(float* __restrict__ x, const half* __restrict__ residual, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         x[idx] = x[idx] + __half2float(residual[idx]);
+    }
+}
+
+// Fused N=2 residual add for spec decoding. Two non-contiguous (x_a/x_b)
+// fp32 hidden buffers and their fp16 residuals processed in one launch.
+// blockIdx.y selects the token.
+__global__ void add_kernel_f32_n2(
+    float* __restrict__ x_a, const half* __restrict__ res_a,
+    float* __restrict__ x_b, const half* __restrict__ res_b,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    if (blockIdx.y == 0) {
+        x_a[idx] = x_a[idx] + __half2float(res_a[idx]);
+    } else {
+        x_b[idx] = x_b[idx] + __half2float(res_b[idx]);
     }
 }
 
@@ -226,6 +392,21 @@ __global__ void silu_mul_kernel(half* __restrict__ a, const half* __restrict__ b
         float silu = va / (1.0f + expf(-va));
         a[idx] = __float2half(silu * __half2float(b[idx]));
     }
+}
+
+// N=2 fused SiLU * mul for spec decoding
+__global__ void silu_mul_n2_kernel(
+    half* __restrict__ a0, const half* __restrict__ b0,
+    half* __restrict__ a1, const half* __restrict__ b1,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    half* a = (blockIdx.y == 0) ? a0 : a1;
+    const half* b = (blockIdx.y == 0) ? b0 : b1;
+    float va = __half2float(a[idx]);
+    float silu = va / (1.0f + expf(-va));
+    a[idx] = __float2half(silu * __half2float(b[idx]));
 }
 
 // Fused GeLU(tanh approx)(a) * b — used by Gemma's GeGLU FFN
