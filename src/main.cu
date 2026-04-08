@@ -861,8 +861,10 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         }
                         qi_logits.quantize(norm_buf,     H, 0);
                         qi_logits_b.quantize(norm_buf_b, H, 0);
-                        quant_gemv(out_w->data, out_w->type, norm_buf,   logits_buf,   H, V, &qi_logits);
-                        quant_gemv(out_w->data, out_w->type, norm_buf_b, logits_buf_b, H, V, &qi_logits_b);
+                        quant_gemv_n2(out_w->data, out_w->type,
+                                      norm_buf,   norm_buf_b,
+                                      logits_buf, logits_buf_b,
+                                      H, V, &qi_logits, &qi_logits_b, 0);
 
                         // 5. Argmax both
                         argmax_half_kernel<<<1, 1024>>>(logits_buf,   V, d_argmax);

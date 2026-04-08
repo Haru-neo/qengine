@@ -48,6 +48,16 @@ struct QwenModel {
     QuantInput gpu_qi_inter2[4];
     bool n2_buffers_ready = false;
 
+    // Second-token GDN intermediate buffers (conv_out / core_out / normed_out
+    // / proj_out) used by the batched forward_gdn_n2.
+    struct GDNBuffers2 {
+        float* conv_out;
+        half*  core_out;
+        half*  normed_out;
+        half*  proj_out;
+    };
+    GDNBuffers2 gdn_bufs2[4];
+
     void init_config(GGUFFile& gguf) {
         auto arch = gguf.get_str("general.architecture");
         cfg.hidden_size = gguf.get_u32(arch + ".embedding_length");
@@ -130,6 +140,8 @@ struct QwenModel {
         if (n2_buffers_ready) return;
         int H = cfg.hidden_size;
         int I = cfg.intermediate_size;
+        int qkv_dim = 2 * 16 * 128 + 48 * 128;  // GDN qkv_dim
+        int v_total = 48 * 128;
         for (int g = 0; g < gpu->num_gpus; g++) {
             cudaSetDevice(g);
             cudaMalloc(&bufs2[g].norm_out, H * sizeof(half));
@@ -138,6 +150,21 @@ struct QwenModel {
             cudaMalloc(&bufs2[g].mlp_up,   I * sizeof(half));
             cudaMalloc(&bufs2[g].mlp_down, H * sizeof(half));
             cudaMalloc(&bufs2[g].residual, H * sizeof(half));
+            // GDN second-token intermediates
+            cudaMalloc(&gdn_bufs2[g].conv_out,   qkv_dim * sizeof(float));
+            cudaMalloc(&gdn_bufs2[g].core_out,   v_total * sizeof(half));
+            cudaMalloc(&gdn_bufs2[g].normed_out, v_total * sizeof(half));
+            cudaMalloc(&gdn_bufs2[g].proj_out,   H * sizeof(half));
+            // Attention second-token intermediates
+            int num_q  = cfg.num_q_heads;
+            int num_kv = cfg.num_kv_heads;
+            int hd     = cfg.head_dim;
+            cudaMalloc(&attn_bufs2[g].q_proj,      num_q  * hd * 2 * sizeof(half));
+            cudaMalloc(&attn_bufs2[g].k_proj,      num_kv * hd * sizeof(half));
+            cudaMalloc(&attn_bufs2[g].v_proj,      num_kv * hd * sizeof(half));
+            cudaMalloc(&attn_bufs2[g].attn_scores, num_q  * 4096 * sizeof(float));
+            cudaMalloc(&attn_bufs2[g].attn_out,    num_q  * hd * sizeof(half));
+            cudaMalloc(&attn_bufs2[g].gate_buf,    num_q  * hd * sizeof(half));
         }
         n2_buffers_ready = true;
         printf("[SPEC] N=2 buffers allocated for speculative decoding\n");
@@ -251,6 +278,7 @@ struct QwenModel {
         half* attn_out;     // [num_q * head_dim]
     };
     AttnBuffers attn_bufs[4];
+    AttnBuffers attn_bufs2[4];  // second-token attn buffers, for forward_attn_n2
     
     void init_attention(int max_seq) {
         int num_q = cfg.num_q_heads;    // 24
@@ -905,35 +933,228 @@ struct QwenModel {
     // positions / hidden states. The "speedup" comes entirely from MLP
     // batching (forward_mlp_n2) which shares weight loads across both tokens.
 
+    // Batched attention forward for two tokens. The 4 projections (q, k, v,
+    // o) are run via quant_gemv_n2 sharing weight loads. The per-token bits
+    // (deinterleave, head norm, RoPE, KV append, Q@K, softmax, @V, gate
+    // sigmoid) are inherently sequential per-position.
     void forward_attn_n2(int layer, float* hidden_a, float* hidden_b,
                          int pos_a, int pos_b, cudaStream_t stream) {
-        forward_attn(layer, hidden_a, pos_a, stream);
-        forward_attn(layer, hidden_b, pos_b, stream);
+        int g = gpu->layer_gpu[layer];
+        int H = cfg.hidden_size;
+        int num_q = cfg.num_q_heads;
+        int num_kv = cfg.num_kv_heads;
+        int hd = cfg.head_dim;
+        float eps = cfg.rms_norm_eps;
+        float scale = 1.0f / sqrtf((float)hd);
+        auto& abA = attn_bufs[g];   auto& abB = attn_bufs2[g];
+        auto& bA  = bufs[g];        auto& bB  = bufs2[g];
+        auto& kv  = kv_caches[layer];
+
+        auto* norm_w   = t(blk(layer, "attn_norm.weight"));
+        auto* q_w      = t(blk(layer, "attn_q.weight"));
+        auto* k_w      = t(blk(layer, "attn_k.weight"));
+        auto* v_w      = t(blk(layer, "attn_v.weight"));
+        auto* q_norm_w = t(blk(layer, "attn_q_norm.weight"));
+        auto* k_norm_w = t(blk(layer, "attn_k_norm.weight"));
+        auto* o_w      = t(blk(layer, "attn_output.weight"));
+
+        int total_qg = num_q * hd;
+        int kv_dim   = num_kv * hd;
+        int q_out_dim = q_w->dims[1];
+
+        // 1. RMSNorm both tokens
+        if (norm_w->type == GGML_TYPE_F32) {
+            rms_norm_f32in_f32w(bA.norm_out, hidden_a, (float*)norm_w->data, 1, H, eps, stream);
+            rms_norm_f32in_f32w(bB.norm_out, hidden_b, (float*)norm_w->data, 1, H, eps, stream);
+        } else {
+            rms_norm_f32in(bA.norm_out, hidden_a, (half*)norm_w->data, 1, H, eps, stream);
+            rms_norm_f32in(bB.norm_out, hidden_b, (half*)norm_w->data, 1, H, eps, stream);
+        }
+
+        // 2. Quantize both norm outputs
+        gpu_qi[g].quantize(bA.norm_out, H, stream);
+        gpu_qi2[g].quantize(bB.norm_out, H, stream);
+
+        // 3. Batched Q / K / V projections
+        quant_gemv_n2(q_w->data, q_w->type,
+                      bA.norm_out, bB.norm_out,
+                      abA.q_proj, abB.q_proj,
+                      H, q_out_dim, &gpu_qi[g], &gpu_qi2[g], stream);
+        quant_gemv_n2(k_w->data, k_w->type,
+                      bA.norm_out, bB.norm_out,
+                      abA.k_proj, abB.k_proj,
+                      H, kv_dim, &gpu_qi[g], &gpu_qi2[g], stream);
+        quant_gemv_n2(v_w->data, v_w->type,
+                      bA.norm_out, bB.norm_out,
+                      abA.v_proj, abB.v_proj,
+                      H, kv_dim, &gpu_qi[g], &gpu_qi2[g], stream);
+
+        // 4. Per-token attention compute (deinterleave, norm, RoPE, KV
+        //    append, Q@K, softmax, @V, gate sigmoid). Lambda to avoid
+        //    duplicating ~30 lines.
+        int rope_dim = rope.rope_dim;
+        int half_rope = rope_dim / 2;
+        auto run_one = [&](AttnBuffers& ab, int pos) {
+            half* q_buf    = ab.attn_out;
+            half* gate_buf = ab.gate_buf;
+            deinterleave_qg_kernel<<<(total_qg+255)/256, 256, 0, stream>>>(
+                ab.q_proj, q_buf, gate_buf, num_q, hd);
+            int tn = min(hd, 128);
+            head_rms_norm_kernel<<<num_q, tn, tn * sizeof(float), stream>>>(
+                q_buf, (float*)q_norm_w->data, num_q, hd, eps);
+            head_rms_norm_kernel<<<num_kv, tn, tn * sizeof(float), stream>>>(
+                ab.k_proj, (float*)k_norm_w->data, num_kv, hd, eps);
+            float* sin_pos = rope.sin_table(g) + (size_t)pos * half_rope;
+            float* cos_pos = rope.cos_table(g) + (size_t)pos * half_rope;
+            apply_rope_kernel<<<(num_q  * half_rope + 255)/256, 256, 0, stream>>>(
+                q_buf, sin_pos, cos_pos, num_q, hd, rope_dim);
+            apply_rope_kernel<<<(num_kv * half_rope + 255)/256, 256, 0, stream>>>(
+                ab.k_proj, sin_pos, cos_pos, num_kv, hd, rope_dim);
+            half* k_cache_pos = kv.k + (size_t)pos * kv_dim;
+            half* v_cache_pos = kv.v + (size_t)pos * kv_dim;
+            cudaMemcpyAsync(k_cache_pos, ab.k_proj, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+            cudaMemcpyAsync(v_cache_pos, ab.v_proj, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+            int seq_len = pos + 1;
+            dim3 score_grid(num_q, seq_len);
+            attn_score_kernel_h<<<score_grid, min(hd, 256), 0, stream>>>(
+                q_buf, kv.k, ab.attn_scores, num_q, num_kv, hd, seq_len, scale);
+            { int st = 1; while(st < seq_len && st < 256) st <<= 1;
+            softmax_kernel<<<num_q, st, st * sizeof(float), stream>>>(
+                ab.attn_scores, num_q, seq_len); }
+            attn_value_kernel_h<<<num_q, min(hd, 256), 0, stream>>>(
+                ab.attn_scores, kv.v, q_buf, num_q, num_kv, hd, seq_len);
+            apply_gate_sigmoid<<<(total_qg+255)/256, 256, 0, stream>>>(
+                q_buf, gate_buf, total_qg);
+        };
+        run_one(abA, pos_a);
+        run_one(abB, pos_b);
+
+        // 5. Batched output projection
+        gpu_qi_inter[g].quantize(abA.attn_out,  num_q * hd, stream);
+        gpu_qi_inter2[g].quantize(abB.attn_out, num_q * hd, stream);
+        quant_gemv_n2(o_w->data, o_w->type,
+                      abA.attn_out, abB.attn_out,
+                      bA.mlp_down,  bB.mlp_down,
+                      num_q * hd, H, &gpu_qi_inter[g], &gpu_qi_inter2[g], stream);
+
+        // 6. Residual add into FP32 hidden (both tokens)
+        add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(hidden_a, bA.mlp_down, H);
+        add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(hidden_b, bB.mlp_down, H);
     }
 
+    // Batched GDN forward for two tokens. The 5 projections (qkv, gate,
+    // alpha, beta, output) are run via quant_gemv_n2 sharing weight loads,
+    // saving roughly half the GDN GEMV memory traffic. The recurrent path
+    // (conv1d, gdn_recurrent_step, rms_norm_gated) is inherently per-token
+    // and runs sequentially with a state snapshot taken between the two
+    // tokens so a rejected second token can be rolled back exactly.
     void forward_gdn_n2(int layer, float* hidden_a, float* hidden_b, cudaStream_t stream) {
-        forward_gdn(layer, hidden_a, stream);
-        // Snapshot GDN state RIGHT AFTER the first token's update so a
-        // reject of the second token (the speculative draft) can restore
-        // exactly to "post-h_a" instead of "pre-batched". Only the snapshot
-        // for THIS GDN layer is touched here; restore_gdn_states walks all
-        // layers when applied.
-        if (snapshots_ready && !is_attn_layer(layer)) {
-            auto* qkv = t("blk.0.attn_qkv.weight");
-            int qkv_dim = qkv->dims[1];
-            int num_v = cfg.linear_v_heads;
-            int k_dim = cfg.linear_k_dim;
-            int v_dim = cfg.linear_v_dim;
+        int g = gpu->layer_gpu[layer];
+        auto& bA = bufs[g];      auto& bB = bufs2[g];
+        auto& gA = gdn_bufs[g];  auto& gB = gdn_bufs2[g];
+        int H = cfg.hidden_size;
+        int num_k = cfg.linear_k_heads;
+        int num_v = cfg.linear_v_heads;
+        int k_dim = cfg.linear_k_dim;
+        int v_dim = cfg.linear_v_dim;
+        int qkv_dim = 2 * num_k * k_dim + num_v * v_dim;
+        int v_total = num_v * v_dim;
+
+        auto* norm_w  = t(blk(layer, "attn_norm.weight"));
+        auto* qkv_w   = t(blk(layer, "attn_qkv.weight"));
+        auto* gate_w  = t(blk(layer, "attn_gate.weight"));
+        auto* alpha_w = t(blk(layer, "ssm_alpha.weight"));
+        auto* beta_w  = t(blk(layer, "ssm_beta.weight"));
+        auto* conv_w  = t(blk(layer, "ssm_conv1d.weight"));
+        auto* a_log_t = t(blk(layer, "ssm_a"));
+        auto* dt_bias_t = t(blk(layer, "ssm_dt.bias"));
+        auto* ssm_norm_w = t(blk(layer, "ssm_norm.weight"));
+        auto* out_w   = t(blk(layer, "ssm_out.weight"));
+
+        // 1. RMSNorm both tokens (FP32 hidden in)
+        if (norm_w->type == GGML_TYPE_F32) {
+            rms_norm_f32in_f32w(bA.norm_out, hidden_a, (float*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+            rms_norm_f32in_f32w(bB.norm_out, hidden_b, (float*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+        } else {
+            rms_norm_f32in(bA.norm_out, hidden_a, (half*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+            rms_norm_f32in(bB.norm_out, hidden_b, (half*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+        }
+
+        // 2. Quantize both norm outputs once
+        gpu_qi[g].quantize(bA.norm_out, H, stream);
+        gpu_qi2[g].quantize(bB.norm_out, H, stream);
+
+        // 3. Batched projections — qkv (largest), gate, alpha, beta
+        // Per-token output buffers reuse the existing aliases used by forward_gdn:
+        //   qkv_out → attn_out, z_out → mlp_gate, a_out → mlp_up, b_out → mlp_down
+        quant_gemv_n2(qkv_w->data, qkv_w->type,
+                      bA.norm_out, bB.norm_out,
+                      bA.attn_out, bB.attn_out,
+                      H, qkv_dim, &gpu_qi[g], &gpu_qi2[g], stream);
+        quant_gemv_n2(gate_w->data, gate_w->type,
+                      bA.norm_out, bB.norm_out,
+                      bA.mlp_gate, bB.mlp_gate,
+                      H, num_v * v_dim, &gpu_qi[g], &gpu_qi2[g], stream);
+        quant_gemv_n2(alpha_w->data, alpha_w->type,
+                      bA.norm_out, bB.norm_out,
+                      bA.mlp_up, bB.mlp_up,
+                      H, num_v, &gpu_qi[g], &gpu_qi2[g], stream);
+        quant_gemv_n2(beta_w->data, beta_w->type,
+                      bA.norm_out, bB.norm_out,
+                      bA.mlp_down, bB.mlp_down,
+                      H, num_v, &gpu_qi[g], &gpu_qi2[g], stream);
+
+        // 4. Token A: conv1d + recurrent + gated norm  (advances state to post-a)
+        int kw = 4;
+        int threads_conv = min(qkv_dim, 256);
+        int blocks_conv  = (qkv_dim + threads_conv - 1) / threads_conv;
+        conv1d_update_silu<<<blocks_conv, threads_conv, 0, stream>>>(
+            gdn_states[layer].conv_state, bA.attn_out, (float*)conv_w->data,
+            gA.conv_out, qkv_dim, kw);
+        int gdn_smem = (2 * cfg.linear_k_dim + 1) * sizeof(float);
+        gdn_recurrent_step<<<num_v, min(v_dim, 128), gdn_smem, stream>>>(
+            gA.conv_out, (float*)a_log_t->data, (float*)dt_bias_t->data,
+            bA.mlp_up, bA.mlp_down,
+            gdn_states[layer].rec_state, gA.core_out,
+            num_k, num_v, k_dim, v_dim);
+        rms_norm_gated_kernel<<<num_v, min(v_dim, 128), 128 * sizeof(float), stream>>>(
+            gA.core_out, bA.mlp_gate, (float*)ssm_norm_w->data, gA.normed_out,
+            num_v, v_dim, 1e-6f);
+
+        // 5. Snapshot GDN state for THIS layer (post-a, for reject rollback)
+        if (snapshots_ready) {
             size_t conv_sz = qkv_dim * 4 * sizeof(float);
             size_t rec_sz  = (size_t)num_v * k_dim * v_dim * sizeof(float);
-            int g = gpu->layer_gpu[layer];
-            cudaSetDevice(g);
             cudaMemcpyAsync(gdn_snapshots[layer].conv_state, gdn_states[layer].conv_state,
                             conv_sz, cudaMemcpyDeviceToDevice, stream);
             cudaMemcpyAsync(gdn_snapshots[layer].rec_state, gdn_states[layer].rec_state,
                             rec_sz, cudaMemcpyDeviceToDevice, stream);
         }
-        forward_gdn(layer, hidden_b, stream);
+
+        // 6. Token B: conv1d + recurrent + gated norm  (advances state to post-b)
+        conv1d_update_silu<<<blocks_conv, threads_conv, 0, stream>>>(
+            gdn_states[layer].conv_state, bB.attn_out, (float*)conv_w->data,
+            gB.conv_out, qkv_dim, kw);
+        gdn_recurrent_step<<<num_v, min(v_dim, 128), gdn_smem, stream>>>(
+            gB.conv_out, (float*)a_log_t->data, (float*)dt_bias_t->data,
+            bB.mlp_up, bB.mlp_down,
+            gdn_states[layer].rec_state, gB.core_out,
+            num_k, num_v, k_dim, v_dim);
+        rms_norm_gated_kernel<<<num_v, min(v_dim, 128), 128 * sizeof(float), stream>>>(
+            gB.core_out, bB.mlp_gate, (float*)ssm_norm_w->data, gB.normed_out,
+            num_v, v_dim, 1e-6f);
+
+        // 7. Batched output projection — both normed_out → proj_out
+        gpu_qi_inter[g].quantize(gA.normed_out,  num_v * v_dim, stream);
+        gpu_qi_inter2[g].quantize(gB.normed_out, num_v * v_dim, stream);
+        quant_gemv_n2(out_w->data, out_w->type,
+                      gA.normed_out, gB.normed_out,
+                      gA.proj_out,   gB.proj_out,
+                      num_v * v_dim, H, &gpu_qi_inter[g], &gpu_qi_inter2[g], stream);
+
+        // 8. Residual add into FP32 hidden (both tokens)
+        add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(hidden_a, gA.proj_out, H);
+        add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(hidden_b, gB.proj_out, H);
     }
 
     // ============ GDN state snapshot/restore (for spec rollback) ============
