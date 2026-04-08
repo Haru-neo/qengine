@@ -89,11 +89,13 @@ struct QwenModel {
     }
 
     // Chunk size for parallel scan during prompt processing.
-    // 64 amortises chunk-loop launch overhead and gives the GDN scan a
-    // longer window. The chunked attention compute path internally splits
-    // CHUNK_SIZE into ATTN_NB-token sub-chunks (see ATTN_NB) so the value
-    // kernel's register-resident accumulator stays bounded.
-    static constexpr int CHUNK_SIZE = 64;
+    // 128 doubles the per-chunk batched-GEMM utilisation versus the
+    // original 64 (each NB=16 GEMM tile gets 8 column blocks instead of
+    // 4) and amortises chunk-loop launch overhead. The chunked attention
+    // compute path internally splits CHUNK_SIZE into ATTN_NB-token
+    // sub-chunks (see ATTN_NB) so the value kernel's register-resident
+    // accumulator stays bounded.
+    static constexpr int CHUNK_SIZE = 128;
     // Sub-chunk size used by attn_score / softmax / attn_value chunked
     // kernels. Picked so attn_value's per-thread accumulator
     // (ATTN_NB × gqa_max=8 floats) fits in registers without spill on Volta.
@@ -895,22 +897,30 @@ struct QwenModel {
             }
         }
 
-        // Conv1d update (per-token) — input is fp16 (buf.attn_out per token)
-        // Output is fp32 directly into chunk_qkv slot.
-        // We re-do qkv proj per token because conv1d needs fp16 input;
-        // alternatively we already stored fp32 qkv into chunk_qkv above.
-        // For simplicity: convert chunk_qkv (fp32) → fp16 buf.attn_out, conv1d → fp32.
+        // Conv1d update — single chunked launch instead of n_tokens
+        // per-token launches. conv1d_update_silu_chunk walks the n_tokens
+        // dimension inside one block per dim element, sharing the conv
+        // state register accumulator across the whole sub-sequence.
+        //
+        // Input format: needs fp16 [n_tokens, qkv_dim]. We have fp32
+        // [n_tokens, qkv_dim] in gb.chunk_qkv from the projection above
+        // (the batched path) or from the fallback. Convert in one shot
+        // into chunk_qkv_half (already alloc'd by the batched projection
+        // path; if the fallback was used, allocate it on demand).
         {
             int kw = 4;
+            if (!gb.chunk_qkv_half) {
+                cudaMalloc(&gb.chunk_qkv_half, (size_t)CHUNK_SIZE * qkv_dim * sizeof(half));
+            }
+            int n_elem = n_tokens * qkv_dim;
+            float_to_half_kernel<<<(n_elem + 255) / 256, 256, 0, stream>>>(
+                gb.chunk_qkv, gb.chunk_qkv_half, n_elem);
+
             int threads = min(qkv_dim, 256);
             int blocks  = (qkv_dim + threads - 1) / threads;
-            for (int t = 0; t < n_tokens; t++) {
-                float_to_half_kernel<<<(qkv_dim+255)/256, 256, 0, stream>>>(
-                    gb.chunk_qkv + (size_t)t * qkv_dim, buf.attn_out, qkv_dim);
-                conv1d_update_silu<<<blocks, threads, 0, stream>>>(
-                    gdn_states[layer].conv_state, buf.attn_out, (float*)conv_w->data,
-                    gb.chunk_qkv + (size_t)t * qkv_dim, qkv_dim, kw);
-            }
+            conv1d_update_silu_chunk<<<blocks, threads, 0, stream>>>(
+                gdn_states[layer].conv_state, gb.chunk_qkv_half,
+                (float*)conv_w->data, gb.chunk_qkv, qkv_dim, kw, n_tokens);
         }
 
         // Chunked GDN recurrent step (single kernel call for all N tokens)
@@ -928,23 +938,40 @@ struct QwenModel {
             );
         }
 
-        // RMSNorm gated (chunked) + output projection (per-token) + residual (per-token)
+        // RMSNorm gated (chunked) + batched output projection + batched residual
         {
-            // Chunked rms_norm_gated
+            // Chunked rms_norm_gated → gb.chunk_normed [n_tokens * v_total] half
             int total_blocks = num_v * n_tokens;
             rms_norm_gated_chunk_kernel<<<total_blocks, min(v_dim, 128), 128*sizeof(float), stream>>>(
                 gb.chunk_core_out, gb.chunk_z_out, (float*)ssm_norm_w->data,
                 gb.chunk_normed, num_v, v_dim, n_tokens, 1e-6f);
 
-            // Per-token output projection + residual into FP32 hidden
-            for (int t = 0; t < n_tokens; t++) {
-                half* normed_t = gb.chunk_normed + (size_t)t * v_total;
-                half* proj_t   = gb.chunk_proj_out + (size_t)t * H;
-                gpu_qi_inter[g].quantize(normed_t, num_v * v_dim, stream);
-                quant_gemv(out_w->data, out_w->type, normed_t, proj_t,
-                           num_v * v_dim, H, &gpu_qi_inter[g], stream);
-                add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(
-                    hidden_chunk + (size_t)t * H, proj_t, H);
+            if (out_w->type == GGML_TYPE_Q8_0) {
+                // Batched output projection: quantize all n_tokens × v_total
+                // values once, then a single chunked GEMM call for the
+                // [v_total → H] projection. This was the largest leftover
+                // per-token GEMV in the GDN path (out_w is the same size
+                // class as MLP down_proj).
+                gpu_qi_inter[g].quantize_chunk(gb.chunk_normed, num_v * v_dim, n_tokens, stream);
+                quant_gemv_chunk(out_w->data, out_w->type,
+                                 gpu_qi_inter[g].q8_buf, gb.chunk_proj_out,
+                                 num_v * v_dim, H, n_tokens, stream);
+
+                // Batched residual into FP32 hidden (one launch).
+                int n_elem = n_tokens * H;
+                add_kernel_f32<<<(n_elem + 255) / 256, 256, 0, stream>>>(
+                    hidden_chunk, gb.chunk_proj_out, n_elem);
+            } else {
+                // Non-Q8_0 fallback: per-token (rare).
+                for (int t = 0; t < n_tokens; t++) {
+                    half* normed_t = gb.chunk_normed + (size_t)t * v_total;
+                    half* proj_t   = gb.chunk_proj_out + (size_t)t * H;
+                    gpu_qi_inter[g].quantize(normed_t, num_v * v_dim, stream);
+                    quant_gemv(out_w->data, out_w->type, normed_t, proj_t,
+                               num_v * v_dim, H, &gpu_qi_inter[g], stream);
+                    add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(
+                        hidden_chunk + (size_t)t * H, proj_t, H);
+                }
             }
         }
     }
@@ -1024,18 +1051,20 @@ struct QwenModel {
                          H, kv_dim, n_tokens, stream);
 
         // 4. Per-token: deinterleave Q/gate, head-RMS, RoPE, KV cache append.
-        //    These are small kernels — keeping them per-token avoids writing
-        //    chunk versions while remaining cheap relative to attention.
+        //    These are small kernels — keeping them per-token in a single
+        //    fused loop. KV cache append is collapsed into TWO contiguous
+        //    cudaMemcpyAsync calls per chunk (chunk_n × kv_dim K and V),
+        //    which is far cheaper than 2*n_tokens individual copies.
         int rope_dim = rope.rope_dim;
         int half_rope = rope_dim / 2;
         int tn = min(hd, 128);
+        auto& kv = kv_caches[layer];
         for (int tt = 0; tt < n_tokens; tt++) {
             int pos = start_pos + tt;
             half* q_slice    = ab.attn_chunk_q      + (size_t)tt * q_out_dim;
             half* qpost      = ab.attn_chunk_q_post + (size_t)tt * total_qg;
             half* gate_slice = ab.attn_chunk_gate   + (size_t)tt * total_qg;
             half* k_slice    = ab.attn_chunk_k      + (size_t)tt * kv_dim;
-            half* v_slice    = ab.attn_chunk_v      + (size_t)tt * kv_dim;
 
             deinterleave_qg_kernel<<<(total_qg + 255) / 256, 256, 0, stream>>>(
                 q_slice, qpost, gate_slice, num_q, hd);
@@ -1051,21 +1080,21 @@ struct QwenModel {
                 qpost,  sin_pos, cos_pos, num_q,  hd, rope_dim);
             apply_rope_kernel<<<(num_kv * half_rope + 255) / 256, 256, 0, stream>>>(
                 k_slice, sin_pos, cos_pos, num_kv, hd, rope_dim);
-
-            // KV cache append
-            auto& kv = kv_caches[layer];
-            half* k_cache_pos = kv.k + (size_t)pos * kv_dim;
-            half* v_cache_pos = kv.v + (size_t)pos * kv_dim;
-            cudaMemcpyAsync(k_cache_pos, k_slice, kv_dim * sizeof(half),
-                            cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(v_cache_pos, v_slice, kv_dim * sizeof(half),
-                            cudaMemcpyDeviceToDevice, stream);
+        }
+        // Bulk KV cache append: contiguous slabs of n_tokens × kv_dim each
+        // (attn_chunk_k / attn_chunk_v) into kv.k / kv.v at offset start_pos.
+        {
+            half* k_dst = kv.k + (size_t)start_pos * kv_dim;
+            half* v_dst = kv.v + (size_t)start_pos * kv_dim;
+            size_t bytes = (size_t)n_tokens * kv_dim * sizeof(half);
+            cudaMemcpyAsync(k_dst, ab.attn_chunk_k, bytes, cudaMemcpyDeviceToDevice, stream);
+            cudaMemcpyAsync(v_dst, ab.attn_chunk_v, bytes, cudaMemcpyDeviceToDevice, stream);
         }
 
         // 5–7. Chunked attention compute, processed in ATTN_NB-token
         //      sub-chunks so the value kernel's register-resident
         //      accumulator stays bounded (see ATTN_NB / acc[16][8]).
-        auto& kv = kv_caches[layer];
+        //      `kv` already aliased above for the bulk K/V append.
         int sub_processed = 0;
         while (sub_processed < n_tokens) {
             int sub_n = std::min(ATTN_NB, n_tokens - sub_processed);

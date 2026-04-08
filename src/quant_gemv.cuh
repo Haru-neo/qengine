@@ -528,6 +528,7 @@ __global__ void gemm_q8_0_q8_1(
 
 // Explicit instantiations.
 template __global__ void gemm_q8_0_q8_1<16, 16, 8>(const void*, const block_q8_1*, half*, int, int, int);
+template __global__ void gemm_q8_0_q8_1<16, 32, 4>(const void*, const block_q8_1*, half*, int, int, int);
 template __global__ void gemm_q8_0_q8_1<32, 16, 4>(const void*, const block_q8_1*, half*, int, int, int);
 
 __global__ void gemv_fp16(const half* __restrict__ w,const half* __restrict__ x,half* __restrict__ y,int K,int N){
@@ -617,14 +618,29 @@ inline void quant_gemv_chunk(void* weight, ggml_type type,
         half* op = output_chunk;
         int remaining = n_tokens;
 
-        // True GEMM tile path: BM=16, BN=16, BK_BLOCKS=8 (256 K elements
-        // per K-tile). Each block computes 16×16 = 256 outputs with one
-        // pair of cooperative tile loads, so weight + input bandwidth is
-        // amortised across 256 outputs instead of just 16 (NB=16 GEMV).
-        // Requires M divisible by 16 (true for 27B's H=5120 and I=17408)
-        // and we issue blocks for ceil(n/16) cols, masking the tail.
-        constexpr int BM = 16, BN = 16, BK_BLOCKS = 8;
-        if (remaining >= BN && (M % BM) == 0) {
+        // True GEMM tile path. Two tile geometries:
+        //   • BM=16, BN=32, BK_BLOCKS=4 — preferred when remaining ≥ 32.
+        //     512 outputs per block, 16 KB SMEM, 4 blocks/SM ⇒ full Volta
+        //     occupancy. Per-output global traffic ≈ K/32 weight + K/16
+        //     input — best ratio of the candidates.
+        //   • BM=16, BN=16, BK_BLOCKS=8 — fallback for remaining ∈ [16, 31].
+        //     256 outputs per block, K/16 weight + K/16 input.
+        // Both require M divisible by 16, which holds for 27B's H, I,
+        // QKV/output projection sizes.
+        if (remaining >= 32 && (M % 16) == 0) {
+            constexpr int BM = 16, BN = 32, BK_BLOCKS = 4;
+            int n_chunks = remaining / BN;
+            int bn_total = n_chunks * BN;
+            dim3 grid(M / BM, n_chunks);
+            int sm_bytes = (BM * BK_BLOCKS + BN * BK_BLOCKS) * sizeof(block_q8_0_aligned);
+            gemm_q8_0_q8_1<BM, BN, BK_BLOCKS><<<grid, BM * BN, sm_bytes, stream>>>(
+                weight, xp, op, M, bn_total, K);
+            xp += (size_t)bn_total * (K / 32);
+            op += (size_t)bn_total * M;
+            remaining -= bn_total;
+        }
+        if (remaining >= 16 && (M % 16) == 0) {
+            constexpr int BM = 16, BN = 16, BK_BLOCKS = 8;
             int n_chunks = remaining / BN;
             int bn_total = n_chunks * BN;
             dim3 grid(M / BM, n_chunks);
