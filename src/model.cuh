@@ -30,6 +30,13 @@ struct LayerBuffers {
     half* mlp_up;        // [intermediate_size]
     half* mlp_down;      // [hidden_size]
     half* residual;      // [hidden_size]
+
+    // Chunked prefill MLP buffers (token-major, [CHUNK_SIZE * dim]).
+    // Allocated lazily on first chunked prefill.
+    half* mlp_chunk_norm = nullptr;  // [CHUNK_SIZE * H]  RMSNorm output
+    half* mlp_chunk_gate = nullptr;  // [CHUNK_SIZE * I]  ffn_gate proj
+    half* mlp_chunk_up   = nullptr;  // [CHUNK_SIZE * I]  ffn_up proj
+    half* mlp_chunk_down = nullptr;  // [CHUNK_SIZE * H]  ffn_down proj
 };
 
 struct QwenModel {
@@ -81,8 +88,16 @@ struct QwenModel {
             cfg.num_q_heads, cfg.num_kv_heads, cfg.vocab_size, cfg.rope_dim);
     }
 
-    // Chunk size for parallel scan during prompt processing
+    // Chunk size for parallel scan during prompt processing.
+    // 64 amortises chunk-loop launch overhead and gives the GDN scan a
+    // longer window. The chunked attention compute path internally splits
+    // CHUNK_SIZE into ATTN_NB-token sub-chunks (see ATTN_NB) so the value
+    // kernel's register-resident accumulator stays bounded.
     static constexpr int CHUNK_SIZE = 64;
+    // Sub-chunk size used by attn_score / softmax / attn_value chunked
+    // kernels. Picked so attn_value's per-thread accumulator
+    // (ATTN_NB × gqa_max=8 floats) fits in registers without spill on Volta.
+    static constexpr int ATTN_NB = 16;
 
     // GDN temp buffers per GPU
     struct GDNBuffers {
@@ -93,6 +108,7 @@ struct QwenModel {
 
         // Chunk buffers (per-token data accumulated for chunked GDN)
         float* chunk_qkv;     // [CHUNK_SIZE * qkv_dim] FP32 conv1d outputs
+        half*  chunk_qkv_half = nullptr;  // [CHUNK_SIZE * qkv_dim] fp16 staging for batched QKV proj
         half*  chunk_a_proj;  // [CHUNK_SIZE * num_v]
         half*  chunk_b_proj;  // [CHUNK_SIZE * num_v]
         half*  chunk_z_out;   // [CHUNK_SIZE * num_v * v_dim]
@@ -114,6 +130,12 @@ struct QwenModel {
             cudaMalloc(&bufs[g].mlp_up, I * sizeof(half));
             cudaMalloc(&bufs[g].mlp_down, H * sizeof(half));
             cudaMalloc(&bufs[g].residual, H * sizeof(half));
+
+            // Chunked prefill MLP buffers (token-major, [CHUNK_SIZE * dim]).
+            cudaMalloc(&bufs[g].mlp_chunk_norm, (size_t)CHUNK_SIZE * H * sizeof(half));
+            cudaMalloc(&bufs[g].mlp_chunk_gate, (size_t)CHUNK_SIZE * I * sizeof(half));
+            cudaMalloc(&bufs[g].mlp_chunk_up,   (size_t)CHUNK_SIZE * I * sizeof(half));
+            cudaMalloc(&bufs[g].mlp_chunk_down, (size_t)CHUNK_SIZE * H * sizeof(half));
 
             // GDN buffers (over-allocate for 27B max)
             int qkv_dim = 2 * 16 * 128 + 48 * 128;  // 10240
@@ -282,6 +304,17 @@ struct QwenModel {
         float* attn_scores; // [num_q * max_seq]
         half* gate_buf;     // [num_q * head_dim] for output gate
         half* attn_out;     // [num_q * head_dim]
+        // Chunked-prefill staging: batched Q/K/V projection outputs.
+        // Allocated lazily on first chunked attn forward.
+        half* attn_chunk_q = nullptr;   // [CHUNK_SIZE * q_out_dim]  raw QKV proj output
+        half* attn_chunk_k = nullptr;   // [CHUNK_SIZE * kv_dim]
+        half* attn_chunk_v = nullptr;   // [CHUNK_SIZE * kv_dim]
+        // Chunked-attention compute scratch:
+        half*  attn_chunk_q_post = nullptr;  // [CHUNK_SIZE * num_q * head_dim] post deinterleave + head_rms + RoPE
+        half*  attn_chunk_gate   = nullptr;  // [CHUNK_SIZE * num_q * head_dim] gate slice from QKV
+        float* attn_chunk_scores = nullptr;  // [CHUNK_SIZE * num_q * max_seq] softmax scratch
+        half*  attn_chunk_out    = nullptr;  // [CHUNK_SIZE * num_q * head_dim] V-weighted output
+        half*  attn_chunk_oproj  = nullptr;  // [CHUNK_SIZE * H] o_proj output staging
     };
     AttnBuffers attn_bufs[4];
     AttnBuffers attn_bufs2[4];  // second-token attn buffers, for forward_attn_n2
@@ -432,7 +465,16 @@ struct QwenModel {
         }
     }
 
-    void forward_attn(int layer, float* hidden, int pos, cudaStream_t stream) {
+    // forward_attn: full per-token attention forward.
+    //
+    // When `external_proj` is true the caller has ALREADY filled
+    // ab.q_proj / ab.k_proj / ab.v_proj for this token (e.g. via a batched
+    // chunked Q/K/V projection in forward_attn_chunk). We then skip the
+    // RMSNorm + Q/K/V GEMVs and pick up at the deinterleave step. The
+    // residual still uses `hidden` so the caller passes the matching token's
+    // fp32 hidden slice.
+    void forward_attn(int layer, float* hidden, int pos, cudaStream_t stream,
+                      bool external_proj = false) {
         int g = gpu->layer_gpu[layer];
         int H = cfg.hidden_size;
         int num_q = cfg.num_q_heads;
@@ -455,19 +497,22 @@ struct QwenModel {
         int total_qg = num_q * hd;
         int kv_dim = num_kv * hd;
         int seq_len = pos + 1;  // including current token
-
-        // 1. RMSNorm (FP32 hidden in)
-        if (norm_w->type == GGML_TYPE_F32)
-            rms_norm_f32in_f32w(norm_out, hidden, (float*)norm_w->data, 1, H, eps, stream);
-        else
-            rms_norm_f32in(norm_out, hidden, (half*)norm_w->data, 1, H, eps, stream);
-
-        // 2. Q/K/V projections
         int q_out_dim = q_w->dims[1];
-        gpu_qi[g].quantize(norm_out, H, stream);
-        quant_gemv(q_w->data, q_w->type, norm_out, ab.q_proj, H, q_out_dim, &gpu_qi[g], stream);
-        quant_gemv(k_w->data, k_w->type, norm_out, ab.k_proj, H, kv_dim, &gpu_qi[g], stream);
-        quant_gemv(v_w->data, v_w->type, norm_out, ab.v_proj, H, kv_dim, &gpu_qi[g], stream);
+
+        if (!external_proj) {
+            // 1. RMSNorm (FP32 hidden in)
+            if (norm_w->type == GGML_TYPE_F32)
+                rms_norm_f32in_f32w(norm_out, hidden, (float*)norm_w->data, 1, H, eps, stream);
+            else
+                rms_norm_f32in(norm_out, hidden, (half*)norm_w->data, 1, H, eps, stream);
+
+            // 2. Q/K/V projections
+            gpu_qi[g].quantize(norm_out, H, stream);
+            quant_gemv(q_w->data, q_w->type, norm_out, ab.q_proj, H, q_out_dim, &gpu_qi[g], stream);
+            quant_gemv(k_w->data, k_w->type, norm_out, ab.k_proj, H, kv_dim, &gpu_qi[g], stream);
+            quant_gemv(v_w->data, v_w->type, norm_out, ab.v_proj, H, kv_dim, &gpu_qi[g], stream);
+        }
+        // else: caller has already populated ab.q_proj / ab.k_proj / ab.v_proj.
 
         // 3. Deinterleave Q and gate
         half* q_buf = ab.attn_out;
@@ -757,33 +802,97 @@ struct QwenModel {
         auto* ssm_norm_w = t(blk(layer, "ssm_norm.weight"));
         auto* out_w   = t(blk(layer, "ssm_out.weight"));
 
-        // For each token: RMSNorm + QKV/Z/alpha/beta projections (per-token GEMV)
-        // Outputs go into chunk buffers.
-        // We use buf.attn_out as a per-token qkv_out staging area (size >= qkv_dim).
-        // Need to also project Z, alpha, beta separately per token into chunk slots.
-        for (int t = 0; t < n_tokens; t++) {
-            float* h_t = hidden_chunk + (size_t)t * H;
-            half* nrm = gb.chunk_norm_out + (size_t)t * H;
+        // ============ Batched RMSNorm + Q/K/V/Z/α/β projection ============
+        // All four projections (qkv, gate, alpha, beta) share the same
+        // pre-quantized norm output. The N-token batched GEMV reuses each
+        // weight word across n_tokens dp4a accumulators, which is the actual
+        // prefill speedup vs the per-token loop.
+        bool can_batch_gdn = (qkv_w->type   == GGML_TYPE_Q8_0)
+                          && (gate_w->type  == GGML_TYPE_Q8_0)
+                          && (alpha_w->type == GGML_TYPE_Q8_0)
+                          && (beta_w->type  == GGML_TYPE_Q8_0);
 
-            // RMSNorm: FP32 hidden in → FP16 norm out
-            if (norm_w->type == GGML_TYPE_F32)
-                rms_norm_f32in_f32w(nrm, h_t, (float*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
-            else
-                rms_norm_f32in(nrm, h_t, (half*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+        if (can_batch_gdn) {
+            // 1. Batched RMSNorm: rows=n_tokens, write into chunk_norm_out
+            if (norm_w->type == GGML_TYPE_F32) {
+                rms_norm_f32in_f32w(gb.chunk_norm_out, hidden_chunk, (float*)norm_w->data,
+                                    n_tokens, H, cfg.rms_norm_eps, stream);
+            } else {
+                rms_norm_f32in(gb.chunk_norm_out, hidden_chunk, (half*)norm_w->data,
+                               n_tokens, H, cfg.rms_norm_eps, stream);
+            }
 
-            gpu_qi[g].quantize(nrm, H, stream);
-            // QKV projection → buf.attn_out (fp16), then convert to fp32 chunk_qkv slot
-            quant_gemv(qkv_w->data, qkv_w->type, nrm, buf.attn_out, H, qkv_dim, &gpu_qi[g], stream);
-            half_to_float_kernel<<<(qkv_dim+255)/256, 256, 0, stream>>>(
-                buf.attn_out, gb.chunk_qkv + (size_t)t * qkv_dim, qkv_dim);
-            // Z (gate) projection
-            quant_gemv(gate_w->data, gate_w->type, nrm,
-                       gb.chunk_z_out + (size_t)t * v_total, H, num_v * v_dim, &gpu_qi[g], stream);
-            // alpha, beta projections
-            quant_gemv(alpha_w->data, alpha_w->type, nrm,
-                       gb.chunk_a_proj + (size_t)t * num_v, H, num_v, &gpu_qi[g], stream);
-            quant_gemv(beta_w->data, beta_w->type, nrm,
-                       gb.chunk_b_proj + (size_t)t * num_v, H, num_v, &gpu_qi[g], stream);
+            // 2. Quantize all n_tokens × H normed values once
+            gpu_qi[g].quantize_chunk(gb.chunk_norm_out, H, n_tokens, stream);
+
+            // 3. Batched QKV projection. Output is [n_tokens, qkv_dim] half,
+            //    we write into buf.attn_out as scratch and immediately
+            //    half→float into chunk_qkv. Need scratch sized n_tokens*qkv_dim.
+            //    buf.attn_out is sized max(H*4, num_q*hd*2) ≥ 12288, which
+            //    is < n_tokens*qkv_dim for chunks > 1. We instead reuse
+            //    chunk_z_out as fp16 staging since it's [CHUNK*v_total]
+            //    (v_total=6144) — that's only 6144 elem per token but qkv_dim
+            //    is 10240. So allocate a dedicated qkv_chunk buffer instead.
+            //    For now: write directly to chunk_qkv as fp16 then convert.
+            //    Actually the simplest: do batched GEMV writing into a fp16
+            //    chunk staging, then half→float.
+            //
+            //    Simpler still: write the batched GEMV output into the FRONT
+            //    of chunk_qkv (which is fp32 [CHUNK*qkv_dim]). We need fp16
+            //    staging though, because gemv_q8_0_q8_nN writes half outputs.
+            //    Use chunk_proj_out as fp16 staging (it's CHUNK*H half = at
+            //    least CHUNK*5120; for 27B qkv_dim=10240 that's not enough).
+            //
+            //    Allocate a dedicated fp16 staging if not already there.
+            if (!gb.chunk_qkv_half) {
+                cudaMalloc(&gb.chunk_qkv_half, (size_t)CHUNK_SIZE * qkv_dim * sizeof(half));
+            }
+
+            quant_gemv_chunk(qkv_w->data, qkv_w->type,
+                             gpu_qi[g].q8_buf, gb.chunk_qkv_half,
+                             H, qkv_dim, n_tokens, stream);
+
+            // Convert chunk_qkv_half [n_tokens, qkv_dim] → chunk_qkv [n_tokens, qkv_dim] fp32
+            {
+                int n_elem = n_tokens * qkv_dim;
+                half_to_float_kernel<<<(n_elem + 255) / 256, 256, 0, stream>>>(
+                    gb.chunk_qkv_half, gb.chunk_qkv, n_elem);
+            }
+
+            // Z (gate) projection — direct fp16 output to chunk_z_out
+            quant_gemv_chunk(gate_w->data, gate_w->type,
+                             gpu_qi[g].q8_buf, gb.chunk_z_out,
+                             H, num_v * v_dim, n_tokens, stream);
+
+            // alpha, beta projections — direct fp16 outputs
+            quant_gemv_chunk(alpha_w->data, alpha_w->type,
+                             gpu_qi[g].q8_buf, gb.chunk_a_proj,
+                             H, num_v, n_tokens, stream);
+            quant_gemv_chunk(beta_w->data, beta_w->type,
+                             gpu_qi[g].q8_buf, gb.chunk_b_proj,
+                             H, num_v, n_tokens, stream);
+        } else {
+            // Fallback: original per-token path for non-Q8_0 quantizations.
+            for (int t = 0; t < n_tokens; t++) {
+                float* h_t = hidden_chunk + (size_t)t * H;
+                half* nrm = gb.chunk_norm_out + (size_t)t * H;
+
+                if (norm_w->type == GGML_TYPE_F32)
+                    rms_norm_f32in_f32w(nrm, h_t, (float*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+                else
+                    rms_norm_f32in(nrm, h_t, (half*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+
+                gpu_qi[g].quantize(nrm, H, stream);
+                quant_gemv(qkv_w->data, qkv_w->type, nrm, buf.attn_out, H, qkv_dim, &gpu_qi[g], stream);
+                half_to_float_kernel<<<(qkv_dim+255)/256, 256, 0, stream>>>(
+                    buf.attn_out, gb.chunk_qkv + (size_t)t * qkv_dim, qkv_dim);
+                quant_gemv(gate_w->data, gate_w->type, nrm,
+                           gb.chunk_z_out + (size_t)t * v_total, H, num_v * v_dim, &gpu_qi[g], stream);
+                quant_gemv(alpha_w->data, alpha_w->type, nrm,
+                           gb.chunk_a_proj + (size_t)t * num_v, H, num_v, &gpu_qi[g], stream);
+                quant_gemv(beta_w->data, beta_w->type, nrm,
+                           gb.chunk_b_proj + (size_t)t * num_v, H, num_v, &gpu_qi[g], stream);
+            }
         }
 
         // Conv1d update (per-token) — input is fp16 (buf.attn_out per token)
@@ -844,17 +953,288 @@ struct QwenModel {
     // For attention layers in prompt phase: process tokens sequentially through
     // forward_attn (KV cache requires sequential append). hidden_chunk is FP32.
     void forward_attn_chunk(int layer, float* hidden_chunk, int start_pos, int n_tokens, cudaStream_t stream) {
+        int g = gpu->layer_gpu[layer];
+        auto& ab = attn_bufs[g];
+        auto& buf = bufs[g];
         int H = cfg.hidden_size;
-        for (int t = 0; t < n_tokens; t++) {
-            forward_attn(layer, hidden_chunk + (size_t)t * H, start_pos + t, stream);
+        int num_q  = cfg.num_q_heads;
+        int num_kv = cfg.num_kv_heads;
+        int hd     = cfg.head_dim;
+        int kv_dim = num_kv * hd;
+        int total_qg = num_q * hd;
+        float eps = cfg.rms_norm_eps;
+        float scale = 1.0f / sqrtf((float)hd);
+
+        auto* norm_w   = t(blk(layer, "attn_norm.weight"));
+        auto* q_w      = t(blk(layer, "attn_q.weight"));
+        auto* k_w      = t(blk(layer, "attn_k.weight"));
+        auto* v_w      = t(blk(layer, "attn_v.weight"));
+        auto* q_norm_w = t(blk(layer, "attn_q_norm.weight"));
+        auto* k_norm_w = t(blk(layer, "attn_k_norm.weight"));
+        auto* o_w      = t(blk(layer, "attn_output.weight"));
+        if (!norm_w || !q_w || !k_w || !v_w || !o_w) {
+            for (int tt = 0; tt < n_tokens; tt++)
+                forward_attn(layer, hidden_chunk + (size_t)tt * H, start_pos + tt, stream);
+            return;
+        }
+        int q_out_dim = q_w->dims[1];
+
+        bool can_batch_attn = (q_w->type == GGML_TYPE_Q8_0)
+                           && (k_w->type == GGML_TYPE_Q8_0)
+                           && (v_w->type == GGML_TYPE_Q8_0)
+                           && (o_w->type == GGML_TYPE_Q8_0)
+                           && !use_turboquant;  // TQ KV cache uses different score path
+        if (!can_batch_attn) {
+            for (int tt = 0; tt < n_tokens; tt++)
+                forward_attn(layer, hidden_chunk + (size_t)tt * H, start_pos + tt, stream);
+            return;
+        }
+
+        // Lazy alloc per-GPU chunked attention buffers.
+        if (!ab.attn_chunk_q) {
+            cudaMalloc(&ab.attn_chunk_q,        (size_t)CHUNK_SIZE * q_out_dim * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_k,        (size_t)CHUNK_SIZE * kv_dim    * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_v,        (size_t)CHUNK_SIZE * kv_dim    * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_q_post,   (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_gate,     (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_scores,   (size_t)CHUNK_SIZE * num_q * kv_max_seq * sizeof(float));
+            cudaMalloc(&ab.attn_chunk_out,      (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_oproj,    (size_t)CHUNK_SIZE * H         * sizeof(half));
+        }
+
+        // 1. Batched RMSNorm: rows=n_tokens, output → mlp_chunk_norm
+        //    (mlp_chunk_norm is reused; MLP runs after attn and re-norms).
+        if (norm_w->type == GGML_TYPE_F32) {
+            rms_norm_f32in_f32w(buf.mlp_chunk_norm, hidden_chunk, (float*)norm_w->data,
+                                n_tokens, H, eps, stream);
+        } else {
+            rms_norm_f32in(buf.mlp_chunk_norm, hidden_chunk, (half*)norm_w->data,
+                           n_tokens, H, eps, stream);
+        }
+
+        // 2. Quantize all n_tokens × H normed values once
+        gpu_qi[g].quantize_chunk(buf.mlp_chunk_norm, H, n_tokens, stream);
+
+        // 3. Batched Q/K/V projections — 3 GEMV calls instead of 3*n_tokens.
+        quant_gemv_chunk(q_w->data, q_w->type, gpu_qi[g].q8_buf, ab.attn_chunk_q,
+                         H, q_out_dim, n_tokens, stream);
+        quant_gemv_chunk(k_w->data, k_w->type, gpu_qi[g].q8_buf, ab.attn_chunk_k,
+                         H, kv_dim, n_tokens, stream);
+        quant_gemv_chunk(v_w->data, v_w->type, gpu_qi[g].q8_buf, ab.attn_chunk_v,
+                         H, kv_dim, n_tokens, stream);
+
+        // 4. Per-token: deinterleave Q/gate, head-RMS, RoPE, KV cache append.
+        //    These are small kernels — keeping them per-token avoids writing
+        //    chunk versions while remaining cheap relative to attention.
+        int rope_dim = rope.rope_dim;
+        int half_rope = rope_dim / 2;
+        int tn = min(hd, 128);
+        for (int tt = 0; tt < n_tokens; tt++) {
+            int pos = start_pos + tt;
+            half* q_slice    = ab.attn_chunk_q      + (size_t)tt * q_out_dim;
+            half* qpost      = ab.attn_chunk_q_post + (size_t)tt * total_qg;
+            half* gate_slice = ab.attn_chunk_gate   + (size_t)tt * total_qg;
+            half* k_slice    = ab.attn_chunk_k      + (size_t)tt * kv_dim;
+            half* v_slice    = ab.attn_chunk_v      + (size_t)tt * kv_dim;
+
+            deinterleave_qg_kernel<<<(total_qg + 255) / 256, 256, 0, stream>>>(
+                q_slice, qpost, gate_slice, num_q, hd);
+
+            head_rms_norm_kernel<<<num_q, tn, tn * sizeof(float), stream>>>(
+                qpost, (float*)q_norm_w->data, num_q, hd, eps);
+            head_rms_norm_kernel<<<num_kv, tn, tn * sizeof(float), stream>>>(
+                k_slice, (float*)k_norm_w->data, num_kv, hd, eps);
+
+            float* sin_pos = rope.sin_table(g) + pos * half_rope;
+            float* cos_pos = rope.cos_table(g) + pos * half_rope;
+            apply_rope_kernel<<<(num_q  * half_rope + 255) / 256, 256, 0, stream>>>(
+                qpost,  sin_pos, cos_pos, num_q,  hd, rope_dim);
+            apply_rope_kernel<<<(num_kv * half_rope + 255) / 256, 256, 0, stream>>>(
+                k_slice, sin_pos, cos_pos, num_kv, hd, rope_dim);
+
+            // KV cache append
+            auto& kv = kv_caches[layer];
+            half* k_cache_pos = kv.k + (size_t)pos * kv_dim;
+            half* v_cache_pos = kv.v + (size_t)pos * kv_dim;
+            cudaMemcpyAsync(k_cache_pos, k_slice, kv_dim * sizeof(half),
+                            cudaMemcpyDeviceToDevice, stream);
+            cudaMemcpyAsync(v_cache_pos, v_slice, kv_dim * sizeof(half),
+                            cudaMemcpyDeviceToDevice, stream);
+        }
+
+        // 5–7. Chunked attention compute, processed in ATTN_NB-token
+        //      sub-chunks so the value kernel's register-resident
+        //      accumulator stays bounded (see ATTN_NB / acc[16][8]).
+        auto& kv = kv_caches[layer];
+        int sub_processed = 0;
+        while (sub_processed < n_tokens) {
+            int sub_n = std::min(ATTN_NB, n_tokens - sub_processed);
+            int sub_start_pos = start_pos + sub_processed;
+            int sub_seq_total = sub_start_pos + sub_n;
+
+            // Pointers into the chunk-major Q-post / scores / out buffers,
+            // offset by sub_processed tokens.
+            half*  q_post_sub = ab.attn_chunk_q_post + (size_t)sub_processed * total_qg;
+            float* scores_sub = ab.attn_chunk_scores + (size_t)sub_processed * num_q * kv_max_seq;
+            half*  out_sub    = ab.attn_chunk_out    + (size_t)sub_processed * total_qg;
+
+            // 5. Score: each (kv_head, pos) block loads K[pos] once and
+            //    dots against sub_n × gqa Q lanes.
+            {
+                int smem_bytes = (hd + 8) * sizeof(float);
+                dim3 sg(num_kv, sub_seq_total);
+                attn_score_kernel_h_chunk<<<sg, hd, smem_bytes, stream>>>(
+                    q_post_sub, kv.k, scores_sub,
+                    num_q, num_kv, hd, sub_seq_total, sub_start_pos, sub_n, scale,
+                    /*row_stride=*/kv_max_seq);
+            }
+
+            // 6. Softmax (one block per (t_idx, q_head) row in this sub-chunk).
+            //    The chunked softmax assumes scores stride = (num_q * seq_len),
+            //    which matches the per-sub layout because each sub_chunk's
+            //    scores buffer is [sub_n][num_q][kv_max_seq] but only
+            //    [..][..][0..sub_seq_total) is meaningful — softmax only
+            //    touches the active range.
+            //
+            //    NOTE: chunked softmax indexes its row as
+            //    scores + t_idx*gridDim.y*seq_len + q_head*seq_len.
+            //    So each row is `kv_max_seq` apart in the per-sub layout
+            //    (because we keep the full max-seq stride). Pass
+            //    seq_len = kv_max_seq to honor that stride, with
+            //    start_pos = sub_start_pos so causal range stays correct.
+            {
+                int st = 1;
+                while (st < sub_seq_total && st < 256) st <<= 1;
+                dim3 sm_grid(sub_n, num_q);
+                softmax_kernel_chunk<<<sm_grid, st, st * sizeof(float), stream>>>(
+                    scores_sub, num_q, kv_max_seq, sub_start_pos,
+                    /*wipe_end=*/sub_seq_total);
+            }
+
+            // 7. Value multiply.
+            {
+                int threads = min(hd, 128);
+                int d_blocks = (hd + threads - 1) / threads;
+                dim3 vg(num_kv, d_blocks);
+                attn_value_kernel_h_chunk<<<vg, threads, 0, stream>>>(
+                    scores_sub, kv.v, out_sub,
+                    num_q, num_kv, hd, sub_seq_total, sub_start_pos, sub_n,
+                    /*row_stride=*/kv_max_seq);
+            }
+
+            sub_processed += sub_n;
+        }
+        int seq_len_total = start_pos + n_tokens;  // for downstream code (unused)
+        (void)seq_len_total;
+
+        // 8. Per-token output gate (sigmoid) + 9. batched output projection.
+        for (int tt = 0; tt < n_tokens; tt++) {
+            half* out_slice  = ab.attn_chunk_out  + (size_t)tt * total_qg;
+            half* gate_slice = ab.attn_chunk_gate + (size_t)tt * total_qg;
+            apply_gate_sigmoid<<<(total_qg + 255) / 256, 256, 0, stream>>>(
+                out_slice, gate_slice, total_qg);
+        }
+
+        // 9. Batched output projection: quantize attn_chunk_out → q8_1 chunk,
+        //    then chunked GEMV for o_proj.
+        gpu_qi_inter[g].quantize_chunk(ab.attn_chunk_out, total_qg, n_tokens, stream);
+        quant_gemv_chunk(o_w->data, o_w->type,
+                         gpu_qi_inter[g].q8_buf, ab.attn_chunk_oproj,
+                         total_qg, H, n_tokens, stream);
+
+        // 10. Residual add into the fp32 hidden chunk (one launch).
+        {
+            int n_elem = n_tokens * H;
+            add_kernel_f32<<<(n_elem + 255) / 256, 256, 0, stream>>>(
+                hidden_chunk, ab.attn_chunk_oproj, n_elem);
         }
     }
 
-    // ============ Chunked MLP forward ============
+    // ============ Chunked MLP forward (batched, prefill fast path) ============
+    // Processes n_tokens hidden states through one MLP layer with shared
+    // weight loads. Each weight word in ffn_gate/ffn_up/ffn_down is read
+    // ONCE per output row and dp4a'd against up to NB token inputs at the
+    // same time (NB=16/8/4 peeling inside quant_gemv_chunk). For Q8_0 27B
+    // this collapses 64 sequential GEMVs into ~4 batched calls per
+    // projection — same total compute, ~1/16 the memory traffic, which is
+    // the actual prefill bottleneck on HBM2-bound Volta.
     void forward_mlp_chunk(int layer, float* hidden_chunk, int n_tokens, cudaStream_t stream) {
+        int g = gpu->layer_gpu[layer];
+        auto& buf = bufs[g];
         int H = cfg.hidden_size;
-        for (int t = 0; t < n_tokens; t++) {
-            forward_mlp(layer, hidden_chunk + (size_t)t * H, stream);
+        int I = cfg.intermediate_size;
+
+        auto* norm_w = t(blk(layer, "post_attention_norm.weight"));
+        auto* gate_w = t(blk(layer, "ffn_gate.weight"));
+        auto* up_w   = t(blk(layer, "ffn_up.weight"));
+        auto* down_w = t(blk(layer, "ffn_down.weight"));
+        if (!norm_w || !gate_w || !up_w || !down_w) {
+            printf("MLP L%d: missing weights!\n", layer);
+            return;
+        }
+
+        // Q8_0 path uses the new chunked dispatch. Q5_K / Q6_K and any
+        // mixed quant fall back to the old per-token loop — those models
+        // don't use the chunked GEMV anyway, and per-token still works.
+        bool can_batch = (gate_w->type == GGML_TYPE_Q8_0)
+                      && (up_w->type   == GGML_TYPE_Q8_0)
+                      && (down_w->type == GGML_TYPE_Q8_0);
+        if (!can_batch) {
+            for (int tt = 0; tt < n_tokens; tt++) {
+                forward_mlp(layer, hidden_chunk + (size_t)tt * H, stream);
+            }
+            return;
+        }
+
+        // 1. Batched RMSNorm: rows = n_tokens, all writing into mlp_chunk_norm.
+        //    rms_norm_f32in_*_kernel uses one block per row, so this is one
+        //    launch with n_tokens blocks instead of n_tokens launches.
+        if (norm_w->type == GGML_TYPE_F32) {
+            rms_norm_f32in_f32w(buf.mlp_chunk_norm, hidden_chunk, (float*)norm_w->data,
+                                n_tokens, H, cfg.rms_norm_eps, stream);
+        } else {
+            rms_norm_f32in(buf.mlp_chunk_norm, hidden_chunk, (half*)norm_w->data,
+                           n_tokens, H, cfg.rms_norm_eps, stream);
+        }
+
+        // 2. Quantize all n_tokens × H normed values in one shot. The chunk
+        //    is contiguous and H is a multiple of QK8=32, so block boundaries
+        //    align with token boundaries.
+        gpu_qi[g].quantize_chunk(buf.mlp_chunk_norm, H, n_tokens, stream);
+
+        // 3. Batched ffn_gate and ffn_up projections. Both share the same
+        //    pre-quantized input chunk → weight word load is paid twice
+        //    (once per matrix), not 2*n_tokens times.
+        quant_gemv_chunk(gate_w->data, gate_w->type,
+                         gpu_qi[g].q8_buf, buf.mlp_chunk_gate,
+                         H, I, n_tokens, stream);
+        quant_gemv_chunk(up_w->data,   up_w->type,
+                         gpu_qi[g].q8_buf, buf.mlp_chunk_up,
+                         H, I, n_tokens, stream);
+
+        // 4. Fused SiLU(gate) * up across the whole chunk. silu_mul_kernel
+        //    is element-wise so we just expand n to (n_tokens * I).
+        {
+            int n_elem = n_tokens * I;
+            silu_mul_kernel<<<(n_elem + 255) / 256, 256, 0, stream>>>(
+                buf.mlp_chunk_gate, buf.mlp_chunk_up, n_elem);
+        }
+
+        // 5. Quantize the (silu_mul'd) intermediate chunk for the down proj.
+        gpu_qi_inter[g].quantize_chunk(buf.mlp_chunk_gate, I, n_tokens, stream);
+
+        // 6. Batched ffn_down projection.
+        quant_gemv_chunk(down_w->data, down_w->type,
+                         gpu_qi_inter[g].q8_buf, buf.mlp_chunk_down,
+                         I, H, n_tokens, stream);
+
+        // 7. Residual add: hidden_chunk[t,h] += mlp_chunk_down[t,h]. Both
+        //    buffers are contiguous and the same shape, so add_kernel_f32
+        //    handles the whole thing in one launch.
+        {
+            int n_elem = n_tokens * H;
+            add_kernel_f32<<<(n_elem + 255) / 256, 256, 0, stream>>>(
+                hidden_chunk, buf.mlp_chunk_down, n_elem);
         }
     }
 

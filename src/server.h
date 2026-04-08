@@ -483,7 +483,7 @@ static std::vector<ChatMessage> json_get_messages(const std::string& json) {
 
 // ============ HTTP Server ============
 
-using GenerateFunc = std::function<std::string(const std::vector<int>& prompt_ids, int max_tokens)>;
+using GenerateFunc = std::function<std::string(const std::vector<int>& prompt_ids, int max_tokens, int* out_completion_tokens)>;
 using StreamCallback = std::function<void(const std::string& token_text, bool is_done)>;
 using StreamGenerateFunc = std::function<void(const std::vector<int>& prompt_ids, int max_tokens, StreamCallback cb)>;
 
@@ -497,6 +497,12 @@ struct HttpServer {
     std::function<std::vector<int>(const std::vector<std::pair<std::string,std::string>>&)> chat_encode_fn;
     std::string model_name = "qwen";
     std::string api_key;
+    // When true, the chat encoder prefills "<think>\n" into the prompt, so the
+    // model's generated stream starts mid-think (no opening <think> token).
+    // The HTTP layer compensates by emitting "<think>\n" as the first content
+    // delta (streaming) and by prepending it before strip_think_block runs
+    // (non-streaming) so the strip can find a balanced pair.
+    bool prefills_think_tag = false;
 
     void send_response(int client_fd, int status, const std::string& content_type, const std::string& body) {
         std::string status_text = (status == 200) ? "OK" : "Bad Request";
@@ -664,6 +670,13 @@ struct HttpServer {
                 + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}");
 
             std::string stream_accum;  // accumulate full output for tool_call detection
+            // If the chat encoder prefilled "<think>\n", surface that to the
+            // client so the streamed content is well-formed (<think>...</think>...).
+            if (prefills_think_tag) {
+                stream_accum += "<think>\n";
+                send_sse(client_fd, "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\""
+                    + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<think>\\n\"},\"finish_reason\":null}]}");
+            }
             stream_generate_fn(prompt_ids, max_tokens, [&](const std::string& token, bool done) {
                 if (done) {
                     // Parse accumulated output for tool calls
@@ -693,14 +706,21 @@ struct HttpServer {
             });
         } else {
             // Non-streaming response
-            std::string generated_text = generate_fn(prompt_ids, max_tokens);
+            int completion_tokens = 0;
+            std::string generated_text = generate_fn(prompt_ids, max_tokens, &completion_tokens);
+
+            // The chat encoder may prefill "<think>\n" into the prompt, in
+            // which case the generated text starts mid-think with no opening
+            // tag. Re-attach it so strip_think_block can find a balanced pair
+            // and the wire response stays well-formed.
+            std::string full_text = prefills_think_tag ? ("<think>\n" + generated_text) : generated_text;
 
             // Parse tool calls from XML output
-            auto parsed_calls = parse_tool_calls(generated_text);
+            auto parsed_calls = parse_tool_calls(full_text);
             std::string finish_reason = parsed_calls.empty() ? "stop" : "tool_calls";
 
             // Clean content: strip <think> and <tool_call> blocks
-            std::string clean_content = strip_think_block(generated_text);
+            std::string clean_content = strip_think_block(full_text);
             clean_content = strip_tool_calls(clean_content);
 
             std::ostringstream json;
@@ -717,7 +737,8 @@ struct HttpServer {
 
             json << "},\"finish_reason\":\"" << finish_reason << "\"}],"
                  << "\"usage\":{\"prompt_tokens\":" << prompt_ids.size()
-                 << ",\"completion_tokens\":0,\"total_tokens\":" << prompt_ids.size() << "}}";
+                 << ",\"completion_tokens\":" << completion_tokens
+                 << ",\"total_tokens\":" << (prompt_ids.size() + (size_t)completion_tokens) << "}}";
 
             send_response(client_fd, 200, "application/json", json.str());
         }

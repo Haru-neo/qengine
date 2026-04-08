@@ -312,6 +312,224 @@ __global__ void gemv_q8_0_q8_n2(
     }
 }
 
+// N-token batched Q8_0 weight × Q8_1 input GEMV (chunked prefill).
+// Each block computes one output row across NB tokens. The weight word is
+// loaded ONCE per j-step and reused across NB dp4a accumulators, so total
+// weight bandwidth is K * M (just like a single GEMV) instead of K * M * NB.
+// This is the prefill analogue of gemv_q8_0_q8_n2 — same shared-weight-load
+// trick, just scaled up to NB tokens at a time.
+//
+// Layout assumptions:
+//   weight: [M, K/32] block_q8_0_aligned
+//   x_q8:   [NB, K/32] block_q8_1, contiguous (token-major: t*bpr + b)
+//   output: [NB, M] half (token-major: t*M + row)
+//
+// Caller must pre-quantize NB tokens of input into a contiguous block_q8_1
+// buffer of size NB * (K/32). Caller must guarantee actual_n_tokens == NB,
+// or pass actual_n_tokens < NB (kernel masks the spillover lanes).
+template<int NB>
+__global__ void gemv_q8_0_q8_nN(
+    const void* __restrict__ weight,
+    const block_q8_1* __restrict__ x_q8_chunk,   // [NB][K/32]
+    half* __restrict__ output_chunk,             // [NB][M]
+    const int K, const int M, const int actual_n_tokens
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int bpr = K / 32;
+    const block_q8_0_aligned* w_row = (const block_q8_0_aligned*)weight + (size_t)row * bpr;
+
+    float thread_sums[NB];
+    #pragma unroll
+    for (int n = 0; n < NB; n++) thread_sums[n] = 0.0f;
+
+    for (int b = threadIdx.x; b < bpr; b += blockDim.x) {
+        const block_q8_0_aligned* wb = &w_row[b];
+        float d_w = __half2float(wb->d);
+        const int* wp32 = (const int*)wb->qs;
+
+        int isums[NB];
+        #pragma unroll
+        for (int n = 0; n < NB; n++) isums[n] = 0;
+
+        // dp4a inner loop. Load weight word once per j, dp4a against NB inputs.
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int wj = wp32[j];
+            #pragma unroll
+            for (int n = 0; n < NB; n++) {
+                if (n < actual_n_tokens) {
+                    const block_q8_1* xb_n = x_q8_chunk + (size_t)n * bpr + b;
+                    const int* xqs = (const int*)xb_n->qs;
+                    isums[n] = __dp4a(wj, xqs[j], isums[n]);
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int n = 0; n < NB; n++) {
+            if (n < actual_n_tokens) {
+                const block_q8_1* xb_n = x_q8_chunk + (size_t)n * bpr + b;
+                float d_x = __half2float(xb_n->ds.x);
+                thread_sums[n] += d_w * d_x * (float)isums[n];
+            }
+        }
+    }
+
+    // Warp shuffle reduce within each lane
+    for (int off = 16; off > 0; off >>= 1) {
+        #pragma unroll
+        for (int n = 0; n < NB; n++) {
+            thread_sums[n] += __shfl_xor_sync(0xffffffff, thread_sums[n], off);
+        }
+    }
+
+    // Cross-warp reduce via shared mem (max 8 warps per block at blockDim=256)
+    __shared__ float sm[NB][8];
+    int w_idx = threadIdx.x >> 5;
+    int lane  = threadIdx.x & 31;
+    int nwarp = blockDim.x >> 5;
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int n = 0; n < NB; n++) sm[n][w_idx] = thread_sums[n];
+    }
+    __syncthreads();
+
+    if (w_idx == 0 && lane < nwarp) {
+        float vals[NB];
+        #pragma unroll
+        for (int n = 0; n < NB; n++) vals[n] = sm[n][lane];
+        for (int o = 16; o > 0; o >>= 1) {
+            #pragma unroll
+            for (int n = 0; n < NB; n++) {
+                vals[n] += __shfl_xor_sync(0xffffffff, vals[n], o);
+            }
+        }
+        if (lane == 0) {
+            #pragma unroll
+            for (int n = 0; n < NB; n++) {
+                if (n < actual_n_tokens) {
+                    output_chunk[(size_t)n * M + row] = __float2half(vals[n]);
+                }
+            }
+        }
+    }
+}
+
+// Explicit instantiations to keep linker happy and force separate code-gen.
+template __global__ void gemv_q8_0_q8_nN<4>(const void*, const block_q8_1*, half*, int, int, int);
+template __global__ void gemv_q8_0_q8_nN<8>(const void*, const block_q8_1*, half*, int, int, int);
+template __global__ void gemv_q8_0_q8_nN<16>(const void*, const block_q8_1*, half*, int, int, int);
+
+// ========================================================================
+// Q8_0 weight × Q8_1 input GEMM (chunked prefill fast path)
+//
+// True GEMM with shared-memory tiling, so each global Q8_0 weight block
+// and each global Q8_1 input block is loaded ONCE per K-tile and reused
+// across all (BM, BN) outputs in the block. Compared to the per-row NB=16
+// batched GEMV (gemv_q8_0_q8_nN<16>) this turns the per-output memory
+// traffic from ~K weight + K input bytes (input bandwidth bound) into
+// ~K/BN weight + K/BM input — both terms shrink, multiplicatively.
+//
+// Tile geometry (template constants):
+//   BM           = output rows per block
+//   BN           = output cols per block (== batched tokens per tile)
+//   BK_BLOCKS    = q8_0 blocks of 32 K-elements processed per K-tile iter
+//   THREADS      = BM * BN  (one thread per output, makes the inner loop
+//                  trivial — every thread accumulates its own dp4a chain
+//                  out of the shared tile)
+//
+// Layouts:
+//   W: [M][bpr] block_q8_0_aligned, bpr = K/32
+//   X: [N][bpr] block_q8_1
+//   Y: [N][M]   half (token-major: y[n*M + m])
+template<int BM, int BN, int BK_BLOCKS>
+__global__ void gemm_q8_0_q8_1(
+    const void* __restrict__ W,
+    const block_q8_1* __restrict__ X,
+    half* __restrict__ Y,
+    const int M, const int N, const int K
+) {
+    const int bpr = K / 32;
+    const int tid = threadIdx.x;
+    const int tx  = tid % BM;          // output row inside tile
+    const int ty  = tid / BM;          // output col inside tile
+    const int gm  = blockIdx.x * BM + tx;
+    const int gn  = blockIdx.y * BN + ty;
+
+    // Shared memory tiles. Layout matters for the load-coalescing path,
+    // but the simple "block-strided cooperative copy" below works well
+    // enough for the first cut.
+    extern __shared__ char gemm_smem_raw[];
+    block_q8_0_aligned* sW = (block_q8_0_aligned*)gemm_smem_raw;             // [BM * BK_BLOCKS]
+    block_q8_1*         sX = (block_q8_1*)(sW + BM * BK_BLOCKS);             // [BN * BK_BLOCKS]
+
+    const block_q8_0_aligned* Wp = (const block_q8_0_aligned*)W;
+
+    float acc = 0.0f;
+
+    // Iterate over K in BK_BLOCKS-sized tiles. The K-loop bound is the
+    // ceiling so the last tile is allowed to run with partial blocks
+    // (the inner accumulator loop respects bpr).
+    for (int kb = 0; kb < bpr; kb += BK_BLOCKS) {
+        // ── Cooperative load: weight tile [BM][BK_BLOCKS] → SMEM
+        for (int idx = tid; idx < BM * BK_BLOCKS; idx += BM * BN) {
+            int row_in = idx / BK_BLOCKS;
+            int b_in   = idx - row_in * BK_BLOCKS;
+            int m_glob = blockIdx.x * BM + row_in;
+            int b_glob = kb + b_in;
+            if (m_glob < M && b_glob < bpr) {
+                sW[idx] = Wp[(size_t)m_glob * bpr + b_glob];
+            }
+        }
+        // ── Cooperative load: input tile [BN][BK_BLOCKS] → SMEM
+        for (int idx = tid; idx < BN * BK_BLOCKS; idx += BM * BN) {
+            int row_in = idx / BK_BLOCKS;
+            int b_in   = idx - row_in * BK_BLOCKS;
+            int n_glob = blockIdx.y * BN + row_in;
+            int b_glob = kb + b_in;
+            if (n_glob < N && b_glob < bpr) {
+                sX[idx] = X[(size_t)n_glob * bpr + b_glob];
+            }
+        }
+        __syncthreads();
+
+        // ── Compute partial dot product for this thread's (tx, ty) output
+        if (gm < M && gn < N) {
+            #pragma unroll
+            for (int b = 0; b < BK_BLOCKS; b++) {
+                int b_glob = kb + b;
+                if (b_glob >= bpr) break;
+                const block_q8_0_aligned* wb = &sW[tx * BK_BLOCKS + b];
+                const block_q8_1*         xb = &sX[ty * BK_BLOCKS + b];
+
+                float d_w = __half2float(wb->d);
+                float d_x = __half2float(xb->ds.x);
+
+                const int* wp32 = (const int*)wb->qs;
+                const int* xqs  = (const int*)xb->qs;
+
+                int isum = 0;
+                #pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    isum = __dp4a(wp32[j], xqs[j], isum);
+                }
+                acc += d_w * d_x * (float)isum;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (gm < M && gn < N) {
+        Y[(size_t)gn * M + gm] = __float2half(acc);
+    }
+}
+
+// Explicit instantiations.
+template __global__ void gemm_q8_0_q8_1<16, 16, 8>(const void*, const block_q8_1*, half*, int, int, int);
+template __global__ void gemm_q8_0_q8_1<32, 16, 4>(const void*, const block_q8_1*, half*, int, int, int);
+
 __global__ void gemv_fp16(const half* __restrict__ w,const half* __restrict__ x,half* __restrict__ y,int K,int N){
     int row=blockIdx.x;if(row>=N)return;float s=0.0f;
     for(int i=threadIdx.x;i<K;i+=blockDim.x)s+=__half2float(w[(size_t)row*K+i])*__half2float(x[i]);
@@ -334,6 +552,15 @@ struct QuantInput {
     block_q8_1* q8_buf=nullptr; int max_K=0;
     void ensure(int K){int nb=K/QK8;if(K>max_K){if(q8_buf)cudaFree(q8_buf);cudaMalloc(&q8_buf,nb*sizeof(block_q8_1));max_K=K;}}
     void quantize(const half* input,int K,cudaStream_t stream=0){ensure(K);quantize_input_q8_1<<<(K/QK8+63)/64,64,0,stream>>>(input,q8_buf,K);}
+    // Quantize a chunk of n_tokens × K contiguous half values into n_tokens
+    // contiguous q8_1 rows. Each token contributes K/QK8 blocks; the kernel
+    // operates on the flat n_tokens*K element span (block boundaries align
+    // with token boundaries because K is always a multiple of QK8=32).
+    void quantize_chunk(const half* input, int K, int n_tokens, cudaStream_t stream=0) {
+        int total_K = K * n_tokens;
+        ensure(total_K);
+        quantize_input_q8_1<<<(total_K/QK8 + 63)/64, 64, 0, stream>>>(input, q8_buf, total_K);
+    }
     void free_buf(){if(q8_buf){cudaFree(q8_buf);q8_buf=nullptr;max_K=0;}}
 };
 
@@ -367,6 +594,87 @@ inline void quant_gemv(void* weight,ggml_type type,half* input,half* output,int 
         case GGML_TYPE_F32: gemv_f32<<<N,256,0,stream>>>((float*)weight,input,output,K,N);break;
         default:fprintf(stderr,"quant_gemv: unsupported type %d\n",type);
         }
+    }
+}
+
+// Chunked Q8_0 GEMV/GEMM dispatch. Processes n_tokens contiguous inputs
+// through the same weight matrix using a tiled GEMM kernel for the bulk
+// of the chunk and the per-row N-batched GEMV kernels for any leftover.
+// Caller pre-quantizes the input chunk into a contiguous block_q8_1 buffer
+// of size n_tokens * (K/32).
+//
+// Falls back to per-token quant_gemv if `type` is not Q8_0 (Q5_K/Q6_K/etc).
+inline void quant_gemv_chunk(void* weight, ggml_type type,
+                             const block_q8_1* x_q8_chunk,
+                             half* output_chunk,
+                             int K, int M, int n_tokens,
+                             cudaStream_t stream = 0) {
+    if (n_tokens <= 0) return;
+    int threads = (K >= 8192) ? 256 : 128;
+
+    if (type == GGML_TYPE_Q8_0) {
+        const block_q8_1* xp = x_q8_chunk;
+        half* op = output_chunk;
+        int remaining = n_tokens;
+
+        // True GEMM tile path: BM=16, BN=16, BK_BLOCKS=8 (256 K elements
+        // per K-tile). Each block computes 16×16 = 256 outputs with one
+        // pair of cooperative tile loads, so weight + input bandwidth is
+        // amortised across 256 outputs instead of just 16 (NB=16 GEMV).
+        // Requires M divisible by 16 (true for 27B's H=5120 and I=17408)
+        // and we issue blocks for ceil(n/16) cols, masking the tail.
+        constexpr int BM = 16, BN = 16, BK_BLOCKS = 8;
+        if (remaining >= BN && (M % BM) == 0) {
+            int n_chunks = remaining / BN;
+            int bn_total = n_chunks * BN;
+            dim3 grid(M / BM, n_chunks);
+            int sm_bytes = (BM * BK_BLOCKS + BN * BK_BLOCKS) * sizeof(block_q8_0_aligned);
+            gemm_q8_0_q8_1<BM, BN, BK_BLOCKS><<<grid, BM * BN, sm_bytes, stream>>>(
+                weight, xp, op, M, bn_total, K);
+            xp += (size_t)bn_total * (K / 32);
+            op += (size_t)bn_total * M;
+            remaining -= bn_total;
+        }
+
+        // Tail: < BN tokens. Fall back to N-batched GEMV peeling.
+        while (remaining >= 8) {
+            gemv_q8_0_q8_nN<8><<<M, threads, 0, stream>>>(weight, xp, op, K, M, 8);
+            xp += 8 * (K / 32);
+            op += (size_t)8 * M;
+            remaining -= 8;
+        }
+        while (remaining >= 4) {
+            gemv_q8_0_q8_nN<4><<<M, threads, 0, stream>>>(weight, xp, op, K, M, 4);
+            xp += 4 * (K / 32);
+            op += (size_t)4 * M;
+            remaining -= 4;
+        }
+        if (remaining >= 2) {
+            gemv_q8_0_q8_nN<4><<<M, threads, 0, stream>>>(weight, xp, op, K, M, remaining);
+            xp += (size_t)remaining * (K / 32);
+            op += (size_t)remaining * M;
+            remaining = 0;
+        }
+        if (remaining == 1) {
+            gemv_q8_0_q8<<<M, threads, 0, stream>>>(weight, xp, op, K, M);
+        }
+        return;
+    }
+
+    // Non-Q8_0 fallback: per-token GEMV. Slower but correct.
+    int bpr = K / 32;
+    for (int t = 0; t < n_tokens; t++) {
+        const block_q8_1* xp = x_q8_chunk + (size_t)t * bpr;
+        half* op = output_chunk + (size_t)t * M;
+        // For non-Q8_0 we can't reuse the pre-quantized buffer this way (the
+        // dequant kernels expect their own input format). Caller should keep
+        // using token-by-token quant_gemv for those types — they're rare.
+        if (type == GGML_TYPE_Q5_K)
+            gemv_q5_K_q8<<<M, threads, 0, stream>>>(weight, xp, op, K, M);
+        else if (type == GGML_TYPE_Q6_K)
+            gemv_q6_K_q8<<<M, threads, 0, stream>>>(weight, xp, op, K, M);
+        else
+            gemv_q8_0_q8<<<M, threads, 0, stream>>>(weight, xp, op, K, M);
     }
 }
 

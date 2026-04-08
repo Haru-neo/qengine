@@ -620,7 +620,13 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     Sampler sampler;
     sampler.init(sp, V);
 
-    auto generate = [&](const std::vector<int>& prompt_ids, int max_tokens) -> std::string {
+    // Unified generate. When `on_token` is provided, it's invoked once per
+    // generated token id (in append order, including both tokens accepted by
+    // a spec iter). The streaming wrapper below uses it to drive SSE chunks
+    // so streaming benefits from the same spec decoding path as non-stream.
+    auto generate_impl = [&](const std::vector<int>& prompt_ids, int max_tokens,
+                             int* out_completion_tokens,
+                             const std::function<void(int)>& on_token) -> std::string {
         model.reset_all_states();
         std::vector<int> generated;
         // No default cap on response length: if the caller doesn't pass
@@ -808,6 +814,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 if (step >= (int)prompt_ids.size()) {
                     if (!got_first_tok) { t_first = std::chrono::high_resolution_clock::now(); got_first_tok = true; }
                     generated.push_back(max_idx);
+                    if (on_token) on_token(max_idx);
 
                     // Track think state: tokens inside <think>...</think> don't count against max_tokens
                     if (max_idx == 248068) in_think = true;   // <think>
@@ -913,6 +920,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         if (spec_accept) {
                             // Append the accepted draft + the provisional next token.
                             generated.push_back(mtp_draft);   // = t_{step+2}
+                            if (on_token) on_token(mtp_draft);
                             if (mtp_draft == 248068) in_think = true;
                             if (mtp_draft == 248069) in_think = false;
                             if (!in_think) output_tokens++;
@@ -921,6 +929,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
 
                             if (!stop_now && output_tokens < max_gen) {
                                 generated.push_back(max_idx_b);   // = t_{step+3}
+                                if (on_token) on_token(max_idx_b);
                                 if (max_idx_b == 248068) in_think = true;
                                 if (max_idx_b == 248069) in_think = false;
                                 if (!in_think) output_tokens++;
@@ -934,6 +943,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         } else {
                             // Reject: keep main's verify (max_idx_a = t_{step+2}_main).
                             generated.push_back(max_idx_a);
+                            if (on_token) on_token(max_idx_a);
                             if (max_idx_a == 248068) in_think = true;
                             if (max_idx_a == 248069) in_think = false;
                             if (!in_think) output_tokens++;
@@ -954,7 +964,12 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         }
                     }
                 } else {
+                    // step == prompt_ids.size() - 1: this is actually the
+                    // first sampled output token (the prediction made from
+                    // the last prompt token's hidden). It's a real
+                    // generation token, so fire on_token for streaming.
                     generated.push_back(max_idx);
+                    if (on_token) on_token(max_idx);
                 }
             }
         }
@@ -978,7 +993,14 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                    1.0 + (double)spec_accept_count / spec_total_count);
         }
 
+        if (out_completion_tokens) *out_completion_tokens = (int)generated.size();
         return tok.decode(generated);
+    };
+
+    // Non-streaming wrapper: call the unified generate with no per-token cb.
+    auto generate = [&](const std::vector<int>& prompt_ids, int max_tokens,
+                        int* out_completion_tokens) -> std::string {
+        return generate_impl(prompt_ids, max_tokens, out_completion_tokens, nullptr);
     };
 
     HttpServer server;
@@ -986,114 +1008,22 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     server.model_name = model_name;
     server.api_key = api_key;
     server.generate_fn = generate;
+    server.prefills_think_tag = true;
     server.sampling_params = &sp;
 
-    // Streaming generate
+    // Streaming wrapper: re-uses the unified generate_impl so it gets the
+    // same spec decoding speedup as non-streaming. The on_token callback
+    // decodes each token, buffers partial UTF-8 sequences, and pushes
+    // complete chunks through the SSE callback.
     server.stream_generate_fn = [&](const std::vector<int>& prompt_ids, int max_tokens, StreamCallback cb) {
-        model.reset_all_states();
-        std::vector<int> generated;
-        std::string utf8_buf;  // buffer for partial UTF-8 sequences
-        // Same uncapped default as the non-streaming path: run to end of
-        // context unless the caller explicitly limits via max_tokens.
-        int max_gen = max_tokens > 0
-                      ? max_tokens
-                      : std::max(64, max_seq - (int)prompt_ids.size() - 64);
-
-        int step_cap = std::min((int)prompt_ids.size() + max_gen, max_seq);
-        for (int step = 0; step < step_cap; step++) {
-            int token_id = step < (int)prompt_ids.size() ? prompt_ids[step] : generated.back();
-
-            cudaSetDevice(0);
-            if (embd_t->type == GGML_TYPE_Q8_0)
-                dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
-            else if (embd_t->type == GGML_TYPE_Q5_K)
-                dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
-            else if (embd_t->type == GGML_TYPE_Q6_K)
-                dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
-            half_to_float_kernel<<<(H+255)/256, 256>>>(gpu_hidden_half[0], gpu_hidden[0], H);
-
-            float* h = gpu_hidden[0];
-            for (int layer = 0; layer < model.cfg.num_layers; layer++) {
-                int g = gpu_model.layer_gpu[layer];
-                int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
-                if (g != prev_g) {
-                    cudaSetDevice(prev_g);
-                    cudaMemcpy(host_transfer, h, H * sizeof(float), cudaMemcpyDeviceToHost);
-                    cudaSetDevice(g);
-                    cudaMemcpy(gpu_hidden[g], host_transfer, H * sizeof(float), cudaMemcpyHostToDevice);
-                    h = gpu_hidden[g];
-                } else { cudaSetDevice(g); }
-                if (model.is_attn_layer(layer))
-                    model.forward_attn(layer, h, step, 0);
-                else
-                    model.forward_gdn(layer, h, 0);
-                model.forward_mlp(layer, h, 0);
-            }
-
-            if (step >= (int)prompt_ids.size() - 1) {
-                cudaSetDevice(last_gpu); cudaDeviceSynchronize();
-                float_to_half_kernel<<<(H+255)/256, 256>>>(h, gpu_hidden_half[last_gpu], H);
-                if (out_norm_t->type == GGML_TYPE_F32)
-                    rms_norm_f32w(norm_buf, gpu_hidden_half[last_gpu], (float*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
-                else
-                    rms_norm(norm_buf, gpu_hidden_half[last_gpu], (half*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
-                qi_logits.quantize(norm_buf, H, 0);
-                quant_gemv(out_w->data, out_w->type, norm_buf, logits_buf, H, V, &qi_logits);
-
-                std::vector<int> ctx = prompt_ids;
-                ctx.insert(ctx.end(), generated.begin(), generated.end());
-
-                // Greedy fast path: see comment in the non-streaming generate.
-                int max_idx;
-                const auto& sp_now = sampler.params();
-                bool greedy_fast = (sp_now.temperature <= 0.0f)
-                                && (sp_now.rep_penalty == 1.0f)
-                                && (sp_now.freq_penalty == 0.0f)
-                                && (sp_now.pres_penalty == 0.0f);
-                if (greedy_fast) {
-                    argmax_half_kernel<<<1, 1024>>>(logits_buf, V, d_argmax);
-                    cudaMemcpy(h_argmax_pinned, d_argmax, sizeof(int), cudaMemcpyDeviceToHost);
-                    max_idx = h_argmax_pinned[0];
-                } else {
-                    cudaDeviceSynchronize();
-                    std::vector<half> h_logits(V);
-                    cudaMemcpy(h_logits.data(), logits_buf, V * sizeof(half), cudaMemcpyDeviceToHost);
-                    max_idx = sampler.sample(h_logits.data(), V, ctx);
-                }
-
-                // Phase 0 MTP measurement (streaming generate path).
-                if (mtp_loaded && step >= (int)prompt_ids.size() - 1) {
-                    int mtp_pred = mtp.forward(norm_buf, token_id, step);
-                    if (mtp_pred == max_idx) mtp_accept_count++;
-                    mtp_total_count++;
-                }
-
-                generated.push_back(max_idx);
-                if (step >= (int)prompt_ids.size()) {
-                    if (max_idx == 248046 || max_idx == 248044 || max_idx == 248045) {
-                        // Flush remaining UTF-8 buffer before done
-                        if (!utf8_buf.empty()) { cb(utf8_buf, false); utf8_buf.clear(); }
-                        cb("", true);
-                        return;
-                    }
-                    utf8_buf += tok.decode_token(max_idx);
-                    std::string complete = Tokenizer::extract_complete_utf8(utf8_buf);
-                    if (!complete.empty()) cb(complete, false);
-                    // Stop on </tool_call>
-                    if (generated.size() >= 4) {
-                        std::string tail = tok.decode(std::vector<int>(generated.end()-4, generated.end()));
-                        if (tail.find("</tool_call>") != std::string::npos) {
-                            if (!utf8_buf.empty()) { cb(utf8_buf, false); utf8_buf.clear(); }
-                            cb("", true); return;
-                        }
-                    }
-                } else if (step == (int)prompt_ids.size() - 1) {
-                    utf8_buf += tok.decode_token(max_idx);
-                    std::string complete = Tokenizer::extract_complete_utf8(utf8_buf);
-                    if (!complete.empty()) cb(complete, false);
-                }
-            }
-        }
+        std::string utf8_buf;
+        auto on_tok = [&](int tok_id) {
+            utf8_buf += tok.decode_token(tok_id);
+            std::string complete = Tokenizer::extract_complete_utf8(utf8_buf);
+            if (!complete.empty()) cb(complete, false);
+        };
+        int dummy_count = 0;
+        generate_impl(prompt_ids, max_tokens, &dummy_count, on_tok);
         if (!utf8_buf.empty()) { cb(utf8_buf, false); utf8_buf.clear(); }
         cb("", true);
     };
@@ -1155,7 +1085,7 @@ int serve_gemma(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
     float embd_scale = model.cfg.embd_scale;
 
     // Generate callback: takes prompt token IDs, returns generated text
-    auto generate = [&](const std::vector<int>& prompt_ids, int max_tokens) -> std::string {
+    auto generate = [&](const std::vector<int>& prompt_ids, int max_tokens, int* out_completion_tokens) -> std::string {
         model.reset_all();
         std::vector<int> generated;
         auto t0 = std::chrono::high_resolution_clock::now();
@@ -1235,6 +1165,7 @@ int serve_gemma(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
         printf("[API] Generated %zu tokens in %.0f ms (%.1f t/s)\n",
                generated.size(), ms, generated.size() * 1000.0 / ms);
 
+        if (out_completion_tokens) *out_completion_tokens = (int)generated.size();
         return tokenizer.decode(generated);
     };
 

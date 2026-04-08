@@ -511,6 +511,235 @@ __global__ void attn_value_kernel(
     }
 }
 
+// ============ Chunked-prefill attention kernels ============
+//
+// Three batched kernels that process N query tokens against the same K/V
+// cache slice in a single launch. The win comes from K/V reuse: each
+// kv_head's K[pos] / V[pos] is loaded ONCE (or held in shared mem) and
+// dotted against N*gqa query lanes, instead of the N separate kernel
+// launches the per-token path needs.
+//
+// Memory layouts (token-major within the chunk):
+//   q_chunk:    [N, num_q,  head_dim] half
+//   scores:     [N, num_q,  seq_len]  float
+//   out_chunk:  [N, num_q,  head_dim] half
+//   k_cache:    [seq_len, num_kv, head_dim] half  (already populated through start_pos+N-1)
+//   v_cache:    [seq_len, num_kv, head_dim] half
+//
+// Causal mask: query at chunk-relative t_idx has absolute position
+//   abs_pos(t_idx) = start_pos + t_idx
+// and may only attend to k positions p in [0, abs_pos(t_idx)]. Out-of-range
+// positions get a -inf score so the subsequent softmax produces 0 weight.
+
+__global__ void attn_score_kernel_h_chunk(
+    const half* __restrict__ q_chunk,    // [N * num_q * head_dim]
+    const half* __restrict__ k_cache,    // [seq_len * num_kv * head_dim]
+    float* __restrict__ scores,          // [N * num_q * row_stride]
+    int num_q_heads, int num_kv_heads, int head_dim,
+    int seq_len, int start_pos, int N, float scale,
+    int row_stride
+) {
+    int kv_head = blockIdx.x;
+    int pos     = blockIdx.y;
+    if (kv_head >= num_kv_heads || pos >= seq_len) return;
+
+    int gqa = num_q_heads / num_kv_heads;
+    int tid = threadIdx.x;
+
+    // Shared mem cache of K[pos, kv_head, :]. head_dim is at most 256 here.
+    extern __shared__ float smem[];
+    float* k_smem = smem;             // [head_dim]
+    float* warp_scratch = smem + head_dim; // [8] for cross-warp reduce
+
+    if (tid < head_dim) {
+        k_smem[tid] = __half2float(
+            k_cache[(size_t)pos * num_kv_heads * head_dim
+                    + kv_head * head_dim + tid]);
+    }
+    __syncthreads();
+
+    // Loop over chunk tokens × gqa query heads. Each (t_idx, qi) does one
+    // dot product against the cached K row.
+    for (int t_idx = 0; t_idx < N; t_idx++) {
+        int abs_pos = start_pos + t_idx;
+        bool causal_ok = (pos <= abs_pos);
+
+        #pragma unroll
+        for (int qi = 0; qi < 8; qi++) {
+            if (qi >= gqa) break;
+            int q_head = kv_head * gqa + qi;
+            size_t score_idx = (size_t)t_idx * num_q_heads * row_stride
+                             + (size_t)q_head * row_stride + pos;
+
+            if (!causal_ok) {
+                if (tid == 0) scores[score_idx] = -1e30f;
+                continue;
+            }
+
+            const half* qh = q_chunk + (size_t)t_idx * num_q_heads * head_dim
+                                     + (size_t)q_head * head_dim;
+            float prod = 0.0f;
+            for (int i = tid; i < head_dim; i += blockDim.x) {
+                prod += __half2float(qh[i]) * k_smem[i];
+            }
+
+            for (int off = 16; off > 0; off >>= 1)
+                prod += __shfl_xor_sync(0xffffffff, prod, off);
+
+            int wid = tid >> 5;
+            int lid = tid & 31;
+            int n_warps = (blockDim.x + 31) >> 5;
+            if (lid == 0) warp_scratch[wid] = prod;
+            __syncthreads();
+
+            if (wid == 0) {
+                prod = (lid < n_warps) ? warp_scratch[lid] : 0.0f;
+                for (int off = 16; off > 0; off >>= 1)
+                    prod += __shfl_xor_sync(0xffffffff, prod, off);
+                if (lid == 0) scores[score_idx] = prod * scale;
+            }
+            __syncthreads();
+        }
+    }
+}
+
+// Per (token, q_head) softmax with implicit causal range. Each block
+// normalises one (t_idx, q_head) row across positions [0, abs_pos]; positions
+// beyond that are stuffed with -inf in the score kernel and contribute 0
+// weight after the exp.
+//
+// `seq_len` is the per-row STRIDE between consecutive (t_idx, q_head) rows
+// in `scores` (so it can be the full kv_max_seq when the buffer is sized
+// for max context). `wipe_end` bounds the explicit zero-fill that runs
+// after normalisation: positions in [active_len, wipe_end) are written to
+// 0 so the downstream value kernel can read them safely. The value kernel
+// only walks up to (start_pos + N - 1), so wipe_end = start_pos + N is
+// enough — anything beyond that stays stale and is never read.
+__global__ void softmax_kernel_chunk(
+    float* __restrict__ scores,   // [N, num_q, seq_len]
+    int num_q_heads, int seq_len, int start_pos, int wipe_end
+) {
+    int t_idx  = blockIdx.x;       // chunk-relative token
+    int q_head = blockIdx.y;
+    int abs_pos = start_pos + t_idx;
+    int active_len = abs_pos + 1;  // valid positions [0, abs_pos]
+
+    float* row = scores + (size_t)t_idx * gridDim.y * seq_len
+                        + (size_t)q_head * seq_len;
+
+    extern __shared__ float sdata[];
+
+    // 1. Find max over active positions only.
+    float max_val = -1e30f;
+    for (int i = threadIdx.x; i < active_len; i += blockDim.x)
+        max_val = fmaxf(max_val, row[i]);
+    sdata[threadIdx.x] = max_val;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s)
+            sdata[threadIdx.x] = fmaxf(sdata[threadIdx.x], sdata[threadIdx.x + s]);
+        __syncthreads();
+    }
+    max_val = sdata[0];
+    __syncthreads();
+
+    // 2. Exp + sum (active range only). Masked positions stay 0.
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < active_len; i += blockDim.x) {
+        float e = expf(row[i] - max_val);
+        row[i] = e;
+        sum += e;
+    }
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    sum = sdata[0];
+    __syncthreads();
+
+    // 3. Normalise. Positions in [active_len, wipe_end) get an explicit
+    //    zero so the value kernel can read them safely; everything else
+    //    stays stale (and is never read because the value kernel walks
+    //    only up to wipe_end-1).
+    float inv = 1.0f / sum;
+    for (int i = threadIdx.x; i < active_len; i += blockDim.x)
+        row[i] *= inv;
+    for (int i = threadIdx.x + active_len; i < wipe_end; i += blockDim.x)
+        row[i] = 0.0f;
+}
+
+// scores @ V → output for the whole chunk. Same K/V reuse trick as the
+// score kernel, but on V[pos, kv_head, d]. Block layout = (kv_head, d_tile)
+// where d_tile is one head_dim element produced for all gqa × N queries
+// in that kv_head group. Inner loop walks pos with one V load shared
+// across all gqa × N accumulators (kept in registers).
+__global__ void attn_value_kernel_h_chunk(
+    const float* __restrict__ scores,    // [N * num_q * row_stride]
+    const half*  __restrict__ v_cache,   // [seq_len * num_kv * head_dim]
+    half* __restrict__ out_chunk,        // [N * num_q * head_dim]
+    int num_q_heads, int num_kv_heads, int head_dim,
+    int seq_len, int start_pos, int N,
+    int row_stride
+) {
+    int kv_head = blockIdx.x;
+    int d       = blockIdx.y * blockDim.x + threadIdx.x;
+    if (kv_head >= num_kv_heads || d >= head_dim) return;
+
+    int gqa = num_q_heads / num_kv_heads;
+
+    // Per-thread accumulators for [N][gqa] outputs at this single d slot.
+    // For Qwen3.5-27B N up to 16 and gqa=6, that's 96 floats per thread —
+    // tight on registers but tolerable. We loop t_idx outer / qi inner so
+    // both dimensions can be unrolled.
+    float acc[16][8];
+    #pragma unroll
+    for (int t_idx = 0; t_idx < 16; t_idx++) {
+        #pragma unroll
+        for (int qi = 0; qi < 8; qi++) acc[t_idx][qi] = 0.0f;
+    }
+
+    int max_active_pos = start_pos + N - 1;
+    int last_active = (max_active_pos < seq_len - 1) ? max_active_pos : (seq_len - 1);
+
+    // Walk position. Each pos: load V[pos, kv_head, d] once, scatter against
+    // all (t_idx, qi) score lanes. Out-of-causal-range scores are 0 from the
+    // softmax kernel, so we don't need an extra mask here.
+    for (int pos = 0; pos <= last_active; pos++) {
+        float v = __half2float(
+            v_cache[(size_t)pos * num_kv_heads * head_dim
+                    + kv_head * head_dim + d]);
+
+        #pragma unroll
+        for (int t_idx = 0; t_idx < 16; t_idx++) {
+            if (t_idx >= N) break;
+            #pragma unroll
+            for (int qi = 0; qi < 8; qi++) {
+                if (qi >= gqa) break;
+                int q_head = kv_head * gqa + qi;
+                float s = scores[(size_t)t_idx * num_q_heads * row_stride
+                                 + (size_t)q_head * row_stride + pos];
+                acc[t_idx][qi] += s * v;
+            }
+        }
+    }
+
+    // Write outputs.
+    #pragma unroll
+    for (int t_idx = 0; t_idx < 16; t_idx++) {
+        if (t_idx >= N) break;
+        #pragma unroll
+        for (int qi = 0; qi < 8; qi++) {
+            if (qi >= gqa) break;
+            int q_head = kv_head * gqa + qi;
+            out_chunk[(size_t)t_idx * num_q_heads * head_dim
+                      + (size_t)q_head * head_dim + d]
+                = __float2half(acc[t_idx][qi]);
+        }
+    }
+}
+
 // FP16 V-cache variant (Gemma uses fp16 KV cache)
 __global__ void attn_value_kernel_h(
     const float* __restrict__ scores,
