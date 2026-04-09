@@ -1217,7 +1217,11 @@ int main(int argc, char** argv) {
     // Parse sampling params and flags
     SamplingParams sp;
     int serve_port = 0;
-    int max_seq = 262144;  // 256K — TurboQuant 3-bit KV makes this affordable
+    // Default max_seq: 4096 for fp16 KV (safe VRAM budget). When MTP_TQ=1 is
+    // set (TurboQuant 3-bit KV cache), the fp16 cache is not allocated and a
+    // 256K context fits comfortably, so bump the default accordingly. Can
+    // always be overridden with --max-seq / -c.
+    int max_seq = getenv("MTP_TQ") ? 262144 : 4096;
     std::string prompt_text, api_key;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--serve") == 0 && i + 1 < argc) {
