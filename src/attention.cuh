@@ -539,17 +539,26 @@ __global__ void attn_score_kernel_h_chunk(
     int seq_len, int start_pos, int N, float scale,
     int row_stride
 ) {
+    // v2: one warp per score. 8 warps per block → 8 scores compute in parallel
+    // instead of the prior "256 threads reduce a single score at a time" layout
+    // which paid a __syncthreads per score (N*gqa=96 barriers per block for
+    // the 27B). Per warp: 32 threads each own head_dim/32 input dims and
+    // reduce via __shfl_xor_sync — no cross-warp reduction needed because
+    // each score is owned by exactly one warp. Expected 5-8× speedup on the
+    // score phase at 2071 tok.
     int kv_head = blockIdx.x;
     int pos     = blockIdx.y;
     if (kv_head >= num_kv_heads || pos >= seq_len) return;
 
     int gqa = num_q_heads / num_kv_heads;
     int tid = threadIdx.x;
+    int wid = tid >> 5;
+    int lid = tid & 31;
+    int n_warps = blockDim.x >> 5;
 
-    // Shared mem cache of K[pos, kv_head, :]. head_dim is at most 256 here.
+    // Shared mem cache of K[pos, kv_head, :].
     extern __shared__ float smem[];
-    float* k_smem = smem;             // [head_dim]
-    float* warp_scratch = smem + head_dim; // [8] for cross-warp reduce
+    float* k_smem = smem;  // [head_dim]
 
     if (tid < head_dim) {
         k_smem[tid] = __half2float(
@@ -558,48 +567,35 @@ __global__ void attn_score_kernel_h_chunk(
     }
     __syncthreads();
 
-    // Loop over chunk tokens × gqa query heads. Each (t_idx, qi) does one
-    // dot product against the cached K row.
-    for (int t_idx = 0; t_idx < N; t_idx++) {
+    // Each warp handles one (t_idx, qi) score per iteration; block strides
+    // through N*gqa scores in n_warps-sized chunks.
+    int total_scores = N * gqa;
+    for (int s = wid; s < total_scores; s += n_warps) {
+        int t_idx = s / gqa;
+        int qi    = s - t_idx * gqa;
+        int q_head = kv_head * gqa + qi;
         int abs_pos = start_pos + t_idx;
         bool causal_ok = (pos <= abs_pos);
 
-        #pragma unroll
-        for (int qi = 0; qi < 8; qi++) {
-            if (qi >= gqa) break;
-            int q_head = kv_head * gqa + qi;
-            size_t score_idx = (size_t)t_idx * num_q_heads * row_stride
-                             + (size_t)q_head * row_stride + pos;
+        size_t score_idx = (size_t)t_idx * num_q_heads * row_stride
+                         + (size_t)q_head * row_stride + pos;
 
-            if (!causal_ok) {
-                if (tid == 0) scores[score_idx] = -1e30f;
-                continue;
-            }
-
-            const half* qh = q_chunk + (size_t)t_idx * num_q_heads * head_dim
-                                     + (size_t)q_head * head_dim;
-            float prod = 0.0f;
-            for (int i = tid; i < head_dim; i += blockDim.x) {
-                prod += __half2float(qh[i]) * k_smem[i];
-            }
-
-            for (int off = 16; off > 0; off >>= 1)
-                prod += __shfl_xor_sync(0xffffffff, prod, off);
-
-            int wid = tid >> 5;
-            int lid = tid & 31;
-            int n_warps = (blockDim.x + 31) >> 5;
-            if (lid == 0) warp_scratch[wid] = prod;
-            __syncthreads();
-
-            if (wid == 0) {
-                prod = (lid < n_warps) ? warp_scratch[lid] : 0.0f;
-                for (int off = 16; off > 0; off >>= 1)
-                    prod += __shfl_xor_sync(0xffffffff, prod, off);
-                if (lid == 0) scores[score_idx] = prod * scale;
-            }
-            __syncthreads();
+        if (!causal_ok) {
+            if (lid == 0) scores[score_idx] = -1e30f;
+            continue;
         }
+
+        const half* qh = q_chunk + (size_t)t_idx * num_q_heads * head_dim
+                                 + (size_t)q_head * head_dim;
+        float prod = 0.0f;
+        // Each thread walks head_dim/32 input dims.
+        for (int i = lid; i < head_dim; i += 32) {
+            prod += __half2float(qh[i]) * k_smem[i];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            prod += __shfl_xor_sync(0xffffffff, prod, off);
+        if (lid == 0) scores[score_idx] = prod * scale;
     }
 }
 
@@ -683,60 +679,48 @@ __global__ void attn_value_kernel_h_chunk(
     int seq_len, int start_pos, int N,
     int row_stride
 ) {
-    int kv_head = blockIdx.x;
+    // v2: grid parallelised across (kv_head, t_idx). The prior layout was
+    // (kv_head, d_block) = num_kv × d_blocks = 8 blocks for 27B, leaving
+    // ~87% of SMs idle. Per-thread accumulator shrank from [N][gqa] (96
+    // floats) to [gqa] (6 floats) so register pressure drops too.
+    //
+    // Grid: (num_kv × N, d_blocks). blockIdx.x encodes kv_head × N + t_idx.
+    int bx = blockIdx.x;
+    int t_idx   = bx % N;
+    int kv_head = bx / N;
     int d       = blockIdx.y * blockDim.x + threadIdx.x;
     if (kv_head >= num_kv_heads || d >= head_dim) return;
 
     int gqa = num_q_heads / num_kv_heads;
+    int abs_pos = start_pos + t_idx;
+    int active_end = abs_pos + 1;  // causal: [0, abs_pos]
+    if (active_end > seq_len) active_end = seq_len;
 
-    // Per-thread accumulators for [N][gqa] outputs at this single d slot.
-    // For Qwen3.5-27B N up to 16 and gqa=6, that's 96 floats per thread —
-    // tight on registers but tolerable. We loop t_idx outer / qi inner so
-    // both dimensions can be unrolled.
-    float acc[16][8];
+    // Per-thread accumulators for this (t_idx, kv_head) block.
+    float acc[8];
     #pragma unroll
-    for (int t_idx = 0; t_idx < 16; t_idx++) {
-        #pragma unroll
-        for (int qi = 0; qi < 8; qi++) acc[t_idx][qi] = 0.0f;
-    }
+    for (int qi = 0; qi < 8; qi++) acc[qi] = 0.0f;
 
-    int max_active_pos = start_pos + N - 1;
-    int last_active = (max_active_pos < seq_len - 1) ? max_active_pos : (seq_len - 1);
+    const float* score_base = scores + (size_t)t_idx * num_q_heads * row_stride
+                                     + (size_t)kv_head * gqa * row_stride;
 
-    // Walk position. Each pos: load V[pos, kv_head, d] once, scatter against
-    // all (t_idx, qi) score lanes. Out-of-causal-range scores are 0 from the
-    // softmax kernel, so we don't need an extra mask here.
-    for (int pos = 0; pos <= last_active; pos++) {
+    for (int pos = 0; pos < active_end; pos++) {
         float v = __half2float(
             v_cache[(size_t)pos * num_kv_heads * head_dim
                     + kv_head * head_dim + d]);
-
-        #pragma unroll
-        for (int t_idx = 0; t_idx < 16; t_idx++) {
-            if (t_idx >= N) break;
-            #pragma unroll
-            for (int qi = 0; qi < 8; qi++) {
-                if (qi >= gqa) break;
-                int q_head = kv_head * gqa + qi;
-                float s = scores[(size_t)t_idx * num_q_heads * row_stride
-                                 + (size_t)q_head * row_stride + pos];
-                acc[t_idx][qi] += s * v;
-            }
-        }
-    }
-
-    // Write outputs.
-    #pragma unroll
-    for (int t_idx = 0; t_idx < 16; t_idx++) {
-        if (t_idx >= N) break;
         #pragma unroll
         for (int qi = 0; qi < 8; qi++) {
             if (qi >= gqa) break;
-            int q_head = kv_head * gqa + qi;
-            out_chunk[(size_t)t_idx * num_q_heads * head_dim
-                      + (size_t)q_head * head_dim + d]
-                = __float2half(acc[t_idx][qi]);
+            acc[qi] += score_base[(size_t)qi * row_stride + pos] * v;
         }
+    }
+
+    half* out_base = out_chunk + (size_t)t_idx * num_q_heads * head_dim
+                               + (size_t)kv_head * gqa * head_dim;
+    #pragma unroll
+    for (int qi = 0; qi < 8; qi++) {
+        if (qi >= gqa) break;
+        out_base[(size_t)qi * head_dim + d] = __float2half(acc[qi]);
     }
 }
 
@@ -914,6 +898,107 @@ __global__ void deinterleave_qg_kernel(
     int d = idx % head_dim;
     q_out[idx]    = src[head * head_dim * 2 + d];
     gate_out[idx] = src[head * head_dim * 2 + head_dim + d];
+}
+
+// Batched (N-token) variants of the per-token attention prologue kernels.
+// These collapse what used to be N separate kernel launches per layer into
+// a single launch, using blockIdx.y (or a token loop inside the block) to
+// stride across tokens. For 27B at chunk=128 and 16 attn layers per chunk
+// this removes ~128× kernel launches per layer on the deinterleave / head
+// RMS / RoPE / gate phases (~175K total launches across a 2071-tok prefill
+// collapse to ~1.4K).
+
+__global__ void deinterleave_qg_kernel_chunk(
+    const half* __restrict__ src,   // [n_tokens, num_heads * head_dim * 2]
+    half* __restrict__ q_out,       // [n_tokens, num_heads * head_dim]
+    half* __restrict__ gate_out,    // [n_tokens, num_heads * head_dim]
+    int num_heads, int head_dim, int n_tokens
+) {
+    int tt = blockIdx.y;
+    if (tt >= n_tokens) return;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int per_tok = num_heads * head_dim;
+    if (idx >= per_tok) return;
+    int head = idx / head_dim;
+    int d = idx % head_dim;
+    int src_stride = per_tok * 2;
+    q_out[tt * per_tok + idx]    = src[tt * src_stride + head * head_dim * 2 + d];
+    gate_out[tt * per_tok + idx] = src[tt * src_stride + head * head_dim * 2 + head_dim + d];
+}
+
+__global__ void head_rms_norm_kernel_chunk(
+    half* __restrict__ x,
+    const float* __restrict__ weight,
+    int num_heads, int head_dim, float eps, int n_tokens
+) {
+    int tt = blockIdx.y;
+    int head = blockIdx.x;
+    if (tt >= n_tokens || head >= num_heads) return;
+    half* xh = x + (size_t)tt * num_heads * head_dim + head * head_dim;
+
+    extern __shared__ float sdata[];
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float v = __half2float(xh[i]);
+        sum += v * v;
+    }
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv = rsqrtf(sdata[0] / head_dim + eps);
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        xh[i] = __float2half(__half2float(xh[i]) * inv * weight[i]);
+    }
+}
+
+// Batched RoPE: each (tt, head, dim-pair) gets its own sin/cos from the
+// full table (offset by start_pos + tt). Grid.y strides tokens.
+__global__ void apply_rope_kernel_chunk(
+    half* __restrict__ x,
+    const float* __restrict__ sin_table,  // [max_seq, rope_dim/2]
+    const float* __restrict__ cos_table,
+    int start_pos, int num_heads, int head_dim, int rope_dim,
+    int n_tokens
+) {
+    int tt = blockIdx.y;
+    if (tt >= n_tokens) return;
+    int pos = start_pos + tt;
+    int half_rope = rope_dim / 2;
+    const float* sin_t = sin_table + pos * half_rope;
+    const float* cos_t = cos_table + pos * half_rope;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_heads * half_rope;
+    if (idx >= total) return;
+
+    int head = idx / half_rope;
+    int i    = idx - head * half_rope;
+    half* xh = x + (size_t)tt * num_heads * head_dim + head * head_dim;
+
+    float x0 = __half2float(xh[i]);
+    float x1 = __half2float(xh[i + half_rope]);
+    float c = cos_t[i], s = sin_t[i];
+    xh[i]             = __float2half(x0 * c - x1 * s);
+    xh[i + half_rope] = __float2half(x0 * s + x1 * c);
+}
+
+__global__ void apply_gate_sigmoid_chunk(
+    half* __restrict__ output,  // [n_tokens, size]
+    const half* __restrict__ gate,
+    int size, int n_tokens
+) {
+    int tt = blockIdx.y;
+    if (tt >= n_tokens) return;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    size_t off = (size_t)tt * size + idx;
+    float o = __half2float(output[off]);
+    float g = __half2float(gate[off]);
+    float sig = 1.0f / (1.0f + expf(-g));
+    output[off] = __float2half(o * sig);
 }
 
 __global__ void deinterleave_qg_kernel_f32(

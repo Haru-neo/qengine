@@ -1050,36 +1050,35 @@ struct QwenModel {
         quant_gemv_chunk(v_w->data, v_w->type, gpu_qi[g].q8_buf, ab.attn_chunk_v,
                          H, kv_dim, n_tokens, stream);
 
-        // 4. Per-token: deinterleave Q/gate, head-RMS, RoPE, KV cache append.
-        //    These are small kernels — keeping them per-token in a single
-        //    fused loop. KV cache append is collapsed into TWO contiguous
-        //    cudaMemcpyAsync calls per chunk (chunk_n × kv_dim K and V),
-        //    which is far cheaper than 2*n_tokens individual copies.
+        // 4. Batched deinterleave Q/gate, head-RMS, RoPE across all n_tokens.
+        //    Single launch per op (blockIdx.y strides tokens) instead of
+        //    n_tokens × 5 launches → ~128× fewer launches per attn layer at
+        //    chunk=128.
         int rope_dim = rope.rope_dim;
         int half_rope = rope_dim / 2;
         int tn = min(hd, 128);
         auto& kv = kv_caches[layer];
-        for (int tt = 0; tt < n_tokens; tt++) {
-            int pos = start_pos + tt;
-            half* q_slice    = ab.attn_chunk_q      + (size_t)tt * q_out_dim;
-            half* qpost      = ab.attn_chunk_q_post + (size_t)tt * total_qg;
-            half* gate_slice = ab.attn_chunk_gate   + (size_t)tt * total_qg;
-            half* k_slice    = ab.attn_chunk_k      + (size_t)tt * kv_dim;
+        {
+            dim3 deint_grid((total_qg + 255) / 256, n_tokens);
+            deinterleave_qg_kernel_chunk<<<deint_grid, 256, 0, stream>>>(
+                ab.attn_chunk_q, ab.attn_chunk_q_post, ab.attn_chunk_gate,
+                num_q, hd, n_tokens);
 
-            deinterleave_qg_kernel<<<(total_qg + 255) / 256, 256, 0, stream>>>(
-                q_slice, qpost, gate_slice, num_q, hd);
+            dim3 q_rms_grid(num_q, n_tokens);
+            head_rms_norm_kernel_chunk<<<q_rms_grid, tn, tn * sizeof(float), stream>>>(
+                ab.attn_chunk_q_post, (float*)q_norm_w->data, num_q, hd, eps, n_tokens);
+            dim3 k_rms_grid(num_kv, n_tokens);
+            head_rms_norm_kernel_chunk<<<k_rms_grid, tn, tn * sizeof(float), stream>>>(
+                ab.attn_chunk_k, (float*)k_norm_w->data, num_kv, hd, eps, n_tokens);
 
-            head_rms_norm_kernel<<<num_q, tn, tn * sizeof(float), stream>>>(
-                qpost, (float*)q_norm_w->data, num_q, hd, eps);
-            head_rms_norm_kernel<<<num_kv, tn, tn * sizeof(float), stream>>>(
-                k_slice, (float*)k_norm_w->data, num_kv, hd, eps);
-
-            float* sin_pos = rope.sin_table(g) + pos * half_rope;
-            float* cos_pos = rope.cos_table(g) + pos * half_rope;
-            apply_rope_kernel<<<(num_q  * half_rope + 255) / 256, 256, 0, stream>>>(
-                qpost,  sin_pos, cos_pos, num_q,  hd, rope_dim);
-            apply_rope_kernel<<<(num_kv * half_rope + 255) / 256, 256, 0, stream>>>(
-                k_slice, sin_pos, cos_pos, num_kv, hd, rope_dim);
+            dim3 rope_q_grid((num_q  * half_rope + 255) / 256, n_tokens);
+            dim3 rope_k_grid((num_kv * half_rope + 255) / 256, n_tokens);
+            apply_rope_kernel_chunk<<<rope_q_grid, 256, 0, stream>>>(
+                ab.attn_chunk_q_post, rope.sin_table(g), rope.cos_table(g),
+                start_pos, num_q,  hd, rope_dim, n_tokens);
+            apply_rope_kernel_chunk<<<rope_k_grid, 256, 0, stream>>>(
+                ab.attn_chunk_k, rope.sin_table(g), rope.cos_table(g),
+                start_pos, num_kv, hd, rope_dim, n_tokens);
         }
         // Bulk KV cache append: contiguous slabs of n_tokens × kv_dim each
         // (attn_chunk_k / attn_chunk_v) into kv.k / kv.v at offset start_pos.
@@ -1140,11 +1139,14 @@ struct QwenModel {
                     /*wipe_end=*/sub_seq_total);
             }
 
-            // 7. Value multiply.
+            // 7. Value multiply. v2 grid: (num_kv × sub_n, d_blocks) —
+            //    16x more blocks than the old (num_kv, d_blocks) layout,
+            //    letting all SMs run concurrently (was 8 blocks on 60 SMs).
+            //    See attention.cuh attn_value_kernel_h_chunk for details.
             {
                 int threads = min(hd, 128);
                 int d_blocks = (hd + threads - 1) / threads;
-                dim3 vg(num_kv, d_blocks);
+                dim3 vg(num_kv * sub_n, d_blocks);
                 attn_value_kernel_h_chunk<<<vg, threads, 0, stream>>>(
                     scores_sub, kv.v, out_sub,
                     num_q, num_kv, hd, sub_seq_total, sub_start_pos, sub_n,
@@ -1156,12 +1158,11 @@ struct QwenModel {
         int seq_len_total = start_pos + n_tokens;  // for downstream code (unused)
         (void)seq_len_total;
 
-        // 8. Per-token output gate (sigmoid) + 9. batched output projection.
-        for (int tt = 0; tt < n_tokens; tt++) {
-            half* out_slice  = ab.attn_chunk_out  + (size_t)tt * total_qg;
-            half* gate_slice = ab.attn_chunk_gate + (size_t)tt * total_qg;
-            apply_gate_sigmoid<<<(total_qg + 255) / 256, 256, 0, stream>>>(
-                out_slice, gate_slice, total_qg);
+        // 8. Batched output gate (sigmoid) — single launch for all n_tokens.
+        {
+            dim3 gate_grid((total_qg + 255) / 256, n_tokens);
+            apply_gate_sigmoid_chunk<<<gate_grid, 256, 0, stream>>>(
+                ab.attn_chunk_out, ab.attn_chunk_gate, total_qg, n_tokens);
         }
 
         // 9. Batched output projection: quantize attn_chunk_out → q8_1 chunk,
