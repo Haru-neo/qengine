@@ -1204,6 +1204,22 @@ struct QwenModel {
     // Caller must have invoked `alloc_tree_decode(budget)` first.
     void forward_gdn_tree(int layer, float* hidden_tree, int n_tokens,
                           const int* parent_ids_dev, cudaStream_t stream) {
+        // Debug fallback: sequentially call non-tree forward_gdn for each node.
+        // Correct for chain parent_ids=[-1, 0, 1, ..., n-1] because each call
+        // updates rec_state/conv_state in-place, which is exactly what the
+        // chain expects as each node's "parent state".
+        //
+        // WARNING: this mutates rec_state/conv_state in-place, so accept-time
+        // commit is redundant. Used only to isolate whether the tree GDN
+        // kernels are the correctness bug.
+        static const bool fallback_gdn = getenv("TREE_FALLBACK_GDN") != nullptr;
+        if (fallback_gdn) {
+            int H = cfg.hidden_size;
+            for (int t = 0; t < n_tokens; t++) {
+                forward_gdn(layer, hidden_tree + (size_t)t * H, stream);
+            }
+            return;
+        }
         int g = gpu->layer_gpu[layer];
         auto& gb = gdn_bufs[g];
         int H = cfg.hidden_size;
@@ -1249,6 +1265,16 @@ struct QwenModel {
                          gb.chunk_a_proj, H, num_v, n_tokens, stream);
         quant_gemv_chunk(beta_w->data, beta_w->type, gpu_qi[g].q8_buf,
                          gb.chunk_b_proj, H, num_v, n_tokens, stream);
+
+        // 3b. Persist each node's conv1d input (post-qkv-projection half values)
+        //     so the host can commit accepted prefix's conv_state after verify,
+        //     without needing to re-run the projection. The generic
+        //     `chunk_qkv_half` buffer will be overwritten by later layers.
+        if (tree_qkv_persist_ready && tree_qkv_persist[layer]) {
+            cudaMemcpyAsync(tree_qkv_persist[layer], gb.chunk_qkv_half,
+                            (size_t)n_tokens * qkv_dim * sizeof(half),
+                            cudaMemcpyDeviceToDevice, stream);
+        }
 
         // 4. Tree-mode conv1d: walks parent chain to reconstruct each node's
         //    (kw-1)-wide window. Input [n_tokens, qkv_dim] half → output
@@ -2496,8 +2522,13 @@ struct QwenModel {
     // masking instead).
     std::vector<float*> tree_gdn_inter;
     int   tree_budget   = 0;
-    int*  tree_parent_ids_d = nullptr;    // [budget] int32, per-layer-GPU copy via broadcast
+    std::vector<int*> tree_parent_ids_d;   // per-GPU [budget] int32
     bool  tree_ready    = false;
+    // Per-GDN-layer saved post-qkv-projection values for the current tree's
+    // nodes. commit_tree_gdn_chain reads this to slide conv_state forward
+    // along the accepted chain.
+    std::vector<half*> tree_qkv_persist;
+    bool  tree_qkv_persist_ready = false;
 
     void alloc_tree_decode(int budget) {
         if (tree_ready) return;
@@ -2514,16 +2545,101 @@ struct QwenModel {
             cudaMalloc(&tree_gdn_inter[layer], per_layer_sz);
             total += per_layer_sz;
         }
-        // parent_ids lives on the last GPU that runs the decode loop (GPU 0
-        // for the first GDN layer). Allocating on all GPUs keeps kernel launches
-        // local but wastes memory; for simplicity we allocate per-GPU below in
-        // the forward wrappers lazily. For now: one copy on GPU 0.
-        cudaSetDevice(0);
-        cudaMalloc(&tree_parent_ids_d, (size_t)budget * sizeof(int));
+        tree_parent_ids_d.assign(gpu->num_gpus, nullptr);
+        for (int g = 0; g < gpu->num_gpus; g++) {
+            cudaSetDevice(g);
+            cudaMalloc(&tree_parent_ids_d[g], (size_t)budget * sizeof(int));
+        }
+        // Persistent per-GDN-layer qkv_half storage.
+        auto* qkv_probe = t("blk.0.attn_qkv.weight");
+        if (qkv_probe) {
+            int qkv_dim = qkv_probe->dims[1];
+            tree_qkv_persist.assign(cfg.num_layers, nullptr);
+            for (int layer = 0; layer < cfg.num_layers; layer++) {
+                if (is_attn_layer(layer)) continue;
+                int g = gpu->layer_gpu[layer];
+                cudaSetDevice(g);
+                cudaMalloc(&tree_qkv_persist[layer],
+                           (size_t)budget * qkv_dim * sizeof(half));
+            }
+            tree_qkv_persist_ready = true;
+        }
         tree_budget = budget;
         tree_ready  = true;
         printf("[TREE] GDN intermediate buffers allocated: %.1f MB total, budget=%d\n",
                total / 1e6, budget);
+    }
+
+    // Host → all GPUs broadcast of the current tree's parent_ids array.
+    // Caller supplies host_parent_ids[tree_budget].
+    void upload_parent_ids(const int* host_parent_ids, cudaStream_t stream = 0) {
+        for (int g = 0; g < gpu->num_gpus; g++) {
+            cudaSetDevice(g);
+            cudaMemcpyAsync(tree_parent_ids_d[g], host_parent_ids,
+                            (size_t)tree_budget * sizeof(int),
+                            cudaMemcpyHostToDevice, stream);
+        }
+    }
+
+    // Scratch per-GPU buffers for chain commit's node_ids, lazily sized to
+    // `tree_budget`. For chain commit node_ids is trivially [0,1,...,L-1], so
+    // we upload that layout once on first use.
+    std::vector<int*> commit_chain_node_ids_d;
+    bool commit_chain_node_ids_ready = false;
+    void ensure_commit_chain_node_ids() {
+        if (commit_chain_node_ids_ready) return;
+        commit_chain_node_ids_d.assign(gpu->num_gpus, nullptr);
+        std::vector<int> host_ids(tree_budget);
+        for (int i = 0; i < tree_budget; i++) host_ids[i] = i;
+        for (int g = 0; g < gpu->num_gpus; g++) {
+            cudaSetDevice(g);
+            cudaMalloc(&commit_chain_node_ids_d[g], (size_t)tree_budget * sizeof(int));
+            cudaMemcpy(commit_chain_node_ids_d[g], host_ids.data(),
+                       (size_t)tree_budget * sizeof(int), cudaMemcpyHostToDevice);
+        }
+        commit_chain_node_ids_ready = true;
+    }
+
+    // Commit a chain-shaped accepted prefix of length L into every GDN
+    // layer's rec_state and conv_state. Chain assumption: the accepted node
+    // indices are exactly [0, 1, ..., L-1] in tree_gdn_inter / tree_qkv_persist.
+    // L must satisfy 1 <= L <= kw-1 (kw=4 for Qwen3.5, so L in {1, 2, 3}).
+    void commit_tree_gdn_chain(int accept_len) {
+        if (accept_len <= 0) return;
+        if (!tree_ready || !tree_qkv_persist_ready) return;
+        // Debug: fallback mode updates rec_state/conv_state in-place via
+        // per-token forward_gdn, so commit here would overwrite with garbage
+        // persist_inter values. Skip commit entirely in fallback mode.
+        static const bool fallback_gdn = getenv("TREE_FALLBACK_GDN") != nullptr;
+        if (fallback_gdn) return;
+        ensure_commit_chain_node_ids();
+
+        int num_v = cfg.linear_v_heads;
+        int k_dim = cfg.linear_k_dim;
+        int v_dim = cfg.linear_v_dim;
+        size_t state_sz = (size_t)num_v * k_dim * v_dim * sizeof(float);
+        auto* qkv_probe = t("blk.0.attn_qkv.weight");
+        int qkv_dim = qkv_probe->dims[1];
+        int kw = 4;
+
+        for (int layer = 0; layer < cfg.num_layers; layer++) {
+            if (is_attn_layer(layer)) continue;
+            int g = gpu->layer_gpu[layer];
+            cudaSetDevice(g);
+            // rec_state ← tree_gdn_inter[layer][accept_len - 1]
+            float* src = tree_gdn_inter[layer]
+                + (size_t)(accept_len - 1) * num_v * k_dim * v_dim;
+            cudaMemcpyAsync(gdn_states[layer].rec_state, src, state_sz,
+                            cudaMemcpyDeviceToDevice, 0);
+            // conv_state slide + append (chain-only: node_ids=[0..L-1])
+            int threads = 256;
+            int blocks  = (qkv_dim + threads - 1) / threads;
+            conv_state_commit_chain_kernel<<<blocks, threads, 0, 0>>>(
+                gdn_states[layer].conv_state,
+                tree_qkv_persist[layer],
+                commit_chain_node_ids_d[g],
+                qkv_dim, kw, accept_len);
+        }
     }
 
     void alloc_gdn_snapshots() {

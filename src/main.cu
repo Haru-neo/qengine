@@ -728,6 +728,24 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     long long spec_k2_accept_a_count  = 0;  // only draft1 accepted
     long long spec_k2_reject_count    = 0;  // draft1 rejected
 
+    // MTP_TREE: chain-tree path. Initial shape is chain budget=3 (main +
+    // draft1 + draft2), mirroring MTP K=2's semantics via the tree
+    // forward_gdn_tree / forward_attn_tree / forward_mlp_tree pipeline so
+    // we can compare against MTP K=2 before expanding into real branching.
+    bool spec_tree_enabled = false;
+    int   tree_budget = 3;
+    float* tree_hidden[4] = {nullptr,nullptr,nullptr,nullptr};   // [budget*H] fp32
+    half*  tree_hidden_half[4] = {nullptr,nullptr,nullptr,nullptr};
+    half*  tree_norm_buf   = nullptr;   // [budget*H] on last_gpu
+    half*  tree_logits_buf = nullptr;   // [budget*V] on last_gpu
+    int*   tree_d_argmax   = nullptr;   // [budget] on last_gpu
+    int*   tree_h_argmax   = nullptr;   // [budget] pinned
+    float* tree_host_transfer = nullptr;// [budget*H] pinned for GPU→GPU copy
+    QuantInput qi_logits_tree;
+    long long tree_accept_full_count = 0;
+    long long tree_accept_partial_count = 0;
+    long long tree_reject_count = 0;
+
     // ── MTP head (Phase 0: forward + accept rate measurement) ─────────────
     // Loaded only if /home/paru/mtp_work/mtp_head.bin exists.
     MTPHead mtp;
@@ -771,7 +789,8 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     // automatically when spec_enabled is true to avoid running MTP twice
     // per iter — the spec branch already runs its own draft MTP.
     spec_enabled = (mtp_loaded && getenv("MTP_SPEC_OFF") == nullptr);
-    spec_k2_enabled = (spec_enabled && getenv("MTP_K2") != nullptr);
+    spec_k2_enabled   = (spec_enabled && getenv("MTP_K2")   != nullptr && getenv("MTP_TREE") == nullptr);
+    spec_tree_enabled = (spec_enabled && getenv("MTP_TREE") != nullptr);
     if (spec_enabled) {
         for (int g = 0; g < n_gpus; g++) {
             cudaSetDevice(g);
@@ -804,6 +823,25 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         model.alloc_buffers_n3(max_seq);
         model.alloc_gdn_snapshots_b();
         printf("[SPEC-K2] MTP K=2 speculative decoding enabled (self-chained draft, N=3 batched verify)\n");
+    }
+    if (spec_tree_enabled) {
+        for (int g = 0; g < n_gpus; g++) {
+            cudaSetDevice(g);
+            cudaMalloc(&tree_hidden[g],      (size_t)tree_budget * H * sizeof(float));
+            cudaMalloc(&tree_hidden_half[g], (size_t)tree_budget * H * sizeof(half));
+        }
+        cudaSetDevice(last_gpu);
+        cudaMalloc(&tree_norm_buf,   (size_t)tree_budget * H * sizeof(half));
+        cudaMalloc(&tree_logits_buf, (size_t)tree_budget * V * sizeof(half));
+        cudaMalloc(&tree_d_argmax,   (size_t)tree_budget * sizeof(int));
+        cudaMallocHost(&tree_h_argmax, (size_t)tree_budget * sizeof(int));
+        cudaMallocHost(&tree_host_transfer, (size_t)tree_budget * H * sizeof(float));
+        if (!h_final_draft1) cudaMalloc(&h_final_draft1, H * sizeof(half));   // reused for self-chain MTP
+        // qi_logits_tree lazily sizes its q8 buffer on first quantize_chunk.
+        // tree forward reuses gdn_bufs[g].chunk_* buffers, already alloc'd in
+        // model init. No additional buffer pool needed here.
+        model.alloc_tree_decode(tree_budget);
+        printf("[TREE] chain-tree decoding enabled (budget=%d, depth=chain)\n", tree_budget);
     }
     long long mtp_accept_count = 0;
     long long mtp_total_count  = 0;
@@ -1224,6 +1262,151 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         std::string tail = tok.decode(std::vector<int>(generated.end()-4, generated.end()));
                         if (tail.find("</tool_call>") != std::string::npos) break;
                     }
+
+                    // ===================== MTP_TREE chain-tree path (Phase 1) =====================
+                    // Chain tree with parent_ids=[-1,0,1] is MTP K=2-equivalent in
+                    // terms of sampled argmax outputs; we route through the
+                    // forward_*_tree pipeline to shake out the DDTree kernels
+                    // end-to-end. Once this matches K2, we'll widen to real
+                    // branching by growing budget and adding ancestor-mask attn.
+                    if (spec_tree_enabled) {
+                        auto sd0 = prof_now();
+                        // 1. Self-chain draft via MTP (same as K2).
+                        int draft1 = mtp.forward_with_state(norm_buf, max_idx, step + 1, h_final_draft1);
+                        int draft2 = mtp.forward(h_final_draft1, draft1, step + 2);
+                        cudaSetDevice(last_gpu);
+                        if (do_gen_prof) g_mtp += prof_sync_ms(sd0, last_gpu);
+
+                        // 2. Upload chain parent_ids = [-1, 0, 1] to every GPU.
+                        int host_parents[3] = {-1, 0, 1};
+                        model.upload_parent_ids(host_parents, 0);
+
+                        // 3. Embed 3 tokens into contiguous slots on GPU 0.
+                        cudaSetDevice(0);
+                        auto se0 = prof_now();
+                        int tokens[3] = {max_idx, draft1, draft2};
+                        for (int b = 0; b < tree_budget; b++) {
+                            half* dst = tree_hidden_half[0] + (size_t)b * H;
+                            if (embd_t->type == GGML_TYPE_Q8_0)
+                                dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, dst, tokens[b], H);
+                            else if (embd_t->type == GGML_TYPE_Q5_K)
+                                dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, dst, tokens[b], H);
+                            else if (embd_t->type == GGML_TYPE_Q6_K)
+                                dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, dst, tokens[b], H);
+                        }
+                        half_to_float_kernel<<<(tree_budget*H+255)/256, 256>>>(
+                            tree_hidden_half[0], tree_hidden[0], tree_budget * H);
+                        if (do_gen_prof) g_embed += prof_sync_ms(se0, 0);
+
+                        // 4. Run all layers in tree mode.
+                        float* h_tree = tree_hidden[0];
+                        for (int layer = 0; layer < model.cfg.num_layers; layer++) {
+                            int g_l = gpu_model.layer_gpu[layer];
+                            int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
+                            if (g_l != prev_g) {
+                                auto sx0 = prof_now();
+                                cudaSetDevice(prev_g);
+                                cudaMemcpy(tree_host_transfer, h_tree,
+                                           (size_t)tree_budget * H * sizeof(float),
+                                           cudaMemcpyDeviceToHost);
+                                cudaSetDevice(g_l);
+                                cudaMemcpy(tree_hidden[g_l], tree_host_transfer,
+                                           (size_t)tree_budget * H * sizeof(float),
+                                           cudaMemcpyHostToDevice);
+                                h_tree = tree_hidden[g_l];
+                                if (do_gen_prof) g_xfer += prof_sync_ms(sx0, g_l);
+                            } else {
+                                cudaSetDevice(g_l);
+                            }
+                            auto sa0 = prof_now();
+                            bool is_attn_t = model.is_attn_layer(layer);
+                            if (is_attn_t) {
+                                model.forward_attn_tree(layer, h_tree, step + 1, tree_budget,
+                                                        model.tree_parent_ids_d[g_l], 0);
+                            } else {
+                                model.forward_gdn_tree(layer, h_tree, tree_budget,
+                                                       model.tree_parent_ids_d[g_l], 0);
+                            }
+                            if (do_gen_prof) {
+                                double ms = prof_sync_ms(sa0, g_l);
+                                if (is_attn_t) g_attn += ms; else g_gdn += ms;
+                            }
+                            auto sm0 = prof_now();
+                            model.forward_mlp_tree(layer, h_tree, tree_budget,
+                                                   model.tree_parent_ids_d[g_l], 0);
+                            if (do_gen_prof) g_mlp += prof_sync_ms(sm0, g_l);
+                        }
+
+                        // 5. Output norm + batched lm_head for all budget nodes.
+                        cudaSetDevice(last_gpu);
+                        cudaDeviceSynchronize();
+                        auto sl0 = prof_now();
+                        if (out_norm_t->type == GGML_TYPE_F32) {
+                            rms_norm_f32in_f32w(tree_norm_buf, h_tree,
+                                                (float*)out_norm_t->data,
+                                                tree_budget, H,
+                                                model.cfg.rms_norm_eps, 0);
+                        } else {
+                            rms_norm_f32in(tree_norm_buf, h_tree,
+                                           (half*)out_norm_t->data,
+                                           tree_budget, H,
+                                           model.cfg.rms_norm_eps, 0);
+                        }
+                        qi_logits_tree.quantize_chunk(tree_norm_buf, H, tree_budget, 0);
+                        quant_gemv_chunk(out_w->data, out_w->type,
+                                         qi_logits_tree.q8_buf,
+                                         tree_logits_buf, H, V, tree_budget, 0);
+                        for (int b = 0; b < tree_budget; b++) {
+                            argmax_half_kernel<<<1, 1024>>>(
+                                tree_logits_buf + (size_t)b * V, V,
+                                tree_d_argmax + b);
+                        }
+                        cudaMemcpy(tree_h_argmax, tree_d_argmax,
+                                   (size_t)tree_budget * sizeof(int),
+                                   cudaMemcpyDeviceToHost);
+                        int verify_a = tree_h_argmax[0]; // prediction at step+2 given main
+                        int verify_b = tree_h_argmax[1]; // prediction at step+3 given draft1
+                        int verify_c = tree_h_argmax[2]; // prediction at step+4 given draft2
+                        if (do_gen_prof) {
+                            g_logits += prof_sync_ms(sl0, last_gpu);
+                            g_spec_iters++;
+                        }
+
+                        bool accept1 = (verify_a == draft1);
+                        bool accept2 = accept1 && (verify_b == draft2);
+                        int accept_len = accept2 ? 3 : (accept1 ? 2 : 1);
+
+                        if (spec_total_count < 3)
+                            printf("[TREE] step=%d main=%d d1=%d d2=%d va=%d vb=%d vc=%d accept_len=%d\n",
+                                   step, max_idx, draft1, draft2,
+                                   verify_a, verify_b, verify_c, accept_len);
+                        spec_total_count++;
+
+                        // 6. Commit accepted chain into GDN rec_state / conv_state.
+                        model.commit_tree_gdn_chain(accept_len);
+
+                        // 7. Emit accepted tokens and roll back MTP KV / draft tail.
+                        if (accept_len == 3) {
+                            tree_accept_full_count++;
+                            spec_accept_count += 2;
+                            if (emit_tok(draft1)) break;
+                            if (emit_tok(draft2)) break;
+                            if (emit_tok(verify_c)) break;
+                            step += 3;
+                        } else if (accept_len == 2) {
+                            tree_accept_partial_count++;
+                            spec_accept_count += 1;
+                            if (emit_tok(draft1)) break;
+                            if (emit_tok(verify_b)) break;
+                            mtp.kv_rollback(1); // drop unused draft2 MTP slot
+                            step += 2;
+                        } else {
+                            tree_reject_count++;
+                            if (emit_tok(verify_a)) break;
+                            mtp.kv_rollback(2); // drop both drafts in MTP KV
+                            step += 1;
+                        }
+                    } else
 
                     // ===================== MTP K=2 speculative decoding =====================
                     // After main produced max_idx (= t_{step+1}) and we hold h[step] in norm_buf,

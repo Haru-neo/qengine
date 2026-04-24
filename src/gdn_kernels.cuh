@@ -610,12 +610,19 @@ __global__ void rms_norm_gated_kernel_f32(
 //               tree, or -1 if t's parent is the pre-block state.
 //   output:     [n_tokens, dim] FP32 — SiLU(conv(window_t)) for each node.
 //
-// The kernel does NOT update conv_state. After tree verify, the host picks
-// the accept-committed suffix and slides the final node's window back into
-// conv_state using the standard per-step path.
+// The kernel does NOT update conv_state. After tree verify, the host slides
+// the accepted chain's input values into conv_state via
+// `conv_state_commit_chain_kernel`.
+//
+// conv_state layout (non-tree `conv1d_update_silu` after processing token t):
+//   slot 0         = x_{t-(kw-1)}   (oldest)
+//   slot kw-1      = x_t            (newest, most recent token processed)
+// A new token x_{t+1} then produces window [slot1, slot2, ..., slot_{kw-1},
+// x_{t+1}]. So the tree root's ancestors in pre-block state live in slots
+// [1 .. kw-1] (not [0 .. kw-2] as an earlier comment claimed).
 template <int KW_MAX = 8>
 __global__ void conv1d_update_silu_tree(
-    const float* __restrict__ conv_state,   // [dim, kw], pre-block window in [0..kw-2]
+    const float* __restrict__ conv_state,   // [dim, kw], see layout note above
     const half*  __restrict__ inputs,       // [n_tokens, dim] half
     const float* __restrict__ weight,       // [dim, kw]
     const int*   __restrict__ parent_ids,   // [n_tokens], -1 = pre-block parent
@@ -651,8 +658,11 @@ __global__ void conv1d_update_silu_tree(
             if (a >= 0) {
                 x = __half2float(inputs[(size_t)a * dim + d]);
             } else {
-                int ps_idx = (kw - 1) + a;       // a in [-1..-(kw-1)] → ps_idx in [kw-2..0]
-                x = (ps_idx >= 0) ? cs[ps_idx] : 0.0f;
+                // a in [-1..-(kw-1)] → ps_idx in [kw-1 .. 1]. Slot 0 is the
+                // oldest token; slot kw-1 is the most recent pre-tree input.
+                // a=-1 picks kw-1 (most recent), a=-2 picks kw-2, etc.
+                int ps_idx = kw + a;
+                x = (ps_idx >= 0 && ps_idx < kw) ? cs[ps_idx] : 0.0f;
             }
             sum += w[k] * x;
         }
@@ -665,6 +675,40 @@ __global__ void conv1d_update_silu_tree(
 // Explicit instantiation for Qwen3.5 (kw=4). KW_MAX=8 covers 3/4/5.
 template __global__ void conv1d_update_silu_tree<8>(
     const float*, const half*, const float*, const int*, float*, int, int, int);
+
+// ============ DDTree: commit accepted chain into conv_state ============
+// For chain-shaped accepted prefixes: slide conv_state left by `accept_len`
+// slots, then fill the rightmost `accept_len` slots from the corresponding
+// nodes' saved post-qkv inputs in `qkv_tree`. Node order in qkv_tree is DFS
+// along the accepted chain (node indices in parent order).
+//
+//   conv_state  [dim, kw] FP32    — in-place updated
+//   qkv_tree    [n, dim]  half    — post-qkv-projection values for each tree
+//                                   node. We pick slots [node_ids[0..L-1]].
+//   node_ids    [L] int32         — tree-node indices of the accepted prefix,
+//                                   in append order (root-first, on host).
+//   accept_len  L, 1 <= L <= kw-1
+//
+// Note: if L >= kw-1, only the last kw-1 nodes matter (earlier ones get
+//       slid out). Caller should trim node_ids accordingly.
+__global__ void conv_state_commit_chain_kernel(
+    float*       __restrict__ conv_state,   // [dim, kw]
+    const half*  __restrict__ qkv_tree,     // [n_nodes, dim]
+    const int*   __restrict__ node_ids,     // [accept_len]
+    int dim, int kw, int accept_len
+) {
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= dim) return;
+    float* st = conv_state + d * kw;
+    // Slide left by accept_len.
+    for (int k = 0; k < kw - accept_len; k++) st[k] = st[k + accept_len];
+    // Fill rightmost accept_len slots from qkv_tree[node_ids[i]].
+    for (int i = 0; i < accept_len; i++) {
+        int node = node_ids[i];
+        st[(kw - accept_len) + i] =
+            __half2float(qkv_tree[(size_t)node * dim + d]);
+    }
+}
 
 // ============ DDTree: GDN recurrent step tree kernel ============
 // Process n_tokens tree nodes over the GDN recurrence in a single launch.
