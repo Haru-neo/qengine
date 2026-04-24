@@ -531,6 +531,70 @@ __global__ void attn_value_kernel(
 // and may only attend to k positions p in [0, abs_pos(t_idx)]. Out-of-range
 // positions get a -inf score so the subsequent softmax produces 0 weight.
 
+// Bit-exact chunked score kernel: one block per score (q_head, t_idx, pos)
+// with the SAME reduction tree as the per-token `attn_score_kernel_h`. This
+// matters for greedy argmax stability — the warp-only reduce in the
+// original `attn_score_kernel_h_chunk` flipped ~1% of borderline tokens
+// (Korean coding prompts in particular) vs per-token runs. Used when
+// VCHUNK_STRICT=1 (default when Korean bit-exact is required).
+//
+// Grid layout: (pos, q_head, t_idx).
+//   pos in grid.x supports up to ~2^31 so 128K context fits.
+//   num_q in grid.y (≤65535, num_q ≤ 128 realistically).
+//   N=ATTN_NB=16 in grid.z.
+// Block 256 threads — matches per-token blockDim for bit-identical summation.
+__global__ void attn_score_kernel_h_chunk_strict(
+    const half* __restrict__ q_chunk,    // [N * num_q * head_dim]
+    const half* __restrict__ k_cache,    // [seq_len * num_kv * head_dim]
+    float* __restrict__ scores,          // [N * num_q * row_stride]
+    int num_q_heads, int num_kv_heads, int head_dim,
+    int sub_seq_total, int start_pos, int N, float scale,
+    int row_stride
+) {
+    int pos    = blockIdx.x;
+    int q_head = blockIdx.y;
+    int t_idx  = blockIdx.z;
+    if (pos >= sub_seq_total || q_head >= num_q_heads || t_idx >= N) return;
+
+    int abs_pos = start_pos + t_idx;
+    size_t score_idx = (size_t)t_idx * num_q_heads * row_stride
+                     + (size_t)q_head * row_stride + pos;
+
+    if (pos > abs_pos) {
+        if (threadIdx.x == 0) scores[score_idx] = -1e30f;
+        return;
+    }
+
+    int kv_head = q_head / (num_q_heads / num_kv_heads);
+    const half* qh = q_chunk
+                   + (size_t)t_idx * num_q_heads * head_dim
+                   + (size_t)q_head * head_dim;
+    const half* kh = k_cache
+                   + (size_t)pos * num_kv_heads * head_dim
+                   + (size_t)kv_head * head_dim;
+
+    // Reduction tree IDENTICAL to attn_score_kernel_h.
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
+        sum += __half2float(qh[i]) * __half2float(kh[i]);
+
+    for (int off = 16; off > 0; off >>= 1)
+        sum += __shfl_xor_sync(0xffffffff, sum, off);
+
+    __shared__ float warp_sums[8];
+    int warp_id = threadIdx.x >> 5;
+    int lane_id = threadIdx.x & 31;
+    int n_warps = (blockDim.x + 31) >> 5;
+    if (lane_id == 0) warp_sums[warp_id] = sum;
+    __syncthreads();
+    if (warp_id == 0) {
+        sum = (lane_id < n_warps) ? warp_sums[lane_id] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1)
+            sum += __shfl_xor_sync(0xffffffff, sum, off);
+        if (lane_id == 0) scores[score_idx] = sum * scale;
+    }
+}
+
 __global__ void attn_score_kernel_h_chunk(
     const half* __restrict__ q_chunk,    // [N * num_q * head_dim]
     const half* __restrict__ k_cache,    // [seq_len * num_kv * head_dim]
@@ -1014,4 +1078,176 @@ __global__ void deinterleave_qg_kernel_f32(
     int d = idx % head_dim;
     q_out[idx]    = src[head * head_dim * 2 + d];
     gate_out[idx] = src[head * head_dim * 2 + head_dim + d];
+}
+
+// ============ FlashAttention fused score + softmax + value ============
+// One block per (kv_head, t_idx) within the current sub-chunk. All GQA
+// query heads sharing the kv_head are processed in a single block so K/V
+// tile loads are amortised across them. Online softmax keeps O/m/l in
+// registers and never materialises the [num_q, seq_len] score tensor.
+//
+// Layout expectations:
+//   q_chunk:   [sub_n, num_q, HD]  half
+//   k_cache:   [kv_max_seq, num_kv, HD] half  (causal populated up to active_end)
+//   v_cache:   [kv_max_seq, num_kv, HD] half
+//   out_chunk: [sub_n, num_q, HD]  half
+//
+// Template params specialise for the Qwen3.5-27B shape HD=256, GQA=6,
+// BM=32, BLOCK=256. Causal mask uses active_end = start_pos + t_idx + 1.
+//
+// SMEM budget (HD=256, BM=32, GQA=6):
+//   q_s    = GQA*HD*2        = 3072  B
+//   k_tile = BM*HD*2         = 16384 B
+//   v_tile = BM*HD*2         = 16384 B
+//   s_smem = GQA*BM*4        = 768   B
+//   total ≈ 36.6 KB  (≤ 48 KB default, no dynamic bump needed)
+template<int HD, int GQA, int BM, int BLOCK>
+__global__ void flash_attn_chunk_fused(
+    const half* __restrict__ q_chunk,
+    const half* __restrict__ k_cache,
+    const half* __restrict__ v_cache,
+    half*       __restrict__ out_chunk,
+    int num_q, int num_kv,
+    int start_pos, int sub_n, float scale
+) {
+    constexpr int N_WARPS = BLOCK / 32;
+    constexpr int LANE_D  = HD / 32;  // dims owned per lane (8)
+    int kv_head = blockIdx.x;
+    int t_idx   = blockIdx.y;
+    if (t_idx >= sub_n) return;
+    int abs_pos    = start_pos + t_idx;
+    int active_end = abs_pos + 1;         // causal: [0, abs_pos]
+    int tid  = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+
+    extern __shared__ unsigned char smem_fa[];
+    half*  q_s    = (half*)smem_fa;
+    half*  k_tile = q_s    + GQA * HD;
+    half*  v_tile = k_tile + BM  * HD;
+    float* s_smem = (float*)(v_tile + BM * HD);
+
+    // Load Q: gqa query heads for this (t_idx, kv_head).
+    #pragma unroll
+    for (int i = tid; i < GQA * HD; i += BLOCK) {
+        int g = i / HD;
+        int c = i - g * HD;
+        int q_head = kv_head * GQA + g;
+        q_s[g * HD + c] = q_chunk[(size_t)t_idx * num_q * HD
+                                  + (size_t)q_head * HD + c];
+    }
+    __syncthreads();
+
+    // Per-warp (== per-q_head for warp<GQA) register-resident accumulators.
+    float acc_o[LANE_D];
+    #pragma unroll
+    for (int i = 0; i < LANE_D; i++) acc_o[i] = 0.0f;
+    float m_w = -INFINITY;
+    float l_w = 0.0f;
+
+    for (int tile_start = 0; tile_start < active_end; tile_start += BM) {
+        int tile_end = min(tile_start + BM, active_end);
+        int tile_len = tile_end - tile_start;
+
+        // Load K, V tile. Invalid rows get zero-filled K so the score is 0,
+        // which we override with -inf before softmax; V zero keeps P·V safe.
+        #pragma unroll
+        for (int i = tid; i < BM * HD; i += BLOCK) {
+            int r = i / HD;
+            int c = i - r * HD;
+            half zero_h = __float2half(0.0f);
+            if (r < tile_len) {
+                size_t base = (size_t)(tile_start + r) * num_kv * HD
+                            + kv_head * HD;
+                k_tile[r * HD + c] = k_cache[base + c];
+                v_tile[r * HD + c] = v_cache[base + c];
+            } else {
+                k_tile[r * HD + c] = zero_h;
+                v_tile[r * HD + c] = zero_h;
+            }
+        }
+        __syncthreads();
+
+        // Score compute: warp-per-score. NITERS × N_WARPS == GQA × BM (192).
+        constexpr int NITERS = (GQA * BM + N_WARPS - 1) / N_WARPS;
+        #pragma unroll
+        for (int k_it = 0; k_it < NITERS; k_it++) {
+            int flat = warp + k_it * N_WARPS;
+            if (flat >= GQA * BM) break;
+            int g = flat / BM;
+            int r = flat - g * BM;
+
+            float partial = 0.0f;
+            const half2* qs2 = reinterpret_cast<const half2*>(q_s    + g * HD);
+            const half2* kt2 = reinterpret_cast<const half2*>(k_tile + r * HD);
+            #pragma unroll
+            for (int i = 0; i < LANE_D / 2; i++) {
+                half2 qv = qs2[lane * (LANE_D / 2) + i];
+                half2 kv = kt2[lane * (LANE_D / 2) + i];
+                float2 qf = __half22float2(qv);
+                float2 kf = __half22float2(kv);
+                partial += qf.x * kf.x + qf.y * kf.y;
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                partial += __shfl_xor_sync(0xffffffff, partial, off);
+            if (lane == 0) {
+                float val = (r < tile_len) ? partial * scale : -INFINITY;
+                s_smem[g * BM + r] = val;
+            }
+        }
+        __syncthreads();
+
+        // Softmax update + O accumulation (warps 0..GQA-1).
+        if (warp < GQA) {
+            int g = warp;
+            float s_val = s_smem[g * BM + lane];  // BM == 32 == warp width
+
+            float m_row = s_val;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                m_row = fmaxf(m_row, __shfl_xor_sync(0xffffffff, m_row, off));
+            float m_new = fmaxf(m_w, m_row);
+            float correction = expf(m_w - m_new);
+            float p_lane    = expf(s_val - m_new);  // r>=tile_len → 0
+            float sum_p = p_lane;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                sum_p += __shfl_xor_sync(0xffffffff, sum_p, off);
+
+            #pragma unroll
+            for (int i = 0; i < LANE_D; i++) acc_o[i] *= correction;
+            l_w = l_w * correction + sum_p;
+
+            // acc_o[i] += sum_r P[r] * V_tile[r, lane*LANE_D + i]
+            #pragma unroll
+            for (int r = 0; r < BM; r++) {
+                float p_r = __shfl_sync(0xffffffff, p_lane, r);
+                const half2* vt = reinterpret_cast<const half2*>(
+                    v_tile + r * HD + lane * LANE_D);
+                #pragma unroll
+                for (int i = 0; i < LANE_D / 2; i++) {
+                    half2 vv = vt[i];
+                    float2 vf = __half22float2(vv);
+                    acc_o[i * 2]     += p_r * vf.x;
+                    acc_o[i * 2 + 1] += p_r * vf.y;
+                }
+            }
+            m_w = m_new;
+        }
+        __syncthreads();
+    }
+
+    // Write normalised O back.
+    if (warp < GQA) {
+        int g = warp;
+        int q_head = kv_head * GQA + g;
+        float inv_l = (l_w > 0.0f) ? (1.0f / l_w) : 0.0f;
+        size_t out_base = (size_t)t_idx * num_q * HD + (size_t)q_head * HD;
+        #pragma unroll
+        for (int i = 0; i < LANE_D; i++) {
+            int c = lane * LANE_D + i;
+            out_chunk[out_base + c] = __float2half(acc_o[i] * inv_l);
+        }
+    }
 }

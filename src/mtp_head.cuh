@@ -560,4 +560,66 @@ struct MTPHead {
         cudaMemcpy(h_argmax, d_argmax, sizeof(int), cudaMemcpyDeviceToHost);
         return h_argmax[0];
     }
+
+    // MTP forward that also exposes its post-final-norm hidden state. Used by
+    // MTP K=2 to self-chain: draft2 = forward(h_final_1, draft1, pos+2).
+    // `h_final_out` must be a half[H] buffer on `gpu_id`. Returns argmax.
+    int forward_with_state(const half* h_main_normed, int prev_token_id, int position,
+                           half* h_final_out) {
+        int tok = forward(h_main_normed, prev_token_id, position);
+        cudaSetDevice(gpu_id);
+        cudaMemcpyAsync(h_final_out, h_final, H * sizeof(half),
+                        cudaMemcpyDeviceToDevice, 0);
+        return tok;
+    }
+
+    // DDTree: forward followed by top-K argmax instead of top-1. Fills
+    // `out_ids[0..K-1]` with the K highest-logit token ids (sorted descending)
+    // and, if non-null, `out_logits[0..K-1]` with their fp32 logits. Also
+    // returns the top-1 (same as forward()). The MTP KV cache is advanced by
+    // one slot as usual; callers that used the non-top-1 branches must
+    // `kv_rollback(1)` if they didn't commit that slot.
+    int forward_topk(const half* h_main_normed, int prev_token_id, int position,
+                     int K, int* out_ids_host, float* out_logits_host = nullptr) {
+        // Reuse the standard forward() up through the lm_head projection, but
+        // replace the argmax step with a top-K reduction.
+        int top1 = forward(h_main_normed, prev_token_id, position);
+        // `logits_buf` still holds the post-lm_head logits from the last call.
+        cudaSetDevice(gpu_id);
+        cudaStream_t stream = 0;
+        if (K <= 4) {
+            static int*   d_topk     = nullptr;
+            static float* d_topk_val = nullptr;
+            if (!d_topk)     cudaMalloc(&d_topk,     4 * sizeof(int));
+            if (!d_topk_val) cudaMalloc(&d_topk_val, 4 * sizeof(float));
+            argmax_topk_half_kernel<4><<<1, 1024, 0, stream>>>(
+                logits_buf, V, d_topk, out_logits_host ? d_topk_val : nullptr);
+            cudaMemcpy(out_ids_host, d_topk, 4 * sizeof(int), cudaMemcpyDeviceToHost);
+            if (out_logits_host) {
+                cudaMemcpy(out_logits_host, d_topk_val, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+            }
+            // Caller asked for K<=4; leave slots out_ids_host[K..3] unused.
+            (void)K;
+        } else {
+            static int*   d_topk     = nullptr;
+            static float* d_topk_val = nullptr;
+            if (!d_topk)     cudaMalloc(&d_topk,     8 * sizeof(int));
+            if (!d_topk_val) cudaMalloc(&d_topk_val, 8 * sizeof(float));
+            argmax_topk_half_kernel<8><<<1, 1024, 0, stream>>>(
+                logits_buf, V, d_topk, out_logits_host ? d_topk_val : nullptr);
+            cudaMemcpy(out_ids_host, d_topk, 8 * sizeof(int), cudaMemcpyDeviceToHost);
+            if (out_logits_host) {
+                cudaMemcpy(out_logits_host, d_topk_val, 8 * sizeof(float), cudaMemcpyDeviceToHost);
+            }
+        }
+        return top1;
+    }
+
+    // Rollback helpers for MTP K=2. If the main model rejects draft1 or
+    // draft2, the MTP KV cache has advanced too far. Each forward() appends
+    // one K/V slot and increments kv_pos, so 1 draft = 1 slot. Roll back by
+    // decrementing kv_pos.
+    void kv_rollback(int steps) {
+        kv_pos = (kv_pos >= steps) ? (kv_pos - steps) : 0;
+    }
 };

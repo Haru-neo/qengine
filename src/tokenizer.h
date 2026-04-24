@@ -298,10 +298,36 @@ struct Tokenizer {
             add_text("\n");
         }
 
-        // Messages
+        // Messages. Assistant turns from prior rounds have their
+        // <think>...</think> reasoning stripped before re-injection —
+        // otherwise the model treats earlier chain-of-thought as its
+        // *current* working memory and keeps extending it, which causes
+        // the "2nd-turn hallucination" where the model re-uses a past
+        // reasoning block as if it were this turn's internal state.
+        // Qwen's official chat template does this strip; we were missing it.
+        auto strip_think = [](const std::string& in) {
+            std::string out = in;
+            while (true) {
+                size_t ts = out.find("<think>");
+                if (ts == std::string::npos) break;
+                size_t te = out.find("</think>", ts);
+                if (te == std::string::npos) {
+                    // Unterminated — drop from <think> to end.
+                    out = out.substr(0, ts);
+                    break;
+                }
+                out.erase(ts, te + 8 - ts);  // len("</think>") == 8
+            }
+            // Trim leading whitespace left after strip.
+            size_t first = out.find_first_not_of(" \n\r\t");
+            return (first == std::string::npos) ? std::string() : out.substr(first);
+        };
+
         for (auto& [role, content] : messages) {
+            const std::string& use_content = (role == "assistant")
+                ? (strip_think(content)) : content;
             ids.push_back(im_start);
-            add_text(role + "\n" + content);
+            add_text(role + "\n" + use_content);
             ids.push_back(im_end);
             add_text("\n");
         }

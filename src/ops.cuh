@@ -304,6 +304,146 @@ inline void rms_norm_f32in_f32w_n2(half* out_a, half* out_b,
         x_a, x_b, weight, out_a, out_b, hidden_size, eps);
 }
 
+// ============ N=3 variants for MTP K=2 speculative decoding ============
+// Each kernel uses blockIdx.y ∈ {0,1,2} to pick a/b/c token. Identical RMSNorm
+// math to the N=2 kernels — just with a third lane.
+
+__global__ void rms_norm_f32w_n3_kernel(
+    const half* __restrict__ x_a, const half* __restrict__ x_b, const half* __restrict__ x_c,
+    const float* __restrict__ weight,
+    half* __restrict__ out_a, half* __restrict__ out_b, half* __restrict__ out_c,
+    int hidden_size, float eps
+) {
+    const half* x = (blockIdx.y == 0) ? x_a : (blockIdx.y == 1) ? x_b : x_c;
+    half* out     = (blockIdx.y == 0) ? out_a : (blockIdx.y == 1) ? out_b : out_c;
+    extern __shared__ float sdata[];
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float v = __half2float(x[i]); sum += v * v;
+    }
+    sdata[threadIdx.x] = sum; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float rms = rsqrtf(sdata[0] / hidden_size + eps);
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        out[i] = __float2half(__half2float(x[i]) * rms * weight[i]);
+    }
+}
+
+inline void rms_norm_f32w_n3(half* out_a, half* out_b, half* out_c,
+                             const half* x_a, const half* x_b, const half* x_c,
+                             const float* weight, int hidden_size,
+                             float eps, cudaStream_t stream = 0) {
+    int threads = min(hidden_size, 256);
+    dim3 grid(1, 3);
+    rms_norm_f32w_n3_kernel<<<grid, threads, threads * sizeof(float), stream>>>(
+        x_a, x_b, x_c, weight, out_a, out_b, out_c, hidden_size, eps);
+}
+
+__global__ void rms_norm_n3_kernel(
+    const half* __restrict__ x_a, const half* __restrict__ x_b, const half* __restrict__ x_c,
+    const half* __restrict__ weight,
+    half* __restrict__ out_a, half* __restrict__ out_b, half* __restrict__ out_c,
+    int hidden_size, float eps
+) {
+    const half* x = (blockIdx.y == 0) ? x_a : (blockIdx.y == 1) ? x_b : x_c;
+    half* out     = (blockIdx.y == 0) ? out_a : (blockIdx.y == 1) ? out_b : out_c;
+    extern __shared__ float sdata[];
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float v = __half2float(x[i]); sum += v * v;
+    }
+    sdata[threadIdx.x] = sum; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float rms = rsqrtf(sdata[0] / hidden_size + eps);
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        out[i] = __float2half(__half2float(x[i]) * rms * __half2float(weight[i]));
+    }
+}
+
+inline void rms_norm_n3(half* out_a, half* out_b, half* out_c,
+                        const half* x_a, const half* x_b, const half* x_c,
+                        const half* weight, int hidden_size,
+                        float eps, cudaStream_t stream = 0) {
+    int threads = min(hidden_size, 256);
+    dim3 grid(1, 3);
+    rms_norm_n3_kernel<<<grid, threads, threads * sizeof(float), stream>>>(
+        x_a, x_b, x_c, weight, out_a, out_b, out_c, hidden_size, eps);
+}
+
+__global__ void rms_norm_f32in_f32w_n3_kernel(
+    const float* __restrict__ x_a, const float* __restrict__ x_b, const float* __restrict__ x_c,
+    const float* __restrict__ weight,
+    half* __restrict__ out_a, half* __restrict__ out_b, half* __restrict__ out_c,
+    int hidden_size, float eps
+) {
+    const float* x = (blockIdx.y == 0) ? x_a : (blockIdx.y == 1) ? x_b : x_c;
+    half* out      = (blockIdx.y == 0) ? out_a : (blockIdx.y == 1) ? out_b : out_c;
+    extern __shared__ float sdata[];
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float v = x[i]; sum += v * v;
+    }
+    sdata[threadIdx.x] = sum; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float rms = rsqrtf(sdata[0] / hidden_size + eps);
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        out[i] = __float2half(x[i] * rms * weight[i]);
+    }
+}
+
+__global__ void rms_norm_f32in_n3_kernel(
+    const float* __restrict__ x_a, const float* __restrict__ x_b, const float* __restrict__ x_c,
+    const half* __restrict__ weight,
+    half* __restrict__ out_a, half* __restrict__ out_b, half* __restrict__ out_c,
+    int hidden_size, float eps
+) {
+    const float* x = (blockIdx.y == 0) ? x_a : (blockIdx.y == 1) ? x_b : x_c;
+    half* out      = (blockIdx.y == 0) ? out_a : (blockIdx.y == 1) ? out_b : out_c;
+    extern __shared__ float sdata[];
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float v = x[i]; sum += v * v;
+    }
+    sdata[threadIdx.x] = sum; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float rms = rsqrtf(sdata[0] / hidden_size + eps);
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        out[i] = __float2half(x[i] * rms * __half2float(weight[i]));
+    }
+}
+
+inline void rms_norm_f32in_n3(half* out_a, half* out_b, half* out_c,
+                              const float* x_a, const float* x_b, const float* x_c,
+                              const half* weight, int hidden_size,
+                              float eps, cudaStream_t stream = 0) {
+    int threads = min(hidden_size, 256);
+    dim3 grid(1, 3);
+    rms_norm_f32in_n3_kernel<<<grid, threads, threads * sizeof(float), stream>>>(
+        x_a, x_b, x_c, weight, out_a, out_b, out_c, hidden_size, eps);
+}
+
+inline void rms_norm_f32in_f32w_n3(half* out_a, half* out_b, half* out_c,
+                                   const float* x_a, const float* x_b, const float* x_c,
+                                   const float* weight, int hidden_size,
+                                   float eps, cudaStream_t stream = 0) {
+    int threads = min(hidden_size, 256);
+    dim3 grid(1, 3);
+    rms_norm_f32in_f32w_n3_kernel<<<grid, threads, threads * sizeof(float), stream>>>(
+        x_a, x_b, x_c, weight, out_a, out_b, out_c, hidden_size, eps);
+}
+
 // FP32 residual add: hidden_f32 += proj_out (half)
 __global__ void add_kernel_f32(float* __restrict__ x, const half* __restrict__ residual, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -327,6 +467,20 @@ __global__ void add_kernel_f32_n2(
     } else {
         x_b[idx] = x_b[idx] + __half2float(res_b[idx]);
     }
+}
+
+// N=3 fused residual add for MTP K=2 spec decoding.
+__global__ void add_kernel_f32_n3(
+    float* __restrict__ x_a, const half* __restrict__ res_a,
+    float* __restrict__ x_b, const half* __restrict__ res_b,
+    float* __restrict__ x_c, const half* __restrict__ res_c,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float* x = (blockIdx.y == 0) ? x_a : (blockIdx.y == 1) ? x_b : x_c;
+    const half* r = (blockIdx.y == 0) ? res_a : (blockIdx.y == 1) ? res_b : res_c;
+    x[idx] = x[idx] + __half2float(r[idx]);
 }
 
 // Convert half → fp32 (used after embedding lookup)
@@ -404,6 +558,22 @@ __global__ void silu_mul_n2_kernel(
     if (idx >= n) return;
     half* a = (blockIdx.y == 0) ? a0 : a1;
     const half* b = (blockIdx.y == 0) ? b0 : b1;
+    float va = __half2float(a[idx]);
+    float silu = va / (1.0f + expf(-va));
+    a[idx] = __float2half(silu * __half2float(b[idx]));
+}
+
+// N=3 fused SiLU * mul (MTP K=2 three-stream batch).
+__global__ void silu_mul_n3_kernel(
+    half* __restrict__ a0, const half* __restrict__ b0,
+    half* __restrict__ a1, const half* __restrict__ b1,
+    half* __restrict__ a2, const half* __restrict__ b2,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    half* a = (blockIdx.y == 0) ? a0 : (blockIdx.y == 1) ? a1 : a2;
+    const half* b = (blockIdx.y == 0) ? b0 : (blockIdx.y == 1) ? b1 : b2;
     float va = __half2float(a[idx]);
     float silu = va / (1.0f + expf(-va));
     a[idx] = __float2half(silu * __half2float(b[idx]));
@@ -646,3 +816,128 @@ __global__ void argmax_half_kernel(const half* __restrict__ logits, int N, int* 
     }
     if (threadIdx.x == 0) out_idx[0] = s_idx[0];
 }
+
+// Top-2 argmax: out_top2[0]=argmax, out_top2[1]=2nd-largest index.
+// Each thread scans strided slice keeping (m1,a1)(m2,a2). Block merges
+// per-thread top-2 pairs into the block top-2 via O(N log N) reduction.
+__global__ void argmax_top2_half_kernel(const half* __restrict__ logits,
+                                        int N, int* __restrict__ out_top2) {
+    __shared__ float s_v1[1024]; __shared__ int s_i1[1024];
+    __shared__ float s_v2[1024]; __shared__ int s_i2[1024];
+
+    float m1 = -1e38f; int a1 = 0;
+    float m2 = -1e38f; int a2 = 0;
+    for (int i = threadIdx.x; i < N; i += blockDim.x) {
+        float v = __half2float(logits[i]);
+        if (v > m1)      { m2 = m1; a2 = a1; m1 = v; a1 = i; }
+        else if (v > m2) { m2 = v;  a2 = i; }
+    }
+    s_v1[threadIdx.x] = m1; s_i1[threadIdx.x] = a1;
+    s_v2[threadIdx.x] = m2; s_i2[threadIdx.x] = a2;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            float aL = s_v1[threadIdx.x],       aR  = s_v1[threadIdx.x + stride];
+            float aL2 = s_v2[threadIdx.x],      aR2 = s_v2[threadIdx.x + stride];
+            int   iL = s_i1[threadIdx.x],       iR  = s_i1[threadIdx.x + stride];
+            int   iL2 = s_i2[threadIdx.x],      iR2 = s_i2[threadIdx.x + stride];
+            // Block top-1/top-2 = two largest of the four {aL, aL2, aR, aR2}.
+            float top1, top2; int top1_i, top2_i;
+            if (aL >= aR) {
+                top1 = aL; top1_i = iL;
+                // top2 = max(aR, aL2) (aR2 <= aR)
+                if (aR >= aL2) { top2 = aR;  top2_i = iR;  }
+                else           { top2 = aL2; top2_i = iL2; }
+            } else {
+                top1 = aR; top1_i = iR;
+                if (aL >= aR2) { top2 = aL;  top2_i = iL;  }
+                else           { top2 = aR2; top2_i = iR2; }
+            }
+            s_v1[threadIdx.x] = top1; s_i1[threadIdx.x] = top1_i;
+            s_v2[threadIdx.x] = top2; s_i2[threadIdx.x] = top2_i;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        out_top2[0] = s_i1[0];
+        out_top2[1] = s_i2[0];
+    }
+}
+
+// Top-K argmax: out_ids[0..K-1] sorted descending by logit. out_logits[k]
+// receives the raw logit (fp32) for that id, or may be nullptr. Used by
+// DDTree tree-draft construction (MTP head top-K expansion).
+template<int K>
+__global__ void argmax_topk_half_kernel(const half* __restrict__ logits,
+                                         int N,
+                                         int* __restrict__ out_ids,
+                                         float* __restrict__ out_logits) {
+    // Per-thread sorted-descending top-K.
+    float my_v[K]; int my_i[K];
+    #pragma unroll
+    for (int k = 0; k < K; k++) { my_v[k] = -1e38f; my_i[k] = 0; }
+
+    for (int i = threadIdx.x; i < N; i += blockDim.x) {
+        float v = __half2float(logits[i]);
+        if (v > my_v[K - 1]) {
+            int pos = K - 1;
+            while (pos > 0 && v > my_v[pos - 1]) {
+                my_v[pos] = my_v[pos - 1];
+                my_i[pos] = my_i[pos - 1];
+                pos--;
+            }
+            my_v[pos] = v;
+            my_i[pos] = i;
+        }
+    }
+
+    // Block-wide tree reduction, merging top-K lists pair-wise.
+    __shared__ float s_v[1024][K];
+    __shared__ int   s_i[1024][K];
+    #pragma unroll
+    for (int k = 0; k < K; k++) {
+        s_v[threadIdx.x][k] = my_v[k];
+        s_i[threadIdx.x][k] = my_i[k];
+    }
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            float a_v[K]; int a_i[K];
+            float b_v[K]; int b_i[K];
+            #pragma unroll
+            for (int k = 0; k < K; k++) {
+                a_v[k] = s_v[threadIdx.x][k];           a_i[k] = s_i[threadIdx.x][k];
+                b_v[k] = s_v[threadIdx.x + stride][k];  b_i[k] = s_i[threadIdx.x + stride][k];
+            }
+            float m_v[K]; int m_i[K];
+            int ai = 0, bi = 0;
+            #pragma unroll
+            for (int k = 0; k < K; k++) {
+                if (ai < K && (bi >= K || a_v[ai] >= b_v[bi])) {
+                    m_v[k] = a_v[ai]; m_i[k] = a_i[ai]; ai++;
+                } else {
+                    m_v[k] = b_v[bi]; m_i[k] = b_i[bi]; bi++;
+                }
+            }
+            #pragma unroll
+            for (int k = 0; k < K; k++) {
+                s_v[threadIdx.x][k] = m_v[k];
+                s_i[threadIdx.x][k] = m_i[k];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        #pragma unroll
+        for (int k = 0; k < K; k++) {
+            out_ids[k] = s_i[0][k];
+            if (out_logits) out_logits[k] = s_v[0][k];
+        }
+    }
+}
+
+template __global__ void argmax_topk_half_kernel<4>(const half*, int, int*, float*);
+template __global__ void argmax_topk_half_kernel<8>(const half*, int, int*, float*);

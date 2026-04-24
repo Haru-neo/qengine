@@ -77,19 +77,21 @@ __global__ void gemv_q5_K_q8(
         uint8_t sc, mn;
         if (sub < 4) { sc = s[sub]&63; mn = s[sub+4]&63; }
         else { sc = (s[sub+4]&0xF)|((s[sub-4]>>6)<<4); mn = (s[sub+4]>>4)|((s[sub]>>6)<<4); }
-        int base = sub * 32, isum = 0;
-        // Q5_K: group=sub/2, sub_half=sub%2
-        const uint8_t* ql_ptr = b->qs + (sub >> 1) * 32;
-        int ql_shift = (sub & 1) * 4;
-        int qh_bit = sub;  // bit position in qh byte
-        
+        int isum = 0;
+        const uint32_t* ql32 = (const uint32_t*)(b->qs + (sub >> 1) * 32);
+        const uint32_t* qh32 = (const uint32_t*)b->qh;
+        const int ql_shift = (sub & 1) * 4;
+        const int qh_bit   = sub;
+
         #pragma unroll
         for (int j = 0; j < 32; j += 4) {
-            uint8_t q0 = ((ql_ptr[j]   >> ql_shift) & 0xF) | (((b->qh[j]   >> qh_bit) & 1) << 4);
-            uint8_t q1 = ((ql_ptr[j+1] >> ql_shift) & 0xF) | (((b->qh[j+1] >> qh_bit) & 1) << 4);
-            uint8_t q2 = ((ql_ptr[j+2] >> ql_shift) & 0xF) | (((b->qh[j+2] >> qh_bit) & 1) << 4);
-            uint8_t q3 = ((ql_ptr[j+3] >> ql_shift) & 0xF) | (((b->qh[j+3] >> qh_bit) & 1) << 4);
-            isum = __dp4a(q0|(q1<<8)|(q2<<16)|(q3<<24), *(const int*)&q8->qs[j], isum);
+            int lw = j >> 2;
+            uint32_t ql_w = ql32[lw];
+            uint32_t qh_w = qh32[lw];
+            uint32_t ql4 = (ql_w >> ql_shift) & 0x0F0F0F0Fu;
+            uint32_t qh1 = (qh_w >> qh_bit)   & 0x01010101u;
+            uint32_t q   = ql4 | (qh1 << 4);   // 5-bit unsigned per byte, [0..31]
+            isum = __dp4a((int)q, *(const int*)&q8->qs[j], isum);
         }
         thread_sum += d5*sc*d8*isum - dmin*mn*s8;
     }
@@ -119,62 +121,42 @@ __global__ void gemv_q6_K_q8(
         const block_q6_K* b = &w_row[blk_idx];
         const block_q8_1* q8 = &x_q8[sb];
         float d6 = __half2float(b->d), d8 = __half2float(q8->ds.x);
-        int base = sub*32;
-        // scales computed in inner loop
 
-        // Q6_K: exact layout matching dequant_embd_q6k_row_v2
-        int8_t sc_val0 = b->scales[(sub*32) / 16];      // scale for first 16
-        int8_t sc_val1 = b->scales[(sub*32 + 16) / 16]; // scale for next 16
-        
+        // Hoisted: sub is loop-constant, so sg/quarter/shifts/pointers are too.
+        const int sg       = sub >> 2;            // sub / 4
+        const int quarter  = sub & 3;             // sub % 4
+        const int ql_shift = (quarter >> 1) * 4;  // 0 or 4
+        const int qh_shift = quarter * 2;         // 0,2,4,6
+        const uint32_t* ql32 = (const uint32_t*)(b->ql + sg * 64 + (quarter & 1) * 32);
+        const uint32_t* qh32 = (const uint32_t*)(b->qh + sg * 32);
+        const int8_t sc0 = b->scales[sub * 2];
+        const int8_t sc1 = b->scales[sub * 2 + 1];
+
         int isum0 = 0;
         #pragma unroll
         for (int j = 0; j < 16; j += 4) {
-            int8_t qq[4];
-            #pragma unroll
-            for (int jj = 0; jj < 4; jj++) {
-                int elem = sub * 32 + j + jj;
-                int sg = elem / 128;
-                int pos = elem % 128;
-                int quarter = pos / 32;
-                int l = pos % 32;
-                const uint8_t* ql = b->ql + sg * 64;
-                const uint8_t* qh = b->qh + sg * 32;
-                uint8_t ql4, qh2;
-                switch(quarter) {
-                    case 0: ql4 = ql[l] & 0xF;     qh2 = (qh[l]>>0)&3; break;
-                    case 1: ql4 = ql[l+32] & 0xF;   qh2 = (qh[l]>>2)&3; break;
-                    case 2: ql4 = ql[l] >> 4;        qh2 = (qh[l]>>4)&3; break;
-                    default:ql4 = ql[l+32] >> 4;     qh2 = (qh[l]>>6)&3; break;
-                }
-                qq[jj] = (int8_t)(ql4 | (qh2 << 4)) - 32;
-            }
-            isum0 = __dp4a((int)(((uint8_t)qq[0])|((uint8_t)qq[1]<<8)|((uint8_t)qq[2]<<16)|((uint8_t)qq[3]<<24)), *(const int*)&q8->qs[j], isum0);
+            int lw = j >> 2;
+            uint32_t ql_w = ql32[lw];
+            uint32_t qh_w = qh32[lw];
+            uint32_t ql4 = (ql_w >> ql_shift) & 0x0F0F0F0Fu;
+            uint32_t qh2 = (qh_w >> qh_shift) & 0x03030303u;
+            uint32_t q   = ql4 | (qh2 << 4);             // 6-bit unsigned bytes in [0..63]
+            uint32_t qs  = __vsub4(q, 0x20202020u);      // signed int8 bytes in [-32..31]
+            isum0 = __dp4a((int)qs, *(const int*)&q8->qs[j], isum0);
         }
         int isum1 = 0;
         #pragma unroll
         for (int j = 16; j < 32; j += 4) {
-            int8_t qq[4];
-            #pragma unroll
-            for (int jj = 0; jj < 4; jj++) {
-                int elem = sub * 32 + j + jj;
-                int sg = elem / 128;
-                int pos = elem % 128;
-                int quarter = pos / 32;
-                int l = pos % 32;
-                const uint8_t* ql = b->ql + sg * 64;
-                const uint8_t* qh = b->qh + sg * 32;
-                uint8_t ql4, qh2;
-                switch(quarter) {
-                    case 0: ql4 = ql[l] & 0xF;     qh2 = (qh[l]>>0)&3; break;
-                    case 1: ql4 = ql[l+32] & 0xF;   qh2 = (qh[l]>>2)&3; break;
-                    case 2: ql4 = ql[l] >> 4;        qh2 = (qh[l]>>4)&3; break;
-                    default:ql4 = ql[l+32] >> 4;     qh2 = (qh[l]>>6)&3; break;
-                }
-                qq[jj] = (int8_t)(ql4 | (qh2 << 4)) - 32;
-            }
-            isum1 = __dp4a((int)(((uint8_t)qq[0])|((uint8_t)qq[1]<<8)|((uint8_t)qq[2]<<16)|((uint8_t)qq[3]<<24)), *(const int*)&q8->qs[j], isum1);
+            int lw = j >> 2;
+            uint32_t ql_w = ql32[lw];
+            uint32_t qh_w = qh32[lw];
+            uint32_t ql4 = (ql_w >> ql_shift) & 0x0F0F0F0Fu;
+            uint32_t qh2 = (qh_w >> qh_shift) & 0x03030303u;
+            uint32_t q   = ql4 | (qh2 << 4);
+            uint32_t qs  = __vsub4(q, 0x20202020u);
+            isum1 = __dp4a((int)qs, *(const int*)&q8->qs[j], isum1);
         }
-        thread_sum += d6*d8*(sc_val0*isum0 + sc_val1*isum1);
+        thread_sum += d6*d8*((float)sc0*isum0 + (float)sc1*isum1);
     }
     for (int off=16;off>0;off>>=1) thread_sum+=__shfl_xor_sync(0xffffffff,thread_sum,off);
     __shared__ float sm[8]; int w2=threadIdx.x>>5,l=threadIdx.x&31,nw=blockDim.x>>5;
@@ -195,6 +177,87 @@ __global__ void gemv_q8_0(const void* __restrict__ w, const half* __restrict__ x
     if(l==0)sm[w2]=s;__syncthreads();
     if(w2==0&&l<nw){s=sm[l];for(int o=16;o>0;o>>=1)s+=__shfl_xor_sync(0xffffffff,s,o);if(l==0)y[row]=__float2half(s);}
 }
+
+// Q8_0 × Q8_1 GEMV with per-block BM output rows. Each thread reads each
+// input word ONCE and runs BM dp4a accumulators against it, so the input
+// load is amortized across BM outputs and kernel launch count drops BM×.
+// Launch: grid = (ceil(N/BM),), threads = 128.
+template<int BM>
+__global__ void gemv_q8_0_q8_tile(
+    const void* __restrict__ weight,
+    const block_q8_1* __restrict__ x_q8,
+    half* __restrict__ output,
+    const int K, const int N
+) {
+    const int row_base = blockIdx.x * BM;
+    if (row_base >= N) return;
+    const int bpr = K / 32;
+
+    float thread_sums[BM];
+    #pragma unroll
+    for (int r = 0; r < BM; r++) thread_sums[r] = 0.0f;
+
+    const block_q8_0_aligned* W = (const block_q8_0_aligned*)weight;
+
+    for (int b = threadIdx.x; b < bpr; b += blockDim.x) {
+        const block_q8_1* xb = &x_q8[b];
+        float d_x = __half2float(xb->ds.x);
+        const int* xp = (const int*)xb->qs;
+        int xw[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) xw[j] = xp[j];
+
+        #pragma unroll
+        for (int r = 0; r < BM; r++) {
+            int row = row_base + r;
+            if (row < N) {
+                const block_q8_0_aligned* wb = &W[(size_t)row * bpr + b];
+                float d_w = __half2float(wb->d);
+                const int* wp32 = (const int*)wb->qs;
+                int isum = 0;
+                #pragma unroll
+                for (int j = 0; j < 8; j++) isum = __dp4a(wp32[j], xw[j], isum);
+                thread_sums[r] += d_w * d_x * (float)isum;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < BM; r++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            thread_sums[r] += __shfl_xor_sync(0xffffffff, thread_sums[r], off);
+    }
+    __shared__ float sm[BM][8];
+    int w_idx = threadIdx.x >> 5;
+    int lane  = threadIdx.x & 31;
+    int nwarp = blockDim.x >> 5;
+    if (lane == 0) {
+        #pragma unroll
+        for (int r = 0; r < BM; r++) sm[r][w_idx] = thread_sums[r];
+    }
+    __syncthreads();
+    if (w_idx == 0 && lane < nwarp) {
+        float vals[BM];
+        #pragma unroll
+        for (int r = 0; r < BM; r++) vals[r] = sm[r][lane];
+        for (int o = 16; o > 0; o >>= 1) {
+            #pragma unroll
+            for (int r = 0; r < BM; r++) vals[r] += __shfl_xor_sync(0xffffffff, vals[r], o);
+        }
+        if (lane == 0) {
+            #pragma unroll
+            for (int r = 0; r < BM; r++) {
+                int row = row_base + r;
+                if (row < N) output[row] = __float2half(vals[r]);
+            }
+        }
+    }
+}
+
+template __global__ void gemv_q8_0_q8_tile<2>(const void*, const block_q8_1*, half*, int, int);
+template __global__ void gemv_q8_0_q8_tile<4>(const void*, const block_q8_1*, half*, int, int);
+template __global__ void gemv_q8_0_q8_tile<8>(const void*, const block_q8_1*, half*, int, int);
 
 // Q8_0 weight × Q8_1 input via dp4a (much faster — int8 dot products)
 // The input gets quantized once via QuantInput::quantize and reused across
@@ -311,6 +374,288 @@ __global__ void gemv_q8_0_q8_n2(
         }
     }
 }
+
+// N=3 batched Q8_0 × Q8_1 GEMV — same shared-weight-load trick as the N=2
+// kernel, scaled to three independent inputs (MTP K=2 speculative verify:
+// main token + two MTP drafts). Weight is read ONCE per K-step and used
+// for three dp4a accumulators.
+__global__ void gemv_q8_0_q8_n3(
+    const void* __restrict__ weight,
+    const block_q8_1* __restrict__ x_q8_a,
+    const block_q8_1* __restrict__ x_q8_b,
+    const block_q8_1* __restrict__ x_q8_c,
+    half* __restrict__ output_a,
+    half* __restrict__ output_b,
+    half* __restrict__ output_c,
+    const int K, const int N
+) {
+    const int row = blockIdx.x;
+    if (row >= N) return;
+    const int bpr = K / 32;
+    const block_q8_0_aligned* w_row = (const block_q8_0_aligned*)weight + (size_t)row * bpr;
+
+    float ts_a = 0.0f, ts_b = 0.0f, ts_c = 0.0f;
+    for (int b = threadIdx.x; b < bpr; b += blockDim.x) {
+        const block_q8_0_aligned* wb = &w_row[b];
+        const block_q8_1* xa = &x_q8_a[b];
+        const block_q8_1* xb = &x_q8_b[b];
+        const block_q8_1* xc = &x_q8_c[b];
+        float d_w   = __half2float(wb->d);
+        float d_x_a = __half2float(xa->ds.x);
+        float d_x_b = __half2float(xb->ds.x);
+        float d_x_c = __half2float(xc->ds.x);
+
+        const int* wp32 = (const int*)wb->qs;
+        const int* xap  = (const int*)xa->qs;
+        const int* xbp  = (const int*)xb->qs;
+        const int* xcp  = (const int*)xc->qs;
+
+        int isum_a = 0, isum_b = 0, isum_c = 0;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int wj = wp32[j];
+            isum_a = __dp4a(wj, xap[j], isum_a);
+            isum_b = __dp4a(wj, xbp[j], isum_b);
+            isum_c = __dp4a(wj, xcp[j], isum_c);
+        }
+        ts_a += d_w * d_x_a * (float)isum_a;
+        ts_b += d_w * d_x_b * (float)isum_b;
+        ts_c += d_w * d_x_c * (float)isum_c;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        ts_a += __shfl_xor_sync(0xffffffff, ts_a, off);
+        ts_b += __shfl_xor_sync(0xffffffff, ts_b, off);
+        ts_c += __shfl_xor_sync(0xffffffff, ts_c, off);
+    }
+    __shared__ float sm_a[8], sm_b[8], sm_c[8];
+    int w_idx = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int nwarp = blockDim.x >> 5;
+    if (lane == 0) { sm_a[w_idx] = ts_a; sm_b[w_idx] = ts_b; sm_c[w_idx] = ts_c; }
+    __syncthreads();
+    if (w_idx == 0 && lane < nwarp) {
+        float va = sm_a[lane], vb = sm_b[lane], vc = sm_c[lane];
+        for (int o = 16; o > 0; o >>= 1) {
+            va += __shfl_xor_sync(0xffffffff, va, o);
+            vb += __shfl_xor_sync(0xffffffff, vb, o);
+            vc += __shfl_xor_sync(0xffffffff, vc, o);
+        }
+        if (lane == 0) {
+            output_a[row] = __float2half(va);
+            output_b[row] = __float2half(vb);
+            output_c[row] = __float2half(vc);
+        }
+    }
+}
+
+// N=2 TILED Q8_0 × Q8_1 GEMV — BM output rows per block × 2 input lanes.
+// Combines gemv_q8_0_q8_tile<BM> (row tiling) with gemv_q8_0_q8_n2 (lane
+// sharing): one weight word is reused across BM × 2 dp4a accumulators,
+// and per-thread input is loaded once and shared across BM rows. Block
+// count drops by BM×, so launch overhead and wave imbalance shrink.
+template<int BM>
+__global__ void gemv_q8_0_q8_tile_n2(
+    const void* __restrict__ weight,
+    const block_q8_1* __restrict__ x_q8_a,
+    const block_q8_1* __restrict__ x_q8_b,
+    half* __restrict__ output_a,
+    half* __restrict__ output_b,
+    const int K, const int N
+) {
+    const int row_base = blockIdx.x * BM;
+    if (row_base >= N) return;
+    const int bpr = K / 32;
+
+    float ts_a[BM], ts_b[BM];
+    #pragma unroll
+    for (int r = 0; r < BM; r++) { ts_a[r] = 0.0f; ts_b[r] = 0.0f; }
+
+    const block_q8_0_aligned* W = (const block_q8_0_aligned*)weight;
+
+    for (int b = threadIdx.x; b < bpr; b += blockDim.x) {
+        const block_q8_1* xba = &x_q8_a[b];
+        const block_q8_1* xbb = &x_q8_b[b];
+        float d_xa = __half2float(xba->ds.x);
+        float d_xb = __half2float(xbb->ds.x);
+        const int* xap = (const int*)xba->qs;
+        const int* xbp = (const int*)xbb->qs;
+        int xa[8], xb[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) { xa[j] = xap[j]; xb[j] = xbp[j]; }
+
+        #pragma unroll
+        for (int r = 0; r < BM; r++) {
+            int row = row_base + r;
+            if (row < N) {
+                const block_q8_0_aligned* wb = &W[(size_t)row * bpr + b];
+                float d_w = __half2float(wb->d);
+                const int* wp32 = (const int*)wb->qs;
+                int isum_a = 0, isum_b = 0;
+                #pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    int wj = wp32[j];
+                    isum_a = __dp4a(wj, xa[j], isum_a);
+                    isum_b = __dp4a(wj, xb[j], isum_b);
+                }
+                ts_a[r] += d_w * d_xa * (float)isum_a;
+                ts_b[r] += d_w * d_xb * (float)isum_b;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < BM; r++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            ts_a[r] += __shfl_xor_sync(0xffffffff, ts_a[r], off);
+            ts_b[r] += __shfl_xor_sync(0xffffffff, ts_b[r], off);
+        }
+    }
+    __shared__ float sm_a[BM][8], sm_b[BM][8];
+    int w_idx = threadIdx.x >> 5;
+    int lane  = threadIdx.x & 31;
+    int nwarp = blockDim.x >> 5;
+    if (lane == 0) {
+        #pragma unroll
+        for (int r = 0; r < BM; r++) { sm_a[r][w_idx] = ts_a[r]; sm_b[r][w_idx] = ts_b[r]; }
+    }
+    __syncthreads();
+    if (w_idx == 0 && lane < nwarp) {
+        float va[BM], vb[BM];
+        #pragma unroll
+        for (int r = 0; r < BM; r++) { va[r] = sm_a[r][lane]; vb[r] = sm_b[r][lane]; }
+        for (int o = 16; o > 0; o >>= 1) {
+            #pragma unroll
+            for (int r = 0; r < BM; r++) {
+                va[r] += __shfl_xor_sync(0xffffffff, va[r], o);
+                vb[r] += __shfl_xor_sync(0xffffffff, vb[r], o);
+            }
+        }
+        if (lane == 0) {
+            #pragma unroll
+            for (int r = 0; r < BM; r++) {
+                int row = row_base + r;
+                if (row < N) {
+                    output_a[row] = __float2half(va[r]);
+                    output_b[row] = __float2half(vb[r]);
+                }
+            }
+        }
+    }
+}
+
+template __global__ void gemv_q8_0_q8_tile_n2<2>(const void*, const block_q8_1*, const block_q8_1*, half*, half*, int, int);
+template __global__ void gemv_q8_0_q8_tile_n2<4>(const void*, const block_q8_1*, const block_q8_1*, half*, half*, int, int);
+template __global__ void gemv_q8_0_q8_tile_n2<8>(const void*, const block_q8_1*, const block_q8_1*, half*, half*, int, int);
+
+// N=3 TILED Q8_0 × Q8_1 GEMV — BM output rows per block × 3 input lanes.
+template<int BM>
+__global__ void gemv_q8_0_q8_tile_n3(
+    const void* __restrict__ weight,
+    const block_q8_1* __restrict__ x_q8_a,
+    const block_q8_1* __restrict__ x_q8_b,
+    const block_q8_1* __restrict__ x_q8_c,
+    half* __restrict__ output_a,
+    half* __restrict__ output_b,
+    half* __restrict__ output_c,
+    const int K, const int N
+) {
+    const int row_base = blockIdx.x * BM;
+    if (row_base >= N) return;
+    const int bpr = K / 32;
+
+    float ts_a[BM], ts_b[BM], ts_c[BM];
+    #pragma unroll
+    for (int r = 0; r < BM; r++) { ts_a[r] = 0.0f; ts_b[r] = 0.0f; ts_c[r] = 0.0f; }
+
+    const block_q8_0_aligned* W = (const block_q8_0_aligned*)weight;
+
+    for (int b = threadIdx.x; b < bpr; b += blockDim.x) {
+        const block_q8_1* xba = &x_q8_a[b];
+        const block_q8_1* xbb = &x_q8_b[b];
+        const block_q8_1* xbc = &x_q8_c[b];
+        float d_xa = __half2float(xba->ds.x);
+        float d_xb = __half2float(xbb->ds.x);
+        float d_xc = __half2float(xbc->ds.x);
+        const int* xap = (const int*)xba->qs;
+        const int* xbp = (const int*)xbb->qs;
+        const int* xcp = (const int*)xbc->qs;
+        int xa[8], xb[8], xc[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) { xa[j] = xap[j]; xb[j] = xbp[j]; xc[j] = xcp[j]; }
+
+        #pragma unroll
+        for (int r = 0; r < BM; r++) {
+            int row = row_base + r;
+            if (row < N) {
+                const block_q8_0_aligned* wb = &W[(size_t)row * bpr + b];
+                float d_w = __half2float(wb->d);
+                const int* wp32 = (const int*)wb->qs;
+                int isum_a = 0, isum_b = 0, isum_c = 0;
+                #pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    int wj = wp32[j];
+                    isum_a = __dp4a(wj, xa[j], isum_a);
+                    isum_b = __dp4a(wj, xb[j], isum_b);
+                    isum_c = __dp4a(wj, xc[j], isum_c);
+                }
+                ts_a[r] += d_w * d_xa * (float)isum_a;
+                ts_b[r] += d_w * d_xb * (float)isum_b;
+                ts_c[r] += d_w * d_xc * (float)isum_c;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < BM; r++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            ts_a[r] += __shfl_xor_sync(0xffffffff, ts_a[r], off);
+            ts_b[r] += __shfl_xor_sync(0xffffffff, ts_b[r], off);
+            ts_c[r] += __shfl_xor_sync(0xffffffff, ts_c[r], off);
+        }
+    }
+    __shared__ float sm_a[BM][8], sm_b[BM][8], sm_c[BM][8];
+    int w_idx = threadIdx.x >> 5;
+    int lane  = threadIdx.x & 31;
+    int nwarp = blockDim.x >> 5;
+    if (lane == 0) {
+        #pragma unroll
+        for (int r = 0; r < BM; r++) {
+            sm_a[r][w_idx] = ts_a[r]; sm_b[r][w_idx] = ts_b[r]; sm_c[r][w_idx] = ts_c[r];
+        }
+    }
+    __syncthreads();
+    if (w_idx == 0 && lane < nwarp) {
+        float va[BM], vb[BM], vc[BM];
+        #pragma unroll
+        for (int r = 0; r < BM; r++) {
+            va[r] = sm_a[r][lane]; vb[r] = sm_b[r][lane]; vc[r] = sm_c[r][lane];
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            #pragma unroll
+            for (int r = 0; r < BM; r++) {
+                va[r] += __shfl_xor_sync(0xffffffff, va[r], o);
+                vb[r] += __shfl_xor_sync(0xffffffff, vb[r], o);
+                vc[r] += __shfl_xor_sync(0xffffffff, vc[r], o);
+            }
+        }
+        if (lane == 0) {
+            #pragma unroll
+            for (int r = 0; r < BM; r++) {
+                int row = row_base + r;
+                if (row < N) {
+                    output_a[row] = __float2half(va[r]);
+                    output_b[row] = __float2half(vb[r]);
+                    output_c[row] = __float2half(vc[r]);
+                }
+            }
+        }
+    }
+}
+
+template __global__ void gemv_q8_0_q8_tile_n3<2>(const void*, const block_q8_1*, const block_q8_1*, const block_q8_1*, half*, half*, half*, int, int);
+template __global__ void gemv_q8_0_q8_tile_n3<4>(const void*, const block_q8_1*, const block_q8_1*, const block_q8_1*, half*, half*, half*, int, int);
+template __global__ void gemv_q8_0_q8_tile_n3<8>(const void*, const block_q8_1*, const block_q8_1*, const block_q8_1*, half*, half*, half*, int, int);
 
 // N-token batched Q8_0 weight × Q8_1 input GEMV (chunked prefill).
 // Each block computes one output row across NB tokens. The weight word is
@@ -531,6 +876,148 @@ template __global__ void gemm_q8_0_q8_1<16, 16, 8>(const void*, const block_q8_1
 template __global__ void gemm_q8_0_q8_1<16, 32, 4>(const void*, const block_q8_1*, half*, int, int, int);
 template __global__ void gemm_q8_0_q8_1<32, 16, 4>(const void*, const block_q8_1*, half*, int, int, int);
 
+// v2 — thread-level tiling. Each thread owns TM×TN output cells instead of 1.
+// The compute:SMEM-traffic ratio is TM·TN / (TM+TN) instead of 1/2, which at
+// TM=TN=4 is 8× better. Block threads = (BM/TM)·(BN/TN).
+//
+// Grid layout matches gemm_q8_0_q8_1 so the dispatch can swap kernels.
+template<int BM, int BN, int TM, int TN, int BK_BLOCKS>
+__global__ void gemm_q8_0_q8_1_v2(
+    const void* __restrict__ W,
+    const block_q8_1* __restrict__ X,
+    half* __restrict__ Y,
+    const int M, const int N, const int K
+) {
+    constexpr int ROWS_PER_BLOCK = BM / TM;
+    constexpr int COLS_PER_BLOCK = BN / TN;
+    constexpr int THREADS = ROWS_PER_BLOCK * COLS_PER_BLOCK;
+    static_assert(BM % TM == 0 && BN % TN == 0, "tile must divide block");
+
+    const int bpr = K / 32;
+    const int tid = threadIdx.x;
+    const int tx  = tid % ROWS_PER_BLOCK;   // thread row in tile
+    const int ty  = tid / ROWS_PER_BLOCK;   // thread col in tile
+
+    float acc[TM][TN];
+    #pragma unroll
+    for (int im = 0; im < TM; im++)
+        #pragma unroll
+        for (int in = 0; in < TN; in++) acc[im][in] = 0.0f;
+
+    extern __shared__ char gemm_smem_raw[];
+    block_q8_0_aligned* sW = (block_q8_0_aligned*)gemm_smem_raw;
+    block_q8_1*         sX = (block_q8_1*)(sW + BM * BK_BLOCKS);
+
+    const block_q8_0_aligned* Wp = (const block_q8_0_aligned*)W;
+
+    for (int kb = 0; kb < bpr; kb += BK_BLOCKS) {
+        // Cooperative SMEM loads.
+        for (int idx = tid; idx < BM * BK_BLOCKS; idx += THREADS) {
+            int row_in = idx / BK_BLOCKS;
+            int b_in   = idx - row_in * BK_BLOCKS;
+            int m_glob = blockIdx.x * BM + row_in;
+            int b_glob = kb + b_in;
+            if (m_glob < M && b_glob < bpr) {
+                sW[idx] = Wp[(size_t)m_glob * bpr + b_glob];
+            }
+        }
+        for (int idx = tid; idx < BN * BK_BLOCKS; idx += THREADS) {
+            int row_in = idx / BK_BLOCKS;
+            int b_in   = idx - row_in * BK_BLOCKS;
+            int n_glob = blockIdx.y * BN + row_in;
+            int b_glob = kb + b_in;
+            if (n_glob < N && b_glob < bpr) {
+                sX[idx] = X[(size_t)n_glob * bpr + b_glob];
+            }
+        }
+        __syncthreads();
+
+        // Inner tile compute. For each K-block in the tile:
+        //   1. Pull TM weight fragments and TN input fragments into registers.
+        //   2. Do TM×TN dp4a × 8-word chain — each weight word is reused TN
+        //      times and each input word TM times from registers.
+        #pragma unroll
+        for (int b = 0; b < BK_BLOCKS; b++) {
+            int b_glob = kb + b;
+            if (b_glob >= bpr) break;
+
+            int isum[TM][TN];
+            #pragma unroll
+            for (int im = 0; im < TM; im++)
+                #pragma unroll
+                for (int in = 0; in < TN; in++) isum[im][in] = 0;
+
+            // Register fragments (8 ints each = one q8_0 block).
+            int w_frag[TM][8];
+            int x_frag[TN][8];
+            float dW[TM];
+            float dX[TN];
+
+            #pragma unroll
+            for (int im = 0; im < TM; im++) {
+                int w_row_in = tx * TM + im;
+                const block_q8_0_aligned* wb = &sW[w_row_in * BK_BLOCKS + b];
+                dW[im] = __half2float(wb->d);
+                const int* wp32 = (const int*)wb->qs;
+                #pragma unroll
+                for (int j = 0; j < 8; j++) w_frag[im][j] = wp32[j];
+            }
+            #pragma unroll
+            for (int in = 0; in < TN; in++) {
+                int x_row_in = ty * TN + in;
+                const block_q8_1* xb = &sX[x_row_in * BK_BLOCKS + b];
+                dX[in] = __half2float(xb->ds.x);
+                const int* xp = (const int*)xb->qs;
+                #pragma unroll
+                for (int j = 0; j < 8; j++) x_frag[in][j] = xp[j];
+            }
+
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                #pragma unroll
+                for (int im = 0; im < TM; im++) {
+                    int wj = w_frag[im][j];
+                    #pragma unroll
+                    for (int in = 0; in < TN; in++) {
+                        isum[im][in] = __dp4a(wj, x_frag[in][j], isum[im][in]);
+                    }
+                }
+            }
+
+            #pragma unroll
+            for (int im = 0; im < TM; im++)
+                #pragma unroll
+                for (int in = 0; in < TN; in++) {
+                    acc[im][in] += dW[im] * dX[in] * (float)isum[im][in];
+                }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int im = 0; im < TM; im++) {
+        int gm = blockIdx.x * BM + tx * TM + im;
+        #pragma unroll
+        for (int in = 0; in < TN; in++) {
+            int gn = blockIdx.y * BN + ty * TN + in;
+            if (gm < M && gn < N) {
+                Y[(size_t)gn * M + gm] = __float2half(acc[im][in]);
+            }
+        }
+    }
+}
+
+// Explicit instantiations for v2.
+template __global__ void gemm_q8_0_q8_1_v2<32, 32, 2, 2, 4>(const void*, const block_q8_1*, half*, int, int, int);
+template __global__ void gemm_q8_0_q8_1_v2<64, 32, 4, 2, 4>(const void*, const block_q8_1*, half*, int, int, int);
+template __global__ void gemm_q8_0_q8_1_v2<64, 64, 4, 4, 4>(const void*, const block_q8_1*, half*, int, int, int);
+template __global__ void gemm_q8_0_q8_1_v2<32, 32, 2, 2, 8>(const void*, const block_q8_1*, half*, int, int, int);
+template __global__ void gemm_q8_0_q8_1_v2<64, 64, 4, 4, 8>(const void*, const block_q8_1*, half*, int, int, int);
+template __global__ void gemm_q8_0_q8_1_v2<128, 64, 8, 4, 4>(const void*, const block_q8_1*, half*, int, int, int);
+template __global__ void gemm_q8_0_q8_1_v2<64, 128, 4, 8, 4>(const void*, const block_q8_1*, half*, int, int, int);
+template __global__ void gemm_q8_0_q8_1_v2<32, 128, 2, 8, 4>(const void*, const block_q8_1*, half*, int, int, int);
+template __global__ void gemm_q8_0_q8_1_v2<16, 128, 1, 8, 4>(const void*, const block_q8_1*, half*, int, int, int);
+
 __global__ void gemv_fp16(const half* __restrict__ w,const half* __restrict__ x,half* __restrict__ y,int K,int N){
     int row=blockIdx.x;if(row>=N)return;float s=0.0f;
     for(int i=threadIdx.x;i<K;i+=blockDim.x)s+=__half2float(w[(size_t)row*K+i])*__half2float(x[i]);
@@ -580,7 +1067,25 @@ inline void quant_gemv(void* weight,ggml_type type,half* input,half* output,int 
     if(qi&&(type==GGML_TYPE_Q5_K||type==GGML_TYPE_Q6_K||type==GGML_TYPE_Q8_0)){
         if(type==GGML_TYPE_Q5_K)      gemv_q5_K_q8<<<N,threads,0,stream>>>(weight,qi->q8_buf,output,K,N);
         else if(type==GGML_TYPE_Q6_K) gemv_q6_K_q8<<<N,threads,0,stream>>>(weight,qi->q8_buf,output,K,N);
-        else                          gemv_q8_0_q8<<<N,threads,0,stream>>>(weight,qi->q8_buf,output,K,N);
+        else {
+            // GEMV_TILE_BM env selects the BM-tiled kernel for N=1 generation.
+            // Default BM=1 — at MLP sizes 2026-04-21 BM=4 showed no win because
+            // Q8_0 GEMV is BW-bound (weight L2 hit, compute cheap). Kept for
+            // future use on smaller matrices or different quant.
+            static const int tile_bm = []{
+                const char* e = getenv("GEMV_TILE_BM");
+                return e ? atoi(e) : 1;
+            }();
+            if (tile_bm == 2 && (N % 2) == 0) {
+                gemv_q8_0_q8_tile<2><<<N/2, threads, 0, stream>>>(weight, qi->q8_buf, output, K, N);
+            } else if (tile_bm == 4 && (N % 4) == 0) {
+                gemv_q8_0_q8_tile<4><<<N/4, threads, 0, stream>>>(weight, qi->q8_buf, output, K, N);
+            } else if (tile_bm == 8 && (N % 8) == 0) {
+                gemv_q8_0_q8_tile<8><<<N/8, threads, 0, stream>>>(weight, qi->q8_buf, output, K, N);
+            } else {
+                gemv_q8_0_q8<<<N, threads, 0, stream>>>(weight, qi->q8_buf, output, K, N);
+            }
+        }
     } else {
         switch(type){
         case GGML_TYPE_Q5_K:case GGML_TYPE_Q6_K:{
@@ -617,6 +1122,112 @@ inline void quant_gemv_chunk(void* weight, ggml_type type,
         const block_q8_1* xp = x_q8_chunk;
         half* op = output_chunk;
         int remaining = n_tokens;
+
+        // MLP_GEMM_V2 env selects the GEMM tile geometry. Default = 9
+        // (32x128 2x8 BK=4) — winner of the 2026-04-21 sweep against 2868-tok
+        // prefill: 1.72× faster total than v1 (92.7 → 159.2 t/s). Set to 0 to
+        // force the legacy 16x32 BK=4 tile for regression testing.
+        // Values: 1=32x32 2x2 BK4, 2=64x32 4x2 BK4, 3=64x64 4x4 BK4,
+        //         4=32x32 2x2 BK8, 5=64x64 4x4 BK8, 6=128x64 8x4 BK4,
+        //         7=64x128 4x8 BK4, 9=32x128 2x8 BK4 (default), 10=16x128 1x8 BK4.
+        static const int v2_mode = []{
+            const char* e = getenv("MLP_GEMM_V2");
+            return e ? atoi(e) : 9;
+        }();
+
+        auto try_v2_tile = [&](int vm, int vn, auto launcher) -> bool {
+            if (remaining < vn || (M % vm) != 0 || (remaining % vn) != 0) return false;
+            int n_chunks = remaining / vn;
+            int bn_total = n_chunks * vn;
+            launcher(n_chunks, bn_total);
+            xp += (size_t)bn_total * (K / 32);
+            op += (size_t)bn_total * M;
+            remaining -= bn_total;
+            return true;
+        };
+
+        if (v2_mode == 1) {
+            try_v2_tile(32, 32, [&](int n_chunks, int bn_total){
+                constexpr int BM = 32, BN = 32, TM = 2, TN = 2, BK = 4;
+                dim3 grid(M / BM, n_chunks);
+                int threads = (BM/TM) * (BN/TN);
+                int sm_bytes = (BM + BN) * BK * sizeof(block_q8_0_aligned);
+                gemm_q8_0_q8_1_v2<BM, BN, TM, TN, BK><<<grid, threads, sm_bytes, stream>>>(
+                    weight, xp, op, M, bn_total, K);
+            });
+        } else if (v2_mode == 2) {
+            try_v2_tile(64, 32, [&](int n_chunks, int bn_total){
+                constexpr int BM = 64, BN = 32, TM = 4, TN = 2, BK = 4;
+                dim3 grid(M / BM, n_chunks);
+                int threads = (BM/TM) * (BN/TN);
+                int sm_bytes = (BM + BN) * BK * sizeof(block_q8_0_aligned);
+                gemm_q8_0_q8_1_v2<BM, BN, TM, TN, BK><<<grid, threads, sm_bytes, stream>>>(
+                    weight, xp, op, M, bn_total, K);
+            });
+        } else if (v2_mode == 3) {
+            try_v2_tile(64, 64, [&](int n_chunks, int bn_total){
+                constexpr int BM = 64, BN = 64, TM = 4, TN = 4, BK = 4;
+                dim3 grid(M / BM, n_chunks);
+                int threads = (BM/TM) * (BN/TN);
+                int sm_bytes = (BM + BN) * BK * sizeof(block_q8_0_aligned);
+                gemm_q8_0_q8_1_v2<BM, BN, TM, TN, BK><<<grid, threads, sm_bytes, stream>>>(
+                    weight, xp, op, M, bn_total, K);
+            });
+        } else if (v2_mode == 4) {
+            try_v2_tile(32, 32, [&](int n_chunks, int bn_total){
+                constexpr int BM = 32, BN = 32, TM = 2, TN = 2, BK = 8;
+                dim3 grid(M / BM, n_chunks);
+                int threads = (BM/TM) * (BN/TN);
+                int sm_bytes = (BM + BN) * BK * sizeof(block_q8_0_aligned);
+                gemm_q8_0_q8_1_v2<BM, BN, TM, TN, BK><<<grid, threads, sm_bytes, stream>>>(
+                    weight, xp, op, M, bn_total, K);
+            });
+        } else if (v2_mode == 5) {
+            try_v2_tile(64, 64, [&](int n_chunks, int bn_total){
+                constexpr int BM = 64, BN = 64, TM = 4, TN = 4, BK = 8;
+                dim3 grid(M / BM, n_chunks);
+                int threads = (BM/TM) * (BN/TN);
+                int sm_bytes = (BM + BN) * BK * sizeof(block_q8_0_aligned);
+                gemm_q8_0_q8_1_v2<BM, BN, TM, TN, BK><<<grid, threads, sm_bytes, stream>>>(
+                    weight, xp, op, M, bn_total, K);
+            });
+        } else if (v2_mode == 6) {
+            try_v2_tile(128, 64, [&](int n_chunks, int bn_total){
+                constexpr int BM = 128, BN = 64, TM = 8, TN = 4, BK = 4;
+                dim3 grid(M / BM, n_chunks);
+                int threads = (BM/TM) * (BN/TN);
+                int sm_bytes = (BM + BN) * BK * sizeof(block_q8_0_aligned);
+                gemm_q8_0_q8_1_v2<BM, BN, TM, TN, BK><<<grid, threads, sm_bytes, stream>>>(
+                    weight, xp, op, M, bn_total, K);
+            });
+        } else if (v2_mode == 7) {
+            try_v2_tile(64, 128, [&](int n_chunks, int bn_total){
+                constexpr int BM = 64, BN = 128, TM = 4, TN = 8, BK = 4;
+                dim3 grid(M / BM, n_chunks);
+                int threads = (BM/TM) * (BN/TN);
+                int sm_bytes = (BM + BN) * BK * sizeof(block_q8_0_aligned);
+                gemm_q8_0_q8_1_v2<BM, BN, TM, TN, BK><<<grid, threads, sm_bytes, stream>>>(
+                    weight, xp, op, M, bn_total, K);
+            });
+        } else if (v2_mode == 9) {
+            try_v2_tile(32, 128, [&](int n_chunks, int bn_total){
+                constexpr int BM = 32, BN = 128, TM = 2, TN = 8, BK = 4;
+                dim3 grid(M / BM, n_chunks);
+                int threads = (BM/TM) * (BN/TN);
+                int sm_bytes = (BM + BN) * BK * sizeof(block_q8_0_aligned);
+                gemm_q8_0_q8_1_v2<BM, BN, TM, TN, BK><<<grid, threads, sm_bytes, stream>>>(
+                    weight, xp, op, M, bn_total, K);
+            });
+        } else if (v2_mode == 10) {
+            try_v2_tile(16, 128, [&](int n_chunks, int bn_total){
+                constexpr int BM = 16, BN = 128, TM = 1, TN = 8, BK = 4;
+                dim3 grid(M / BM, n_chunks);
+                int threads = (BM/TM) * (BN/TN);
+                int sm_bytes = (BM + BN) * BK * sizeof(block_q8_0_aligned);
+                gemm_q8_0_q8_1_v2<BM, BN, TM, TN, BK><<<grid, threads, sm_bytes, stream>>>(
+                    weight, xp, op, M, bn_total, K);
+            });
+        }
 
         // True GEMM tile path. Two tile geometries:
         //   • BM=16, BN=32, BK_BLOCKS=4 — preferred when remaining ≥ 32.
@@ -705,13 +1316,69 @@ inline void quant_gemv_n2(void* weight, ggml_type type,
                           QuantInput* qi_a, QuantInput* qi_b,
                           cudaStream_t stream = 0) {
     int threads = (K >= 8192) ? 256 : 128;
+    static const bool legacy_n = getenv("LEGACY_GEMV_N") != nullptr;
     if (type == GGML_TYPE_Q8_0 && qi_a && qi_b) {
-        gemv_q8_0_q8_n2<<<N, threads, 0, stream>>>(
-            weight, qi_a->q8_buf, qi_b->q8_buf, out_a, out_b, K, N);
+        if (legacy_n) {
+            gemv_q8_0_q8_n2<<<N, threads, 0, stream>>>(
+                weight, qi_a->q8_buf, qi_b->q8_buf, out_a, out_b, K, N);
+        } else if (N % 8 == 0) {
+            gemv_q8_0_q8_tile_n2<8><<<N/8, threads, 0, stream>>>(
+                weight, qi_a->q8_buf, qi_b->q8_buf, out_a, out_b, K, N);
+        } else if (N % 4 == 0) {
+            gemv_q8_0_q8_tile_n2<4><<<N/4, threads, 0, stream>>>(
+                weight, qi_a->q8_buf, qi_b->q8_buf, out_a, out_b, K, N);
+        } else if (N % 2 == 0) {
+            gemv_q8_0_q8_tile_n2<2><<<N/2, threads, 0, stream>>>(
+                weight, qi_a->q8_buf, qi_b->q8_buf, out_a, out_b, K, N);
+        } else {
+            gemv_q8_0_q8_n2<<<N, threads, 0, stream>>>(
+                weight, qi_a->q8_buf, qi_b->q8_buf, out_a, out_b, K, N);
+        }
         return;
     }
     // Fallback: two sequential N=1 calls. Loses the shared-weight-load win
     // but stays correct for any quantization.
     quant_gemv(weight, type, in_a, out_a, K, N, qi_a, stream);
     quant_gemv(weight, type, in_b, out_b, K, N, qi_b, stream);
+}
+
+// N=3 batched dispatch — all three inputs pre-quantized. Used by MTP K=2
+// speculative decoding to verify (main_token, draft1, draft2) in a single
+// forward pass with weight-shared dp4a.
+inline void quant_gemv_n3(void* weight, ggml_type type,
+                          half* in_a, half* in_b, half* in_c,
+                          half* out_a, half* out_b, half* out_c,
+                          int K, int N,
+                          QuantInput* qi_a, QuantInput* qi_b, QuantInput* qi_c,
+                          cudaStream_t stream = 0) {
+    int threads = (K >= 8192) ? 256 : 128;
+    static const bool legacy_n = getenv("LEGACY_GEMV_N") != nullptr;
+    if (type == GGML_TYPE_Q8_0 && qi_a && qi_b && qi_c) {
+        if (legacy_n) {
+            gemv_q8_0_q8_n3<<<N, threads, 0, stream>>>(
+                weight, qi_a->q8_buf, qi_b->q8_buf, qi_c->q8_buf,
+                out_a, out_b, out_c, K, N);
+        } else if (N % 8 == 0) {
+            gemv_q8_0_q8_tile_n3<8><<<N/8, threads, 0, stream>>>(
+                weight, qi_a->q8_buf, qi_b->q8_buf, qi_c->q8_buf,
+                out_a, out_b, out_c, K, N);
+        } else if (N % 4 == 0) {
+            gemv_q8_0_q8_tile_n3<4><<<N/4, threads, 0, stream>>>(
+                weight, qi_a->q8_buf, qi_b->q8_buf, qi_c->q8_buf,
+                out_a, out_b, out_c, K, N);
+        } else if (N % 2 == 0) {
+            gemv_q8_0_q8_tile_n3<2><<<N/2, threads, 0, stream>>>(
+                weight, qi_a->q8_buf, qi_b->q8_buf, qi_c->q8_buf,
+                out_a, out_b, out_c, K, N);
+        } else {
+            gemv_q8_0_q8_n3<<<N, threads, 0, stream>>>(
+                weight, qi_a->q8_buf, qi_b->q8_buf, qi_c->q8_buf,
+                out_a, out_b, out_c, K, N);
+        }
+        return;
+    }
+    // Fallback: three sequential N=1 calls.
+    quant_gemv(weight, type, in_a, out_a, K, N, qi_a, stream);
+    quant_gemv(weight, type, in_b, out_b, K, N, qi_b, stream);
+    quant_gemv(weight, type, in_c, out_c, K, N, qi_c, stream);
 }

@@ -8,7 +8,17 @@
 #include "tokenizer.h"
 #include "sampling.h"
 #include "server.h"
+#include "vision.cuh"
 #include <cstdio>
+// Vision hooks (shared via global pointers — see main() wiring). When the CLI
+// is invoked with --mmproj + --image-raw, main() runs the ViT on GPU 0 and
+// populates g_vision_embeds with 576 fp16 rows of LLM-hidden dim. During
+// prefill, any token matching g_image_pad_id uses the next vision embedding
+// instead of the normal dequant_embd path.
+static half* g_vision_embeds = nullptr;
+static int g_vision_n_tokens = 0;
+static int g_vision_H = 0;
+static int g_image_pad_id = -1;
 #include <chrono>
 #include <vector>
 #include <algorithm>
@@ -401,6 +411,157 @@ int run_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, const SamplingPara
     std::vector<int> generated;
     int max_gen = sp.max_tokens > 0 ? sp.max_tokens : 4096;
 
+    // BENCH_PREFILL=1: chunked prefill microbench, baseline vs FLASH_ATTN.
+    // Runs the chunked pre-fill path twice (cold-loaded weights, stream 0)
+    // and prints per-phase timers. Uses the same generate_impl plumbing so
+    // forward_attn_chunk / _mlp_chunk / _gdn_chunk take effect. Exits after.
+    if (const char* be = getenv("BENCH_PREFILL"); be && be[0] == '1') {
+        constexpr int CHUNK = QwenModel::CHUNK_SIZE;
+        int prompt_len_local  = (int)prompt_ids.size();
+        // Include ALL prompt tokens in prefill so the final hidden = last
+        // prompt token's hidden, usable for next-token argmax correctness.
+        int prefill_len_local = prompt_len_local;
+        float* gpu_hidden_chunk[4] = {};
+        for (int g = 0; g < n_gpus; g++) {
+            cudaSetDevice(g);
+            cudaMalloc(&gpu_hidden_chunk[g], (size_t)CHUNK * H * sizeof(float));
+        }
+        float* host_chunk_transfer;
+        cudaMallocHost(&host_chunk_transfer, (size_t)CHUNK * H * sizeof(float));
+
+        auto run_prefill = [&](const char* label, bool use_fa) -> int {
+            g_profile_attn  = true;
+            g_use_flash_attn = use_fa;
+            g_attn_score_ms = g_attn_softmax_ms = g_attn_value_ms = g_attn_fused_ms = 0.0;
+            model.reset_all_states();
+
+            double t_embed=0, t_xfer=0, t_attn=0, t_gdn=0, t_mlp=0;
+            auto prof_now = [](){ return std::chrono::high_resolution_clock::now(); };
+            auto sync_ms = [&](std::chrono::high_resolution_clock::time_point tb, int dev){
+                cudaSetDevice(dev); cudaDeviceSynchronize();
+                auto te = std::chrono::high_resolution_clock::now();
+                return std::chrono::duration<double, std::milli>(te - tb).count();
+            };
+            int chunk_pos = 0;
+            float* last_final_h = nullptr;
+            int    last_chunk_n = 0;
+            while (chunk_pos < prefill_len_local) {
+                int chunk_n = std::min(CHUNK, prefill_len_local - chunk_pos);
+                cudaSetDevice(0);
+                auto te0 = prof_now();
+                for (int t = 0; t < chunk_n; t++) {
+                    int token_id = prompt_ids[chunk_pos + t];
+                    if (embd_t->type == GGML_TYPE_Q8_0)
+                        dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+                    else if (embd_t->type == GGML_TYPE_Q5_K)
+                        dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+                    else if (embd_t->type == GGML_TYPE_Q6_K)
+                        dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+                    half_to_float_kernel<<<(H+255)/256, 256>>>(
+                        gpu_hidden_half[0], gpu_hidden_chunk[0] + (size_t)t * H, H);
+                }
+                t_embed += sync_ms(te0, 0);
+
+                float* h_chunk = gpu_hidden_chunk[0];
+                for (int layer = 0; layer < model.cfg.num_layers; layer++) {
+                    int g = gpu_model.layer_gpu[layer];
+                    int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
+                    if (g != prev_g) {
+                        auto tx0 = prof_now();
+                        cudaSetDevice(prev_g);
+                        cudaMemcpy(host_chunk_transfer, h_chunk,
+                                   (size_t)chunk_n * H * sizeof(float), cudaMemcpyDeviceToHost);
+                        cudaSetDevice(g);
+                        cudaMemcpy(gpu_hidden_chunk[g], host_chunk_transfer,
+                                   (size_t)chunk_n * H * sizeof(float), cudaMemcpyHostToDevice);
+                        h_chunk = gpu_hidden_chunk[g];
+                        t_xfer += sync_ms(tx0, g);
+                    } else {
+                        cudaSetDevice(g);
+                    }
+                    auto ta0 = prof_now();
+                    bool is_attn = model.is_attn_layer(layer);
+                    if (is_attn) model.forward_attn_chunk(layer, h_chunk, chunk_pos, chunk_n, 0);
+                    else         model.forward_gdn_chunk (layer, h_chunk, chunk_n, 0);
+                    double ms_al = sync_ms(ta0, g);
+                    if (is_attn) t_attn += ms_al; else t_gdn += ms_al;
+
+                    auto tm0 = prof_now();
+                    model.forward_mlp_chunk(layer, h_chunk, chunk_n, 0);
+                    t_mlp += sync_ms(tm0, g);
+                }
+                cudaSetDevice(last_gpu); cudaDeviceSynchronize();
+                last_final_h = h_chunk;
+                last_chunk_n = chunk_n;
+                chunk_pos += chunk_n;
+            }
+            double total = t_embed + t_xfer + t_attn + t_gdn + t_mlp;
+            printf("[%s] prompt=%d total=%.1fms (%.1f t/s) "
+                   "embed=%.1f xfer=%.1f attn=%.1f gdn=%.1f mlp=%.1f\n",
+                   label, prefill_len_local, total, prefill_len_local * 1000.0 / total,
+                   t_embed, t_xfer, t_attn, t_gdn, t_mlp);
+            double sub = g_attn_score_ms + g_attn_softmax_ms + g_attn_value_ms;
+            printf("[%s ATTN] score=%.1f softmax=%.1f value=%.1f (sub=%.1f) fused=%.1f\n",
+                   label, g_attn_score_ms, g_attn_softmax_ms, g_attn_value_ms,
+                   sub, g_attn_fused_ms);
+            // Correctness probe: sample first 8 floats + next-token argmax.
+            int argmax_tok = -1;
+            if (last_final_h && last_chunk_n > 0) {
+                cudaSetDevice(last_gpu);
+                std::vector<float> hs(8);
+                cudaMemcpy(hs.data(),
+                           last_final_h + (size_t)(last_chunk_n - 1) * H,
+                           8 * sizeof(float), cudaMemcpyDeviceToHost);
+                printf("[%s HSAMPLE] %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
+                       label, hs[0], hs[1], hs[2], hs[3], hs[4], hs[5], hs[6], hs[7]);
+
+                float_to_half_kernel<<<(H+255)/256, 256>>>(
+                    last_final_h + (size_t)(last_chunk_n - 1) * H,
+                    gpu_hidden_half[last_gpu], H);
+                if (out_norm_t->type == GGML_TYPE_F32)
+                    rms_norm_f32w(norm_buf, gpu_hidden_half[last_gpu],
+                                  (float*)out_norm_t->data, 1, H,
+                                  model.cfg.rms_norm_eps);
+                else
+                    rms_norm(norm_buf, gpu_hidden_half[last_gpu],
+                             (half*)out_norm_t->data, 1, H,
+                             model.cfg.rms_norm_eps);
+                qi_logits.quantize(norm_buf, H, 0);
+                quant_gemv(out_w->data, out_w->type, norm_buf, logits_buf,
+                           H, V, &qi_logits);
+                int* d_am; cudaMalloc(&d_am, sizeof(int));
+                argmax_half_kernel<<<1, 1024>>>(logits_buf, V, d_am);
+                cudaDeviceSynchronize();
+                cudaMemcpy(&argmax_tok, d_am, sizeof(int), cudaMemcpyDeviceToHost);
+                cudaFree(d_am);
+                printf("[%s ARGMAX] next_tok=%d\n", label, argmax_tok);
+            }
+            fflush(stdout);
+            return argmax_tok;
+        };
+        int base_tok = run_prefill("BASELINE", false);
+        for (int g = 0; g < n_gpus; g++) {
+            cudaSetDevice(g); cudaDeviceSynchronize();
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess)
+                printf("[post-BASELINE gpu %d] %s\n", g, cudaGetErrorString(err));
+        }
+        int fa_tok   = run_prefill("FLASH_ATTN", true);
+        for (int g = 0; g < n_gpus; g++) {
+            cudaSetDevice(g); cudaDeviceSynchronize();
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess)
+                printf("[post-FA gpu %d] %s\n", g, cudaGetErrorString(err));
+        }
+        printf("[CORRECTNESS] %s  (baseline=%d  flash_attn=%d)\n",
+               (base_tok == fa_tok) ? "MATCH" : "MISMATCH",
+               base_tok, fa_tok);
+        fflush(stdout);
+        for (int g = 0; g < n_gpus; g++) { cudaSetDevice(g); cudaFree(gpu_hidden_chunk[g]); }
+        cudaFreeHost(host_chunk_transfer);
+        return 0;
+    }
+
     printf("\n=== Qwen Generation (%zu prompt tokens) ===\n", prompt_ids.size());
     auto total_start = std::chrono::high_resolution_clock::now();
 
@@ -534,8 +695,12 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     // GPU argmax fast path: when temp=0 and rep_penalty=1.0 we can pick the
     // winning token entirely on-device and only transfer 4 bytes back over
     // the slow PCIe 1.0 x1 bus instead of V*2 bytes (~500 KB).
-    int*  d_argmax;       cudaMalloc(&d_argmax, sizeof(int));
-    int*  h_argmax_pinned; cudaMallocHost(&h_argmax_pinned, sizeof(int));
+    // [0] = top-1 (standard argmax). [1] = top-2 (only populated when
+    // MTP_ACCEPT_TOP2=1 and argmax_top2_half_kernel is used). Allocating
+    // 2 slots unconditionally is cheap and lets the env flag flip behavior
+    // without re-allocating.
+    int*  d_argmax;       cudaMalloc(&d_argmax, 2 * sizeof(int));
+    int*  h_argmax_pinned; cudaMallocHost(&h_argmax_pinned, 2 * sizeof(int));
 
     // Speculative decoding (MTP_SPEC=1) buffers — declared here, allocated
     // below after mtp.load() reports success.
@@ -548,6 +713,20 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     int*   h_argmax_pinned_b = nullptr;
     float* host_transfer_b = nullptr;
     QuantInput qi_logits_b;
+    // MTP K=2 third-stream buffers — allocated only when MTP_K2 is enabled.
+    bool spec_k2_enabled = false;
+    float* gpu_hidden_c[4]   = {nullptr,nullptr,nullptr,nullptr};
+    half*  gpu_hidden_half_c[4] = {nullptr,nullptr,nullptr,nullptr};
+    half*  norm_buf_c   = nullptr;
+    half*  logits_buf_c = nullptr;
+    int*   d_argmax_c   = nullptr;
+    int*   h_argmax_pinned_c = nullptr;
+    float* host_transfer_c = nullptr;
+    QuantInput qi_logits_c;
+    half*  h_final_draft1 = nullptr;   // MTP's post-final-norm hidden after draft1
+    long long spec_k2_accept_ab_count = 0;  // both drafts accepted
+    long long spec_k2_accept_a_count  = 0;  // only draft1 accepted
+    long long spec_k2_reject_count    = 0;  // draft1 rejected
 
     // ── MTP head (Phase 0: forward + accept rate measurement) ─────────────
     // Loaded only if /home/paru/mtp_work/mtp_head.bin exists.
@@ -592,6 +771,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     // automatically when spec_enabled is true to avoid running MTP twice
     // per iter — the spec branch already runs its own draft MTP.
     spec_enabled = (mtp_loaded && getenv("MTP_SPEC_OFF") == nullptr);
+    spec_k2_enabled = (spec_enabled && getenv("MTP_K2") != nullptr);
     if (spec_enabled) {
         for (int g = 0; g < n_gpus; g++) {
             cudaSetDevice(g);
@@ -601,12 +781,29 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         cudaSetDevice(last_gpu);
         cudaMalloc(&norm_buf_b,   H * sizeof(half));
         cudaMalloc(&logits_buf_b, V * sizeof(half));
-        cudaMalloc(&d_argmax_b,   sizeof(int));
-        cudaMallocHost(&h_argmax_pinned_b, sizeof(int));
+        cudaMalloc(&d_argmax_b,   2 * sizeof(int));
+        cudaMallocHost(&h_argmax_pinned_b, 2 * sizeof(int));
         cudaMallocHost(&host_transfer_b, H * sizeof(float));
         model.alloc_buffers_n2(max_seq);
         model.alloc_gdn_snapshots();
         printf("[SPEC] speculative decoding enabled (MTP K=1, MLP batched)\n");
+    }
+    if (spec_k2_enabled) {
+        for (int g = 0; g < n_gpus; g++) {
+            cudaSetDevice(g);
+            cudaMalloc(&gpu_hidden_c[g], H * sizeof(float));
+            cudaMalloc(&gpu_hidden_half_c[g], H * sizeof(half));
+        }
+        cudaSetDevice(last_gpu);
+        cudaMalloc(&norm_buf_c,   H * sizeof(half));
+        cudaMalloc(&logits_buf_c, V * sizeof(half));
+        cudaMalloc(&d_argmax_c,   2 * sizeof(int));
+        cudaMallocHost(&h_argmax_pinned_c, 2 * sizeof(int));
+        cudaMallocHost(&host_transfer_c, H * sizeof(float));
+        cudaMalloc(&h_final_draft1, H * sizeof(half));
+        model.alloc_buffers_n3(max_seq);
+        model.alloc_gdn_snapshots_b();
+        printf("[SPEC-K2] MTP K=2 speculative decoding enabled (self-chained draft, N=3 batched verify)\n");
     }
     long long mtp_accept_count = 0;
     long long mtp_total_count  = 0;
@@ -654,22 +851,78 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         int prompt_len = (int)prompt_ids.size();
         int prefill_len = prompt_len > 1 ? prompt_len - 1 : 0;
         int chunk_pos = 0;
+        // PROFILE_PREFILL=1 env gates per-phase sync+timer. Adds sync overhead
+        // so keep OFF for production. Phase totals printed at prefill end.
+        const char* prof_env = getenv("PROFILE_PREFILL");
+        const bool do_prof = prof_env && prof_env[0] == '1';
+        const char* prof_attn_env = getenv("PROFILE_ATTN");
+        g_profile_attn = prof_attn_env && prof_attn_env[0] == '1';
+        // FlashAttention fused score+softmax+value is now default ON for the
+        // 27B shape (head_dim=256, num_kv=4, num_q=24). ~1.8× prefill speedup
+        // vs strict block-per-score, code-value accurate (Korean Rust
+        // Singleton `value: 42` preserved). Set FLASH_ATTN=0 to force off.
+        const char* fa_env = getenv("FLASH_ATTN");
+        g_use_flash_attn = (fa_env == nullptr) ? true : (fa_env[0] == '1');
+        g_attn_score_ms = g_attn_softmax_ms = g_attn_value_ms
+                       = g_attn_fused_ms  = g_attn_other_ms = 0.0;
+        double t_embed = 0, t_xfer = 0, t_attn = 0, t_gdn = 0, t_mlp = 0;
+        auto prof_now = [](){ return std::chrono::high_resolution_clock::now(); };
+        auto prof_sync_ms = [&](std::chrono::high_resolution_clock::time_point t_beg, int dev) {
+            cudaSetDevice(dev); cudaDeviceSynchronize();
+            auto t_end = std::chrono::high_resolution_clock::now();
+            return std::chrono::duration<double, std::milli>(t_end - t_beg).count();
+        };
+        // PROFILE_GEN=1 drives the same sync+timer machinery for the per-token
+        // loop. Separate totals for gen so prefill numbers stay clean. The
+        // breakdown covers embed / xfer / attn / gdn / mlp / logits / mtp so
+        // we can see which step is the next target.
+        const char* gen_prof_env = getenv("PROFILE_GEN");
+        const bool do_gen_prof = gen_prof_env && gen_prof_env[0] == '1';
+        double g_embed = 0, g_xfer = 0, g_attn = 0, g_gdn = 0, g_mlp = 0,
+               g_logits = 0, g_mtp = 0, g_other = 0;
+        int g_steps = 0, g_spec_iters = 0;
+        // DISABLE_CHUNKED_PREFILL=1 : chunked path 우회. per-token loop 가
+        // 처음부터 prompt 전체를 처리 (batch=1, state update 명시적 누적).
+        // 9B 에서 chunked GDN 의 fp16 누적 오차가 언어 classification 을
+        // 넘겨버리는지 확인용. 맞으면 chunked kernel 수정 타깃.
+        static const bool skip_chunked = getenv("DISABLE_CHUNKED_PREFILL") != nullptr;
+        if (skip_chunked) prefill_len = 0;
         while (chunk_pos < prefill_len) {
             int chunk_n = std::min(CHUNK_SIZE, prefill_len - chunk_pos);
 
             // 1. Embed all chunk tokens to gpu_hidden_chunk[0] (fp32)
             cudaSetDevice(0);
+            auto te0 = prof_now();
             for (int t = 0; t < chunk_n; t++) {
                 int token_id = prompt_ids[chunk_pos + t];
-                if (embd_t->type == GGML_TYPE_Q8_0)
-                    dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
-                else if (embd_t->type == GGML_TYPE_Q5_K)
-                    dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
-                else if (embd_t->type == GGML_TYPE_Q6_K)
-                    dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+                // Vision override: substitute the pre-computed ViT embedding
+                // for each <|image_pad|> token, in order of appearance. Falls
+                // through to the normal dequant path when the token is not
+                // an image placeholder or when vision is disabled.
+                bool vision_hit = false;
+                if (g_vision_embeds && g_image_pad_id >= 0 && token_id == g_image_pad_id) {
+                    static int s_vision_idx = 0;
+                    if (s_vision_idx < g_vision_n_tokens && H == g_vision_H) {
+                        cudaMemcpyAsync(gpu_hidden_half[0],
+                                        g_vision_embeds + (size_t)s_vision_idx * H,
+                                        (size_t)H * sizeof(half),
+                                        cudaMemcpyDeviceToDevice);
+                        s_vision_idx++;
+                        vision_hit = true;
+                    }
+                }
+                if (!vision_hit) {
+                    if (embd_t->type == GGML_TYPE_Q8_0)
+                        dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+                    else if (embd_t->type == GGML_TYPE_Q5_K)
+                        dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+                    else if (embd_t->type == GGML_TYPE_Q6_K)
+                        dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+                }
                 half_to_float_kernel<<<(H+255)/256, 256>>>(
                     gpu_hidden_half[0], gpu_hidden_chunk[0] + (size_t)t * H, H);
             }
+            if (do_prof) t_embed += prof_sync_ms(te0, 0);
 
             // 2. Process chunk through all layers (transfer between GPUs as needed)
             float* h_chunk = gpu_hidden_chunk[0];
@@ -677,33 +930,132 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 int g = gpu_model.layer_gpu[layer];
                 int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
                 if (g != prev_g) {
+                    auto tx0 = prof_now();
                     cudaSetDevice(prev_g);
                     cudaMemcpy(host_chunk_transfer, h_chunk, (size_t)chunk_n * H * sizeof(float), cudaMemcpyDeviceToHost);
                     cudaSetDevice(g);
                     cudaMemcpy(gpu_hidden_chunk[g], host_chunk_transfer, (size_t)chunk_n * H * sizeof(float), cudaMemcpyHostToDevice);
                     h_chunk = gpu_hidden_chunk[g];
+                    if (do_prof) t_xfer += prof_sync_ms(tx0, g);
                 } else { cudaSetDevice(g); }
 
-                if (model.is_attn_layer(layer))
-                    model.forward_attn_chunk(layer, h_chunk, chunk_pos, chunk_n, 0);
-                else
-                    model.forward_gdn_chunk(layer, h_chunk, chunk_n, 0);
-                model.forward_mlp_chunk(layer, h_chunk, chunk_n, 0);
+                auto ta0 = prof_now();
+                bool is_attn = model.is_attn_layer(layer);
+                // DEBUG envs for bit-exact bisect. Each env forces the chunked
+                // control flow to call the per-token forward_* in a loop over
+                // n_tokens instead of the batched chunked kernel. Combine with
+                // DUMP_LAYERS=1 to diff against DISABLE_CHUNKED_PREFILL=1 path.
+                static const bool force_pt_gdn  = getenv("CHUNK_FORCE_PT_GDN")  != nullptr;
+                // ATTN chunked kernels: the score kernel now has a strict
+                // variant (`attn_score_kernel_h_chunk_strict`, block-per-score
+                // with per-token reduction tree) enabled by default. It's
+                // argmax-stable with the per-token path, so per-token fallback
+                // is no longer needed for correctness. CHUNK_FORCE_PT_ATTN=1
+                // still forces per-token (debug/bisect). CHUNK_ATTN_FAST=1
+                // swaps back to the old warp-per-score kernel (fastest but
+                // ~1% argmax drift on Korean).
+                static const bool force_pt_attn = getenv("CHUNK_FORCE_PT_ATTN") != nullptr;
+                static const bool force_pt_mlp  = getenv("CHUNK_FORCE_PT_MLP")  != nullptr;
+                if (is_attn) {
+                    if (force_pt_attn) {
+                        for (int tt = 0; tt < chunk_n; tt++) {
+                            float* h_t = h_chunk + (size_t)tt * H;
+                            model.forward_attn(layer, h_t, chunk_pos + tt, 0);
+                        }
+                    } else {
+                        model.forward_attn_chunk(layer, h_chunk, chunk_pos, chunk_n, 0);
+                    }
+                } else {
+                    if (force_pt_gdn) {
+                        for (int tt = 0; tt < chunk_n; tt++) {
+                            float* h_t = h_chunk + (size_t)tt * H;
+                            model.forward_gdn(layer, h_t, 0);
+                        }
+                    } else {
+                        model.forward_gdn_chunk(layer, h_chunk, chunk_n, 0);
+                    }
+                }
+                if (do_prof) {
+                    double ms = prof_sync_ms(ta0, g);
+                    if (is_attn) t_attn += ms; else t_gdn += ms;
+                }
+
+                auto tm0 = prof_now();
+                if (force_pt_mlp) {
+                    for (int tt = 0; tt < chunk_n; tt++) {
+                        float* h_t = h_chunk + (size_t)tt * H;
+                        model.forward_mlp(layer, h_t, 0);
+                    }
+                } else {
+                    model.forward_mlp_chunk(layer, h_chunk, chunk_n, 0);
+                }
+                if (do_prof) t_mlp += prof_sync_ms(tm0, g);
+                // DUMP_LAYERS=1: chunked prefill 경로에서도 마지막 prompt
+                // token 의 layer output hidden 처음 8 float 를 덤프한다.
+                // per-token 경로 (DISABLE_CHUNKED_PREFILL=1) 와 같은 포맷
+                // "[L%02d gdn/attn] ..." 로 찍어 diff 로 drift 레이어 bisect.
+                static const bool dump_layers_chunk = getenv("DUMP_LAYERS") != nullptr;
+                if (dump_layers_chunk && chunk_pos + chunk_n == prefill_len) {
+                    cudaSetDevice(g); cudaDeviceSynchronize();
+                    float sample[8];
+                    float* last_h = h_chunk + (size_t)(chunk_n - 1) * H;
+                    cudaMemcpy(sample, last_h, 8 * sizeof(float), cudaMemcpyDeviceToHost);
+                    fprintf(stderr, "[L%02d %s] %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f\n",
+                            layer, is_attn ? "attn" : "gdn ",
+                            sample[0], sample[1], sample[2], sample[3],
+                            sample[4], sample[5], sample[6], sample[7]);
+                    fflush(stderr);
+                }
             }
             cudaSetDevice(last_gpu); cudaDeviceSynchronize();
 
             chunk_pos += chunk_n;
+        }
+        if (do_prof) {
+            double total = t_embed + t_xfer + t_attn + t_gdn + t_mlp;
+            printf("[PREFILL PROF] prompt=%d tok  total=%.1fms  embed=%.1f(%.0f%%) xfer=%.1f(%.0f%%) attn=%.1f(%.0f%%) gdn=%.1f(%.0f%%) mlp=%.1f(%.0f%%)\n",
+                   prefill_len, total,
+                   t_embed, 100.0*t_embed/total, t_xfer, 100.0*t_xfer/total,
+                   t_attn, 100.0*t_attn/total, t_gdn, 100.0*t_gdn/total,
+                   t_mlp, 100.0*t_mlp/total);
+            fflush(stdout);
+        }
+        if (g_profile_attn) {
+            double sub = g_attn_score_ms + g_attn_softmax_ms + g_attn_value_ms;
+            printf("[ATTN PROF]  score=%.1fms(%.0f%%) softmax=%.1fms(%.0f%%) value=%.1fms(%.0f%%)  sub_sum=%.1fms  fused=%.1fms\n",
+                   g_attn_score_ms, sub > 0 ? 100.0*g_attn_score_ms/sub : 0,
+                   g_attn_softmax_ms, sub > 0 ? 100.0*g_attn_softmax_ms/sub : 0,
+                   g_attn_value_ms, sub > 0 ? 100.0*g_attn_value_ms/sub : 0,
+                   sub, g_attn_fused_ms);
+            fflush(stdout);
         }
 
         // ============ Phase 2: per-token loop (handles last prompt token + generation) ============
         // The +4096 used to be a "think buffer" so reasoning chains
         // weren't counted against max_gen, but for unlimited responses
         // we just cap at the actual KV context capacity instead.
+        //
+        // emit_tok: single-source-of-truth for "append a token to the
+        // client-visible stream". Stop markers (<|im_end|>, <|endoftext|>,
+        // <|im_start|>) are *not* emitted — we just signal stop by returning
+        // true so the outer loop breaks before the marker reaches the
+        // transcript. Also handles the <think>/</think> bookkeeping and
+        // max_gen cap.
+        auto emit_tok = [&](int tok) -> bool {
+            if (tok == 248046 || tok == 248044 || tok == 248045) return true;
+            generated.push_back(tok);
+            if (on_token) on_token(tok);
+            if (tok == 248068) in_think = true;
+            if (tok == 248069) in_think = false;
+            if (!in_think) output_tokens++;
+            return output_tokens >= max_gen;
+        };
         int step_cap = std::min((int)prompt_ids.size() + max_gen + 4096, max_seq);
         for (int step = prefill_len; step < step_cap; step++) {
             int token_id = step < (int)prompt_ids.size() ? prompt_ids[step] : generated.back();
 
             cudaSetDevice(0);
+            auto ge0 = prof_now();
             // Dequant embedding into fp16 scratch, then convert to fp32 hidden
             if (embd_t->type == GGML_TYPE_Q8_0)
                 dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
@@ -712,27 +1064,66 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
             else if (embd_t->type == GGML_TYPE_Q6_K)
                 dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
             half_to_float_kernel<<<(H+255)/256, 256>>>(gpu_hidden_half[0], gpu_hidden[0], H);
+            if (do_gen_prof) g_embed += prof_sync_ms(ge0, 0);
+
+            {
+                static const bool dump_emb = getenv("DUMP_LAYERS") != nullptr;
+                if (dump_emb && step == (int)prompt_ids.size() - 1) {
+                    cudaDeviceSynchronize();
+                    float sample[8];
+                    cudaMemcpy(sample, gpu_hidden[0], 8 * sizeof(float), cudaMemcpyDeviceToHost);
+                    fprintf(stderr, "[EMB tok=%d] %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f\n",
+                            token_id, sample[0], sample[1], sample[2], sample[3],
+                            sample[4], sample[5], sample[6], sample[7]);
+                    fflush(stderr);
+                }
+            }
 
             float* h = gpu_hidden[0];
             for (int layer = 0; layer < model.cfg.num_layers; layer++) {
                 int g = gpu_model.layer_gpu[layer];
                 int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
                 if (g != prev_g) {
+                    auto gx0 = prof_now();
                     cudaSetDevice(prev_g);
                     cudaMemcpy(host_transfer, h, H * sizeof(float), cudaMemcpyDeviceToHost);
                     cudaSetDevice(g);
                     cudaMemcpy(gpu_hidden[g], host_transfer, H * sizeof(float), cudaMemcpyHostToDevice);
                     h = gpu_hidden[g];
+                    if (do_gen_prof) g_xfer += prof_sync_ms(gx0, g);
                 } else { cudaSetDevice(g); }
-                if (model.is_attn_layer(layer))
+                auto ga0 = prof_now();
+                bool is_attn = model.is_attn_layer(layer);
+                if (is_attn)
                     model.forward_attn(layer, h, step, 0);
                 else
                     model.forward_gdn(layer, h, 0);
+                if (do_gen_prof) {
+                    double ms = prof_sync_ms(ga0, g);
+                    if (is_attn) g_attn += ms; else g_gdn += ms;
+                }
+                auto gm0 = prof_now();
                 model.forward_mlp(layer, h, 0);
+                if (do_gen_prof) g_mlp += prof_sync_ms(gm0, g);
+                // DUMP_LAYERS=1: 각 layer 후 hidden state 처음 8 floats 출력.
+                // 마지막 prompt token (= prefill 직후 첫 per-token step) 에서만
+                // 찍어서 llama.cpp eval-callback 출력과 layer-wise 비교 가능.
+                static const bool dump_layers = getenv("DUMP_LAYERS") != nullptr;
+                if (dump_layers && step == (int)prompt_ids.size() - 1) {
+                    cudaSetDevice(g); cudaDeviceSynchronize();
+                    float sample[8];
+                    cudaMemcpy(sample, h, 8 * sizeof(float), cudaMemcpyDeviceToHost);
+                    fprintf(stderr, "[L%02d %s] %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f\n",
+                            layer, is_attn ? "attn" : "gdn ",
+                            sample[0], sample[1], sample[2], sample[3],
+                            sample[4], sample[5], sample[6], sample[7]);
+                    fflush(stderr);
+                }
             }
 
             if (step >= (int)prompt_ids.size() - 1) {
                 cudaSetDevice(last_gpu); cudaDeviceSynchronize();
+                auto gl0 = prof_now();
                 // Convert fp32 hidden to fp16 for output norm + projection
                 float_to_half_kernel<<<(H+255)/256, 256>>>(h, gpu_hidden_half[last_gpu], H);
                 if (out_norm_t->type == GGML_TYPE_F32)
@@ -741,6 +1132,8 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     rms_norm(norm_buf, gpu_hidden_half[last_gpu], (half*)out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
                 qi_logits.quantize(norm_buf, H, 0);
                 quant_gemv(out_w->data, out_w->type, norm_buf, logits_buf, H, V, &qi_logits);
+                if (do_gen_prof) g_logits += prof_sync_ms(gl0, last_gpu);
+                if (do_gen_prof) g_steps++;
 
                 std::vector<int> ctx = prompt_ids;
                 ctx.insert(ctx.end(), generated.begin(), generated.end());
@@ -813,6 +1206,10 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
 
                 if (step >= (int)prompt_ids.size()) {
                     if (!got_first_tok) { t_first = std::chrono::high_resolution_clock::now(); got_first_tok = true; }
+                    // Stop tokens are NOT emitted to the client: check before
+                    // push/stream so the final response text doesn't include
+                    // raw `<|im_end|>` / `<|endoftext|>` markers.
+                    if (max_idx == 248046 || max_idx == 248044 || max_idx == 248045) break;
                     generated.push_back(max_idx);
                     if (on_token) on_token(max_idx);
 
@@ -821,8 +1218,6 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     if (max_idx == 248069) in_think = false;  // </think>
                     if (!in_think) output_tokens++;
 
-                    // Stop conditions
-                    if (max_idx == 248046 || max_idx == 248044 || max_idx == 248045) break;
                     if (output_tokens >= max_gen) break;  // max_tokens only counts non-think output
                     // Stop on tool call end tags
                     if (generated.size() >= 4) {
@@ -830,18 +1225,183 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         if (tail.find("</tool_call>") != std::string::npos) break;
                     }
 
-                    // ===================== MTP_SPEC speculative decoding =====================
-                    // After main has produced max_idx (= t_{step+1}) and we hold h[step] in
-                    // norm_buf, draft t_{step+2} via MTP, then run a batched main forward at
-                    // [step+1, step+2] with inputs [max_idx, mtp_draft] using the N=2 batched
-                    // MLP path. Accept the draft if main's verify (logit at step+1) matches.
-                    if (spec_enabled) {
+                    // ===================== MTP K=2 speculative decoding =====================
+                    // After main produced max_idx (= t_{step+1}) and we hold h[step] in norm_buf,
+                    // draft two tokens by self-chaining the MTP head (draft1 from h_main, draft2
+                    // from h_final_draft1). Then run a three-stream N=3 batched forward at
+                    // positions [step+1, step+2, step+3] with inputs [max_idx, draft1, draft2].
+                    // Accept logic:
+                    //   verify_a == draft1 && verify_b == draft2 → accept both, provisional verify_c
+                    //   verify_a == draft1                       → accept draft1 only
+                    //   else                                      → reject both
+                    if (spec_k2_enabled) {
+                        auto sd0 = prof_now();
+                        // 1. Self-chain draft: MTP(norm_buf, max_idx, step+1) → draft1, h_final_draft1
+                        //    Then MTP(h_final_draft1, draft1, step+2) → draft2.
+                        int draft1 = mtp.forward_with_state(norm_buf, max_idx, step + 1, h_final_draft1);
+                        int draft2 = mtp.forward(h_final_draft1, draft1, step + 2);
+                        cudaSetDevice(last_gpu);
+                        if (do_gen_prof) g_mtp += prof_sync_ms(sd0, last_gpu);
+
+                        // 2. Embed all three tokens onto GPU 0
+                        cudaSetDevice(0);
+                        auto se0 = prof_now();
+                        if (embd_t->type == GGML_TYPE_Q8_0) {
+                            dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0],   max_idx, H);
+                            dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half_b[0], draft1,  H);
+                            dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half_c[0], draft2,  H);
+                        } else if (embd_t->type == GGML_TYPE_Q5_K) {
+                            dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0],   max_idx, H);
+                            dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half_b[0], draft1,  H);
+                            dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half_c[0], draft2,  H);
+                        } else if (embd_t->type == GGML_TYPE_Q6_K) {
+                            dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0],   max_idx, H);
+                            dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half_b[0], draft1,  H);
+                            dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half_c[0], draft2,  H);
+                        }
+                        half_to_float_kernel<<<(H+255)/256, 256>>>(gpu_hidden_half[0],   gpu_hidden[0],   H);
+                        half_to_float_kernel<<<(H+255)/256, 256>>>(gpu_hidden_half_b[0], gpu_hidden_b[0], H);
+                        half_to_float_kernel<<<(H+255)/256, 256>>>(gpu_hidden_half_c[0], gpu_hidden_c[0], H);
+                        if (do_gen_prof) g_embed += prof_sync_ms(se0, 0);
+
+                        // 3. N=3 batched forward across all 64 layers
+                        float* h_a = gpu_hidden[0];
+                        float* h_b = gpu_hidden_b[0];
+                        float* h_c = gpu_hidden_c[0];
+                        for (int layer = 0; layer < model.cfg.num_layers; layer++) {
+                            int g_l = gpu_model.layer_gpu[layer];
+                            int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
+                            if (g_l != prev_g) {
+                                auto sx0 = prof_now();
+                                cudaSetDevice(prev_g);
+                                cudaMemcpy(host_transfer,   h_a, H * sizeof(float), cudaMemcpyDeviceToHost);
+                                cudaMemcpy(host_transfer_b, h_b, H * sizeof(float), cudaMemcpyDeviceToHost);
+                                cudaMemcpy(host_transfer_c, h_c, H * sizeof(float), cudaMemcpyDeviceToHost);
+                                cudaSetDevice(g_l);
+                                cudaMemcpy(gpu_hidden[g_l],   host_transfer,   H * sizeof(float), cudaMemcpyHostToDevice);
+                                cudaMemcpy(gpu_hidden_b[g_l], host_transfer_b, H * sizeof(float), cudaMemcpyHostToDevice);
+                                cudaMemcpy(gpu_hidden_c[g_l], host_transfer_c, H * sizeof(float), cudaMemcpyHostToDevice);
+                                h_a = gpu_hidden[g_l];
+                                h_b = gpu_hidden_b[g_l];
+                                h_c = gpu_hidden_c[g_l];
+                                if (do_gen_prof) g_xfer += prof_sync_ms(sx0, g_l);
+                            } else {
+                                cudaSetDevice(g_l);
+                            }
+                            auto sa0 = prof_now();
+                            bool is_attn_s = model.is_attn_layer(layer);
+                            if (is_attn_s)
+                                model.forward_attn_n3(layer, h_a, h_b, h_c, step + 1, step + 2, step + 3, 0);
+                            else
+                                model.forward_gdn_n3(layer, h_a, h_b, h_c, 0);
+                            if (do_gen_prof) {
+                                double ms = prof_sync_ms(sa0, g_l);
+                                if (is_attn_s) g_attn += ms; else g_gdn += ms;
+                            }
+                            auto sm0 = prof_now();
+                            model.forward_mlp_n3(layer, h_a, h_b, h_c, 0);
+                            if (do_gen_prof) g_mlp += prof_sync_ms(sm0, g_l);
+                        }
+
+                        // 4. Output norm + lm_head for all three via n3 helpers
+                        cudaSetDevice(last_gpu);
+                        cudaDeviceSynchronize();
+                        auto sl0 = prof_now();
+                        float_to_half_kernel<<<(H+255)/256, 256>>>(h_a, gpu_hidden_half[last_gpu],   H);
+                        float_to_half_kernel<<<(H+255)/256, 256>>>(h_b, gpu_hidden_half_b[last_gpu], H);
+                        float_to_half_kernel<<<(H+255)/256, 256>>>(h_c, gpu_hidden_half_c[last_gpu], H);
+                        if (out_norm_t->type == GGML_TYPE_F32) {
+                            rms_norm_f32w_n3(norm_buf, norm_buf_b, norm_buf_c,
+                                             gpu_hidden_half[last_gpu], gpu_hidden_half_b[last_gpu], gpu_hidden_half_c[last_gpu],
+                                             (float*)out_norm_t->data, H, model.cfg.rms_norm_eps, 0);
+                        } else {
+                            rms_norm_n3(norm_buf, norm_buf_b, norm_buf_c,
+                                        gpu_hidden_half[last_gpu], gpu_hidden_half_b[last_gpu], gpu_hidden_half_c[last_gpu],
+                                        (half*)out_norm_t->data, H, model.cfg.rms_norm_eps, 0);
+                        }
+                        qi_logits.quantize(norm_buf,     H, 0);
+                        qi_logits_b.quantize(norm_buf_b, H, 0);
+                        qi_logits_c.quantize(norm_buf_c, H, 0);
+                        quant_gemv_n3(out_w->data, out_w->type,
+                                      norm_buf,   norm_buf_b, norm_buf_c,
+                                      logits_buf, logits_buf_b, logits_buf_c,
+                                      H, V, &qi_logits, &qi_logits_b, &qi_logits_c, 0);
+
+                        // 5. Argmax all three (top-2 if MTP_ACCEPT_TOP2 set)
+                        static const bool mtp_accept_top2 = getenv("MTP_ACCEPT_TOP2") != nullptr;
+                        if (mtp_accept_top2) {
+                            argmax_top2_half_kernel<<<1, 1024>>>(logits_buf,   V, d_argmax);
+                            argmax_top2_half_kernel<<<1, 1024>>>(logits_buf_b, V, d_argmax_b);
+                            argmax_top2_half_kernel<<<1, 1024>>>(logits_buf_c, V, d_argmax_c);
+                            cudaMemcpy(h_argmax_pinned,   d_argmax,   2*sizeof(int), cudaMemcpyDeviceToHost);
+                            cudaMemcpy(h_argmax_pinned_b, d_argmax_b, 2*sizeof(int), cudaMemcpyDeviceToHost);
+                            cudaMemcpy(h_argmax_pinned_c, d_argmax_c, 2*sizeof(int), cudaMemcpyDeviceToHost);
+                        } else {
+                            argmax_half_kernel<<<1, 1024>>>(logits_buf,   V, d_argmax);
+                            argmax_half_kernel<<<1, 1024>>>(logits_buf_b, V, d_argmax_b);
+                            argmax_half_kernel<<<1, 1024>>>(logits_buf_c, V, d_argmax_c);
+                            cudaMemcpy(h_argmax_pinned,   d_argmax,   sizeof(int), cudaMemcpyDeviceToHost);
+                            cudaMemcpy(h_argmax_pinned_b, d_argmax_b, sizeof(int), cudaMemcpyDeviceToHost);
+                            cudaMemcpy(h_argmax_pinned_c, d_argmax_c, sizeof(int), cudaMemcpyDeviceToHost);
+                        }
+                        int verify_a = h_argmax_pinned[0];    // main's prediction at step+2
+                        int verify_b = h_argmax_pinned_b[0];  // main's prediction at step+3
+                        int verify_c = h_argmax_pinned_c[0];  // provisional at step+4
+                        if (do_gen_prof) {
+                            g_logits += prof_sync_ms(sl0, last_gpu);
+                            g_spec_iters++;
+                        }
+
+                        // Top-2 softer accept: draft is accepted if it matches
+                        // main's top-1 OR top-2 argmax (opt-in via MTP_ACCEPT_TOP2).
+                        bool accept_draft1 = (verify_a == draft1)
+                            || (mtp_accept_top2 && h_argmax_pinned[1]   == draft1);
+                        bool accept_draft2 = (verify_b == draft2)
+                            || (mtp_accept_top2 && h_argmax_pinned_b[1] == draft2);
+                        if (spec_total_count < 3)
+                            printf("[SPEC-K2] step=%d main=%d d1=%d d2=%d va=%d vb=%d vc=%d %s\n",
+                                   step, max_idx, draft1, draft2, verify_a, verify_b, verify_c,
+                                   accept_draft1 ? (accept_draft2 ? "ACCEPT_BOTH" : "ACCEPT_A") : "REJECT");
+                        spec_total_count++;
+
+                        if (accept_draft1 && accept_draft2) {
+                            spec_k2_accept_ab_count++;
+                            spec_accept_count += 2;  // two drafts accepted this iter
+                            if (emit_tok(draft1)) break;
+                            if (emit_tok(draft2)) break;
+                            if (emit_tok(verify_c)) break;
+                            step += 3;  // skip step+1..step+3 (all consumed)
+                        } else if (accept_draft1) {
+                            spec_k2_accept_a_count++;
+                            spec_accept_count += 1;
+                            // Keep draft1 + main's verify_b (real prediction at step+3).
+                            if (emit_tok(draft1)) break;
+                            if (emit_tok(verify_b)) break;
+                            // Roll back GDN to post-draft1 (=post-token-B). KV: draft2 slot stays
+                            // stale (not read since next main forward runs at step+3 onwards).
+                            // MTP KV: one draft (draft2) was appended after draft1; roll back one.
+                            model.restore_gdn_states_b(0);
+                            mtp.kv_rollback(1);
+                            step += 2;  // consumed step+1 (main) and step+2 (draft1 accepted)
+                        } else {
+                            spec_k2_reject_count++;
+                            // Reject both drafts — commit main's verify_a (= prediction at step+2).
+                            if (emit_tok(verify_a)) break;
+                            // Roll back GDN to post-main (slot A). MTP: two drafts appended; roll both back.
+                            model.restore_gdn_states(0);
+                            mtp.kv_rollback(2);
+                            step += 1;
+                        }
+                    } else if (spec_enabled) {
+                        auto sd0 = prof_now();
                         // 1. MTP draft
                         int mtp_draft = mtp.forward(norm_buf, max_idx, step + 1);
                         cudaSetDevice(last_gpu);
+                        if (do_gen_prof) g_mtp += prof_sync_ms(sd0, last_gpu);
 
                         // 2. Embed both tokens onto GPU 0
                         cudaSetDevice(0);
+                        auto se0 = prof_now();
                         if (embd_t->type == GGML_TYPE_Q8_0) {
                             dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0],   max_idx,   H);
                             dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half_b[0], mtp_draft, H);
@@ -854,6 +1414,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         }
                         half_to_float_kernel<<<(H+255)/256, 256>>>(gpu_hidden_half[0],   gpu_hidden[0],   H);
                         half_to_float_kernel<<<(H+255)/256, 256>>>(gpu_hidden_half_b[0], gpu_hidden_b[0], H);
+                        if (do_gen_prof) g_embed += prof_sync_ms(se0, 0);
 
                         // 3. Run all 64 layers in N=2 batched mode
                         float* h_a = gpu_hidden[0];
@@ -862,6 +1423,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                             int g_l = gpu_model.layer_gpu[layer];
                             int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
                             if (g_l != prev_g) {
+                                auto sx0 = prof_now();
                                 cudaSetDevice(prev_g);
                                 cudaMemcpy(host_transfer,   h_a, H * sizeof(float), cudaMemcpyDeviceToHost);
                                 cudaMemcpy(host_transfer_b, h_b, H * sizeof(float), cudaMemcpyDeviceToHost);
@@ -870,19 +1432,29 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                                 cudaMemcpy(gpu_hidden_b[g_l], host_transfer_b, H * sizeof(float), cudaMemcpyHostToDevice);
                                 h_a = gpu_hidden[g_l];
                                 h_b = gpu_hidden_b[g_l];
+                                if (do_gen_prof) g_xfer += prof_sync_ms(sx0, g_l);
                             } else {
                                 cudaSetDevice(g_l);
                             }
-                            if (model.is_attn_layer(layer))
+                            auto sa0 = prof_now();
+                            bool is_attn_s = model.is_attn_layer(layer);
+                            if (is_attn_s)
                                 model.forward_attn_n2(layer, h_a, h_b, step + 1, step + 2, 0);
                             else
                                 model.forward_gdn_n2(layer, h_a, h_b, 0);
+                            if (do_gen_prof) {
+                                double ms = prof_sync_ms(sa0, g_l);
+                                if (is_attn_s) g_attn += ms; else g_gdn += ms;
+                            }
+                            auto sm0 = prof_now();
                             model.forward_mlp_n2(layer, h_a, h_b, 0);
+                            if (do_gen_prof) g_mlp += prof_sync_ms(sm0, g_l);
                         }
 
                         // 4. Output norm + lm_head for both
                         cudaSetDevice(last_gpu);
                         cudaDeviceSynchronize();
+                        auto sl0 = prof_now();
                         float_to_half_kernel<<<(H+255)/256, 256>>>(h_a, gpu_hidden_half[last_gpu],   H);
                         float_to_half_kernel<<<(H+255)/256, 256>>>(h_b, gpu_hidden_half_b[last_gpu], H);
                         if (out_norm_t->type == GGML_TYPE_F32) {
@@ -908,6 +1480,10 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         cudaMemcpy(h_argmax_pinned_b, d_argmax_b, sizeof(int), cudaMemcpyDeviceToHost);
                         int max_idx_a = h_argmax_pinned[0];   // verify of mtp_draft (= main's pred at step+2)
                         int max_idx_b = h_argmax_pinned_b[0]; // provisional t_{step+3}
+                        if (do_gen_prof) {
+                            g_logits += prof_sync_ms(sl0, last_gpu);
+                            g_spec_iters++;
+                        }
 
                         bool spec_accept = (max_idx_a == mtp_draft);
                         if (spec_total_count < 3)
@@ -919,36 +1495,15 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
 
                         if (spec_accept) {
                             // Append the accepted draft + the provisional next token.
-                            generated.push_back(mtp_draft);   // = t_{step+2}
-                            if (on_token) on_token(mtp_draft);
-                            if (mtp_draft == 248068) in_think = true;
-                            if (mtp_draft == 248069) in_think = false;
-                            if (!in_think) output_tokens++;
-                            bool stop_now = false;
-                            if (mtp_draft == 248046 || mtp_draft == 248044 || mtp_draft == 248045) stop_now = true;
-
-                            if (!stop_now && output_tokens < max_gen) {
-                                generated.push_back(max_idx_b);   // = t_{step+3}
-                                if (on_token) on_token(max_idx_b);
-                                if (max_idx_b == 248068) in_think = true;
-                                if (max_idx_b == 248069) in_think = false;
-                                if (!in_think) output_tokens++;
-                                if (max_idx_b == 248046 || max_idx_b == 248044 || max_idx_b == 248045) stop_now = true;
-                            }
-                            if (stop_now || output_tokens >= max_gen) break;
+                            if (emit_tok(mtp_draft)) break;
+                            if (emit_tok(max_idx_b)) break;
                             // Skip outer loop iters at step+1 and step+2 (we processed them
                             // via the batched verify). norm_buf gets re-derived next iter
                             // from main's forward at the new step.
                             step += 2;
                         } else {
                             // Reject: keep main's verify (max_idx_a = t_{step+2}_main).
-                            generated.push_back(max_idx_a);
-                            if (on_token) on_token(max_idx_a);
-                            if (max_idx_a == 248068) in_think = true;
-                            if (max_idx_a == 248069) in_think = false;
-                            if (!in_think) output_tokens++;
-                            if (max_idx_a == 248046 || max_idx_a == 248044 || max_idx_a == 248045) break;
-                            if (output_tokens >= max_gen) break;
+                            if (emit_tok(max_idx_a)) break;
                             // Rollback GDN past the second (rejected) token. The snapshot
                             // was taken inside forward_gdn_n2 right after the first token's
                             // GDN update, so restoring brings state to "post-(step+1)".
@@ -981,16 +1536,43 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         printf("[API] prefill %zu tok %.1fs | gen %d tok %.1f t/s (%.1fs)\n",
                prompt_ids.size(), prefill_ms / 1000.0,
                gen_count, gen_count > 1 ? (gen_count - 1) * 1000.0 / gen_ms : 0, gen_ms / 1000.0);
+        // Dump the full decoded output (think + answer) so operators can
+        // inspect model chain-of-thought + final reply from the server log.
+        if (!generated.empty()) {
+            std::string full_text = tok.decode(generated);
+            printf("[API FULL TEXT]\n%s\n[/API FULL TEXT]\n", full_text.c_str());
+        }
         if (mtp_loaded && mtp_total_count > 0) {
             printf("[MTP] accept %lld / %lld = %.1f%%\n",
                    mtp_accept_count, mtp_total_count,
                    100.0 * mtp_accept_count / mtp_total_count);
         }
         if (spec_enabled && spec_total_count > 0) {
+            double avg = 1.0 + (double)spec_accept_count / spec_total_count;
             printf("[SPEC] accept %lld / %lld = %.1f%%  (per-iter avg tokens %.2f)\n",
                    spec_accept_count, spec_total_count,
-                   100.0 * spec_accept_count / spec_total_count,
-                   1.0 + (double)spec_accept_count / spec_total_count);
+                   100.0 * spec_accept_count / spec_total_count, avg);
+            if (spec_k2_enabled) {
+                long long tot_k2 = spec_k2_accept_ab_count + spec_k2_accept_a_count + spec_k2_reject_count;
+                if (tot_k2 > 0) {
+                    printf("[SPEC-K2] accept_both=%lld (%.1f%%) accept_a=%lld (%.1f%%) reject=%lld (%.1f%%)\n",
+                           spec_k2_accept_ab_count, 100.0 * spec_k2_accept_ab_count / tot_k2,
+                           spec_k2_accept_a_count,  100.0 * spec_k2_accept_a_count / tot_k2,
+                           spec_k2_reject_count,    100.0 * spec_k2_reject_count / tot_k2);
+                }
+            }
+        }
+        if (do_gen_prof) {
+            double total = g_embed + g_xfer + g_attn + g_gdn + g_mlp + g_logits + g_mtp;
+            printf("[GEN PROF] steps=%d spec_iters=%d  total=%.1fms  "
+                   "embed=%.1f(%.0f%%) xfer=%.1f(%.0f%%) attn=%.1f(%.0f%%) "
+                   "gdn=%.1f(%.0f%%) mlp=%.1f(%.0f%%) logits=%.1f(%.0f%%) mtp=%.1f(%.0f%%)\n",
+                   g_steps, g_spec_iters, total,
+                   g_embed, 100.0*g_embed/total, g_xfer, 100.0*g_xfer/total,
+                   g_attn, 100.0*g_attn/total, g_gdn, 100.0*g_gdn/total,
+                   g_mlp, 100.0*g_mlp/total, g_logits, 100.0*g_logits/total,
+                   g_mtp, 100.0*g_mtp/total);
+            fflush(stdout);
         }
 
         if (out_completion_tokens) *out_completion_tokens = (int)generated.size();
@@ -1008,7 +1590,11 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     server.model_name = model_name;
     server.api_key = api_key;
     server.generate_fn = generate;
-    server.prefills_think_tag = true;
+    // Match llama.cpp: no <think> prefill. 모델이 자율적으로 필요 시
+    // `<think>` 열고 닫음. 웹 UI splitThink 는 `<think>` 로 시작하는
+    // stream 만 think block 으로 접고, 바로 답 오는 경우는 all-answer
+    // 로 표시 — 둘 다 자연스럽게 처리.
+    server.prefills_think_tag = false;
     server.sampling_params = &sp;
 
     // Streaming wrapper: re-uses the unified generate_impl so it gets the
@@ -1040,8 +1626,17 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 conv.push_back({role, content});
             }
         }
-        // Prefill <think>\n (matches gist template default)
-        return tok.apply_chat(sys_msg, conv, /*force_think=*/1);
+        // Do not force <think>\n prefill: llama.cpp 참조 구현과 동일하게
+        // 모델이 자율적으로 reasoning 여부 결정. 짧은 greeting 에 강제
+        // reasoning 을 걸면 언어 drift / 환각 증폭 발생함 (실측 확인).
+        auto ids = tok.apply_chat(sys_msg, conv, /*force_think=*/0);
+        if (getenv("DUMP_PROMPT_IDS")) {
+            fprintf(stderr, "[PROMPT_IDS %zu]", ids.size());
+            for (int id : ids) fprintf(stderr, " %d", id);
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
+        return ids;
     };
     server.encode_fn = [&](const std::string& text) {
         return tok.encode(text);
@@ -1223,6 +1818,7 @@ int main(int argc, char** argv) {
     // always be overridden with --max-seq / -c.
     int max_seq = getenv("MTP_TQ") ? 262144 : 4096;
     std::string prompt_text, api_key;
+    std::string vision_mmproj_path, vision_test_image, image_raw_path;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--serve") == 0 && i + 1 < argc) {
             serve_port = atoi(argv[++i]);
@@ -1234,7 +1830,71 @@ int main(int argc, char** argv) {
             max_seq = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
             max_seq = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--vision-mmproj") == 0 && i + 1 < argc) {
+            vision_mmproj_path = argv[++i];
+        } else if (strcmp(argv[i], "--vision-test") == 0 && i + 1 < argc) {
+            vision_test_image = argv[++i];
+        } else if (strcmp(argv[i], "--image-raw") == 0 && i + 1 < argc) {
+            image_raw_path = argv[++i];
         }
+    }
+
+    // Vision smoke test: --vision-mmproj <mmproj.gguf> --vision-test <3x768x768 fp32.raw>
+    // Loads mmproj, runs ViT on the preprocessed image, dumps first embeddings.
+    if (!vision_mmproj_path.empty() && !vision_test_image.empty()) {
+        GGUFFile vgg;
+        if (!vgg.open(vision_mmproj_path.c_str())) {
+            fprintf(stderr, "vision mmproj open failed\n");
+            return 1;
+        }
+        vision::VisionModel vm;
+        if (!vm.load(vgg, 0)) {
+            fprintf(stderr, "vision load failed\n");
+            return 1;
+        }
+        // Read fp32 raw image: 3*768*768 = 1769472 floats = 6.75 MB
+        int H = vm.cfg.image_size;
+        size_t need = (size_t)3 * H * H * sizeof(float);
+        FILE* f = fopen(vision_test_image.c_str(), "rb");
+        if (!f) { perror("image open"); return 1; }
+        std::vector<float> host_img(3 * H * H);
+        size_t got = fread(host_img.data(), 1, need, f);
+        fclose(f);
+        if (got != need) {
+            fprintf(stderr, "image size mismatch: got %zu need %zu\n", got, need);
+            return 1;
+        }
+        float* d_img;
+        cudaMalloc(&d_img, need);
+        cudaMemcpy(d_img, host_img.data(), need, cudaMemcpyHostToDevice);
+        half* d_out;
+        int Nm = vm.cfg.num_merged();
+        int P  = vm.cfg.proj_dim;
+        cudaMalloc(&d_out, (size_t)Nm * P * sizeof(half));
+        auto t0 = std::chrono::high_resolution_clock::now();
+        vm.forward(d_img, d_out, 0);
+        cudaDeviceSynchronize();
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        printf("[vision] forward pass: %.1f ms → %d tokens × %d dim\n", ms, Nm, P);
+        std::vector<half> host_out(Nm * P);
+        cudaMemcpy(host_out.data(), d_out, host_out.size() * sizeof(half), cudaMemcpyDeviceToHost);
+        printf("[vision] token 0 first 12 embeddings: ");
+        for (int i = 0; i < 12; i++) printf("%.4f ", __half2float(host_out[i]));
+        printf("\n[vision] token 288 (center) first 12: ");
+        for (int i = 0; i < 12; i++) printf("%.4f ", __half2float(host_out[288*P + i]));
+        printf("\n");
+        // Sanity: check for NaN/Inf
+        int nan_count = 0, inf_count = 0;
+        for (size_t i = 0; i < host_out.size(); i++) {
+            float v = __half2float(host_out[i]);
+            if (v != v) nan_count++;
+            else if (v > 1e30 || v < -1e30) inf_count++;
+        }
+        printf("[vision] NaN: %d / %zu, Inf: %d / %zu\n",
+               nan_count, host_out.size(), inf_count, host_out.size());
+        cudaFree(d_img); cudaFree(d_out);
+        return 0;
     }
     int tok_start = parse_sampling_args(argc, argv, sp);
 
@@ -1242,17 +1902,83 @@ int main(int argc, char** argv) {
     Tokenizer tokenizer;
     tokenizer.load_from_gguf(gguf);
 
+    // Vision + text inference: --vision-mmproj <mmproj.gguf> --image-raw <fp32.raw> -p "prompt"
+    // Loads mmproj, runs ViT on the preprocessed image, stores embeddings in
+    // g_vision_embeds. Later the prefill loop substitutes these for each
+    // <|image_pad|> token in the prompt.
+    if (!vision_mmproj_path.empty() && !image_raw_path.empty()) {
+        GGUFFile vgg;
+        if (!vgg.open(vision_mmproj_path.c_str())) {
+            fprintf(stderr, "vision mmproj open failed\n");
+            return 1;
+        }
+        static vision::VisionModel vm;   // static: lifetime = program
+        if (!vm.load(vgg, 0)) {
+            fprintf(stderr, "vision load failed\n");
+            return 1;
+        }
+        int Hv = vm.cfg.image_size;
+        size_t need = (size_t)3 * Hv * Hv * sizeof(float);
+        FILE* f = fopen(image_raw_path.c_str(), "rb");
+        if (!f) { perror("image open"); return 1; }
+        std::vector<float> host_img(3 * Hv * Hv);
+        size_t got = fread(host_img.data(), 1, need, f);
+        fclose(f);
+        if (got != need) {
+            fprintf(stderr, "image size mismatch: got %zu need %zu\n", got, need);
+            return 1;
+        }
+        float* d_img;
+        cudaSetDevice(0);
+        cudaMalloc(&d_img, need);
+        cudaMemcpy(d_img, host_img.data(), need, cudaMemcpyHostToDevice);
+        int Nm = vm.cfg.num_merged();
+        int P  = vm.cfg.proj_dim;
+        half* d_vis;
+        cudaMalloc(&d_vis, (size_t)Nm * P * sizeof(half));
+        auto vt0 = std::chrono::high_resolution_clock::now();
+        vm.forward(d_img, d_vis, 0);
+        cudaDeviceSynchronize();
+        auto vt1 = std::chrono::high_resolution_clock::now();
+        double vms = std::chrono::duration<double, std::milli>(vt1 - vt0).count();
+        printf("[vision] ViT forward: %.1f ms → %d tokens × %d dim\n", vms, Nm, P);
+        cudaFree(d_img);
+        // Publish to global hooks
+        g_vision_embeds = d_vis;
+        g_vision_n_tokens = Nm;
+        g_vision_H = P;
+        auto it = tokenizer.token_to_id.find("<|image_pad|>");
+        if (it == tokenizer.token_to_id.end()) {
+            fprintf(stderr, "<|image_pad|> token not found in vocab\n");
+            return 1;
+        }
+        g_image_pad_id = it->second;
+        printf("[vision] image_pad token id = %d, %d placeholders needed\n",
+               g_image_pad_id, Nm);
+    }
+
     // Build prompt token IDs
     std::vector<int> prompt_ids;
     if (!prompt_text.empty()) {
+        std::string effective_prompt = prompt_text;
+        if (g_vision_embeds) {
+            // Wrap the user text with the Qwen-VL vision block. The tokenizer
+            // recognises the <|vision_start|>/<|image_pad|>/<|vision_end|>
+            // special tokens so they encode as single token IDs.
+            std::string vblock = "<|vision_start|>";
+            vblock.reserve(16 + g_vision_n_tokens * 16);
+            for (int i = 0; i < g_vision_n_tokens; i++) vblock += "<|image_pad|>";
+            vblock += "<|vision_end|>";
+            effective_prompt = vblock + prompt_text;
+        }
         // Text prompt: encode with appropriate chat template
         if (tokenizer.is_sentencepiece)
-            prompt_ids = tokenizer.apply_chat_gemma("", {{"user", prompt_text}});
+            prompt_ids = tokenizer.apply_chat_gemma("", {{"user", effective_prompt}});
         else
-            prompt_ids = tokenizer.encode_chat(prompt_text);
-        printf("Prompt: \"%s\" → %zu tokens [", prompt_text.c_str(), prompt_ids.size());
+            prompt_ids = tokenizer.encode_chat(effective_prompt);
+        printf("Prompt: %zu tokens total [", prompt_ids.size());
         for (size_t i = 0; i < std::min(prompt_ids.size(), (size_t)20); i++) printf("%d ", prompt_ids[i]);
-        printf("]\n");
+        printf("...]\n");
     } else {
         // Raw token IDs from CLI
         for (int i = tok_start; i < argc; i++) {

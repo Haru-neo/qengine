@@ -323,11 +323,50 @@ __global__ void gdn_chunk_step(
     int qkv_dim = 2 * num_k * k_dim + num_v * v_dim;
     int v_total = num_v * v_dim;
 
+    // SMEM layout:
+    //   sState [k_dim*v_dim]   — hot recurrent state, loaded once per chunk
+    //   sQ     [k_dim+1]
+    //   sK     [k_dim]
+    //   sWQ    [32]            — warp-partial for q_norm (padded to 32 for tree reduce)
+    //   sWK    [32]            — warp-partial for k_norm
+    //   sWA    [32]            — warp-partial for attn_score
+    //
+    // The three 32-wide scratch arrays are sized to let warp 0 run the exact
+    // same __shfl_xor_sync tree reduction as `gdn_recurrent_step` (per-token).
+    // Previously this kernel summed warp-partials serially which produced a
+    // different fp32 accumulation order than the per-token kernel, causing
+    // chunked-vs-per-token divergence that argmax-flipped tokens in 27B
+    // Korean coding generation. Matching the reduction tree makes the two
+    // paths bit-exact on this step.
     extern __shared__ float smem[];
-    float* sQ = smem;             // [k_dim+1] q_norm scaled, last slot = attn_score
-    float* sK = smem + k_dim + 1; // [k_dim] k_norm
+    const int state_len = k_dim * v_dim;
+    float* sState = smem;
+    float* sQ     = sState + state_len;
+    float* sK     = sQ + k_dim + 1;
+    float* sWQ    = sK + k_dim;
+    float* sWK    = sWQ + 32;
+    float* sWA    = sWK + 32;
 
-    float* state = rec_state + head * k_dim * v_dim;
+    float* gState = rec_state + head * k_dim * v_dim;
+    // Cooperative load of state into SMEM — done once, amortized over n_tokens.
+    for (int i = threadIdx.x; i < state_len; i += blockDim.x) {
+        sState[i] = gState[i];
+    }
+    __syncthreads();
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int nwarp = (blockDim.x + 31) >> 5;
+
+    auto warp_sum = [](float v) -> float {
+        v += __shfl_xor_sync(0xffffffff, v, 16);
+        v += __shfl_xor_sync(0xffffffff, v,  8);
+        v += __shfl_xor_sync(0xffffffff, v,  4);
+        v += __shfl_xor_sync(0xffffffff, v,  2);
+        v += __shfl_xor_sync(0xffffffff, v,  1);
+        return v;
+    };
 
     for (int t = 0; t < n_tokens; t++) {
         const float* qkv = chunk_qkv + (size_t)t * qkv_dim;
@@ -337,32 +376,66 @@ __global__ void gdn_chunk_step(
         const half* a_proj = chunk_a + (size_t)t * num_v;
         const half* b_proj = chunk_b + (size_t)t * num_v;
 
-        // L2 norm Q, K and compute attn_score (single-thread setup)
-        if (threadIdx.x == 0) {
-            float q_norm_sq = 0.0f, k_norm_sq = 0.0f;
-            for (int i = 0; i < k_dim; i++) {
-                float qv = q_raw[i];
-                float kv = k_raw[i];
-                q_norm_sq += qv * qv;
-                k_norm_sq += kv * kv;
+        // L2 norm Q, K + attn_score — warp-parallel. blockDim = min(v_dim,128)
+        // which for k_dim=128 gives one thread per k_dim element (or a strided
+        // loop when blockDim < k_dim).
+        float q_ss_local = 0.0f, k_ss_local = 0.0f;
+        for (int i = tid; i < k_dim; i += blockDim.x) {
+            float qv = q_raw[i];
+            float kv = k_raw[i];
+            q_ss_local += qv * qv;
+            k_ss_local += kv * kv;
+        }
+        float q_ss_w = warp_sum(q_ss_local);
+        float k_ss_w = warp_sum(k_ss_local);
+        // Cross-warp reduce via warp-0 shfl_xor tree — matches
+        // gdn_recurrent_step's order exactly so chunked-vs-per-token fp32
+        // accumulation is bit-identical. Initialize the full 32 slots so
+        // threads outside [0, nwarp) read 0.
+        if (lane == 0) { sWQ[warp] = q_ss_w; sWK[warp] = k_ss_w; }
+        if (warp == 0 && lane >= nwarp && lane < 32) { sWQ[lane] = 0.0f; sWK[lane] = 0.0f; }
+        __syncthreads();
+        if (warp == 0) {
+            float q_val = sWQ[lane];
+            float k_val = sWK[lane];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                q_val += __shfl_xor_sync(0xffffffff, q_val, off);
+                k_val += __shfl_xor_sync(0xffffffff, k_val, off);
             }
-            float q_inv = rsqrtf(q_norm_sq + 1e-6f);
-            float k_inv = rsqrtf(k_norm_sq + 1e-6f);
-            float scale = rsqrtf((float)k_dim);
-            float attn_score = 0.0f;
-            for (int i = 0; i < k_dim; i++) {
-                float q_n = q_raw[i] * q_inv;
-                float k_n = k_raw[i] * k_inv;
-                sQ[i] = q_n * scale;
-                sK[i] = k_n;
-                attn_score += q_n * k_n;
-            }
-            attn_score *= scale;
-            sQ[k_dim] = attn_score;
+            if (lane == 0) { sWQ[0] = q_val; sWK[0] = k_val; }
         }
         __syncthreads();
+        float q_norm_sq = sWQ[0];
+        float k_norm_sq = sWK[0];
+        float q_inv = rsqrtf(q_norm_sq + 1e-6f);
+        float k_inv = rsqrtf(k_norm_sq + 1e-6f);
+        float scale = rsqrtf((float)k_dim);
 
-        float attn_score = sQ[k_dim];
+        // Pass 2: write sQ/sK, accumulate attn_score.
+        float attn_partial = 0.0f;
+        for (int i = tid; i < k_dim; i += blockDim.x) {
+            float q_n = q_raw[i] * q_inv;
+            float k_n = k_raw[i] * k_inv;
+            sQ[i] = q_n * scale;
+            sK[i] = k_n;
+            attn_partial += q_n * k_n;
+        }
+        float attn_w = warp_sum(attn_partial);
+        // Same tree reduce as above for attn_score.
+        if (lane == 0) sWA[warp] = attn_w;
+        if (warp == 0 && lane >= nwarp && lane < 32) sWA[lane] = 0.0f;
+        __syncthreads();
+        if (warp == 0) {
+            float a_val = sWA[lane];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                a_val += __shfl_xor_sync(0xffffffff, a_val, off);
+            }
+            if (lane == 0) sWA[0] = a_val * scale;
+        }
+        __syncthreads();
+        float attn_score = sWA[0];
 
         // Gate and beta in FP32 (Volta has 1:32 fp64 throughput)
         float alpha = __half2float(a_proj[head]);
@@ -372,11 +445,13 @@ __global__ void gdn_chunk_step(
         float g = expf(fminf(g_log, 50.0f));
         float beta = 1.0f / (1.0f + expf(-__half2float(b_proj[head])));
 
-        // Per-v state update + output
+        // Per-v state update + output. State lives in SMEM for the duration
+        // of this chunk — two passes over kd are cache-local instead of the
+        // global-memory re-reads the original kernel was paying.
         for (int vi = threadIdx.x; vi < v_dim; vi += blockDim.x) {
             float sum1 = 0.0f, sum2 = 0.0f;
             for (int kd = 0; kd < k_dim; kd++) {
-                float s = state[kd * v_dim + vi];
+                float s = sState[kd * v_dim + vi];
                 sum1 += s * sK[kd];
                 sum2 += s * sQ[kd];
             }
@@ -385,13 +460,19 @@ __global__ void gdn_chunk_step(
             chunk_out[(size_t)t * v_total + head * v_dim + vi] = __float2half(out_val);
 
             for (int kd = 0; kd < k_dim; kd++) {
-                float s_new = g * state[kd * v_dim + vi] + sv_new * sK[kd];
+                float s_new = g * sState[kd * v_dim + vi] + sv_new * sK[kd];
                 if (s_new > 1e6f) s_new = 1e6f;
                 else if (s_new < -1e6f) s_new = -1e6f;
-                state[kd * v_dim + vi] = s_new;
+                sState[kd * v_dim + vi] = s_new;
             }
         }
         __syncthreads();
+    }
+
+    // Flush SMEM state back to global so the next chunk picks up where we
+    // left off.
+    for (int i = threadIdx.x; i < state_len; i += blockDim.x) {
+        gState[i] = sState[i];
     }
 }
 
@@ -507,5 +588,233 @@ __global__ void rms_norm_gated_kernel_f32(
         float gv = g_h[i];
         float silu_g = gv / (1.0f + expf(-gv));
         out_h[i] = normed * silu_g;
+    }
+}
+
+// ============ DDTree: conv1d tree-mode kernel ============
+// Process n_tokens tree nodes in a single launch. For each node t, walk the
+// parent chain (kw-1) times via parent_ids[] to reconstruct the K-wide conv
+// window. parent_ids[t] == -1 means "parent is the pre-block state"; walking
+// further through negative indices decays into the pre-block `conv_state`
+// buffer (slots [0 .. kw-2]).
+//
+// Inputs / outputs:
+//   conv_state: [dim, kw] FP32 — caller supplies the conv state BEFORE the
+//               block began. The kernel only reads slots [0 .. kw-2] as the
+//               pre-block window; slot kw-1 is ignored (each tree node
+//               provides its own "self" value via `inputs`).
+//   inputs:     [n_tokens, dim] FP32 — per-node new conv input values (the
+//               same value that non-tree conv1d would place into slot kw-1).
+//   weight:     [dim, kw] FP32 — same layout as the per-step kernel.
+//   parent_ids: [n_tokens] int32 — t's parent node index in the DFS-flattened
+//               tree, or -1 if t's parent is the pre-block state.
+//   output:     [n_tokens, dim] FP32 — SiLU(conv(window_t)) for each node.
+//
+// The kernel does NOT update conv_state. After tree verify, the host picks
+// the accept-committed suffix and slides the final node's window back into
+// conv_state using the standard per-step path.
+template <int KW_MAX = 8>
+__global__ void conv1d_update_silu_tree(
+    const float* __restrict__ conv_state,   // [dim, kw], pre-block window in [0..kw-2]
+    const half*  __restrict__ inputs,       // [n_tokens, dim] half
+    const float* __restrict__ weight,       // [dim, kw]
+    const int*   __restrict__ parent_ids,   // [n_tokens], -1 = pre-block parent
+    float*       __restrict__ output,       // [n_tokens, dim]
+    int dim, int kw, int n_tokens
+) {
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= dim) return;
+
+    const float* cs = conv_state + d * kw;
+    const float* wr = weight + d * kw;
+
+    float w[KW_MAX];
+    #pragma unroll
+    for (int k = 0; k < KW_MAX; k++) w[k] = (k < kw) ? wr[k] : 0.0f;
+
+    for (int t = 0; t < n_tokens; t++) {
+        int anc[KW_MAX];
+        #pragma unroll
+        for (int k = 0; k < KW_MAX; k++) anc[k] = 0;
+        anc[kw - 1] = t;
+        for (int k = kw - 2; k >= 0; k--) {
+            int prev = anc[k + 1];
+            anc[k] = (prev >= 0) ? parent_ids[prev] : (prev - 1);
+        }
+
+        float sum = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < KW_MAX; k++) {
+            if (k >= kw) break;
+            int a = anc[k];
+            float x;
+            if (a >= 0) {
+                x = __half2float(inputs[(size_t)a * dim + d]);
+            } else {
+                int ps_idx = (kw - 1) + a;       // a in [-1..-(kw-1)] → ps_idx in [kw-2..0]
+                x = (ps_idx >= 0) ? cs[ps_idx] : 0.0f;
+            }
+            sum += w[k] * x;
+        }
+
+        float silu = sum / (1.0f + expf(-sum));
+        output[(size_t)t * dim + d] = silu;
+    }
+}
+
+// Explicit instantiation for Qwen3.5 (kw=4). KW_MAX=8 covers 3/4/5.
+template __global__ void conv1d_update_silu_tree<8>(
+    const float*, const half*, const float*, const int*, float*, int, int, int);
+
+// ============ DDTree: GDN recurrent step tree kernel ============
+// Process n_tokens tree nodes over the GDN recurrence in a single launch.
+// Each node t reloads its starting state from parent_ids[t]'s saved slot in
+// persist_inter (or rec_state_init for root), runs the same state update as
+// gdn_recurrent_step, writes the post-token state into persist_inter[t], and
+// outputs core_out_tree[t].
+//
+// Layout:
+//   qkv_tree       [n_tokens, qkv_stride]        qkv_stride = 2*num_k*k_dim + num_v*v_dim
+//   a_proj_tree    [n_tokens, num_v] half
+//   b_proj_tree    [n_tokens, num_v] half
+//   rec_state_init [num_v, k_dim, v_dim] f32     PRE-tree GDN state (read-only)
+//   persist_inter  [n_tokens, num_v, k_dim, v_dim] f32   per-token state save
+//   core_out_tree  [n_tokens, num_v, v_dim] half
+//   parent_ids     [n_tokens] int32               -1 = root (parent is rec_state_init)
+//
+// Grid:    num_v blocks × 128 threads   (same as gdn_recurrent_step)
+// SMEM:    (k_dim + 1 + k_dim) floats  (same as gdn_recurrent_step)
+//
+// Host responsibility: after the tree run, pick the committed suffix and
+// copy its last node's state from persist_inter back into rec_state_init.
+__global__ void gdn_recurrent_step_tree(
+    const float* __restrict__ qkv_tree,
+    const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias,
+    const half*  __restrict__ a_proj_tree,
+    const half*  __restrict__ b_proj_tree,
+    const float* __restrict__ rec_state_init,
+    float*       __restrict__ persist_inter,
+    const int*   __restrict__ parent_ids,
+    half*        __restrict__ core_out_tree,
+    int num_k, int num_v, int k_dim, int v_dim, int n_tokens
+) {
+    int head = blockIdx.x;
+    if (head >= num_v) return;
+    int k_head = head % num_k;
+
+    const int qkv_stride = 2 * num_k * k_dim + num_v * v_dim;
+    const size_t state_head_size = (size_t)k_dim * v_dim;
+
+    extern __shared__ float smem[];
+    float* sQ = smem;
+    float* sK = smem + k_dim + 1;
+
+    int warp_id = threadIdx.x >> 5;
+    int lane    = threadIdx.x & 31;
+    int n_warps = (blockDim.x + 31) >> 5;
+    __shared__ float warp_q[32], warp_k[32], warp_a[32];
+
+    for (int t = 0; t < n_tokens; t++) {
+        // 1. Reload state_t from parent (or root) into persist_inter[t].
+        float* state_t = persist_inter
+            + ((size_t)t * num_v + head) * state_head_size;
+        int parent_t = parent_ids[t];
+        const float* src = nullptr;
+        if (parent_t < 0) {
+            src = rec_state_init + (size_t)head * state_head_size;
+        } else {
+            src = persist_inter
+                + ((size_t)parent_t * num_v + head) * state_head_size;
+        }
+        for (int i = threadIdx.x; i < (int)state_head_size; i += blockDim.x) {
+            state_t[i] = src[i];
+        }
+        __syncthreads();
+
+        // 2. Per-token inputs.
+        const float* qkv_t = qkv_tree + (size_t)t * qkv_stride;
+        const float* q_raw = qkv_t + k_head * k_dim;
+        const float* k_raw = qkv_t + num_k * k_dim + k_head * k_dim;
+        const float* v_raw = qkv_t + 2 * num_k * k_dim + head * v_dim;
+
+        // 3. L2 norm Q and K (parallel reduction) — same as gdn_recurrent_step.
+        float q_norm_sq = 0.0f, k_norm_sq = 0.0f;
+        for (int i = threadIdx.x; i < k_dim; i += blockDim.x) {
+            float qv = q_raw[i];
+            float kv = k_raw[i];
+            q_norm_sq += qv * qv;
+            k_norm_sq += kv * kv;
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            q_norm_sq += __shfl_xor_sync(0xffffffff, q_norm_sq, off);
+            k_norm_sq += __shfl_xor_sync(0xffffffff, k_norm_sq, off);
+        }
+        if (lane == 0) { warp_q[warp_id] = q_norm_sq; warp_k[warp_id] = k_norm_sq; }
+        __syncthreads();
+        if (warp_id == 0) {
+            q_norm_sq = (lane < n_warps) ? warp_q[lane] : 0.0f;
+            k_norm_sq = (lane < n_warps) ? warp_k[lane] : 0.0f;
+            for (int off = 16; off > 0; off >>= 1) {
+                q_norm_sq += __shfl_xor_sync(0xffffffff, q_norm_sq, off);
+                k_norm_sq += __shfl_xor_sync(0xffffffff, k_norm_sq, off);
+            }
+            if (lane == 0) { warp_q[0] = q_norm_sq; warp_k[0] = k_norm_sq; }
+        }
+        __syncthreads();
+        float q_inv = rsqrtf(warp_q[0] + 1e-6f);
+        float k_inv = rsqrtf(warp_k[0] + 1e-6f);
+        float scale = rsqrtf((float)k_dim);
+
+        float my_attn = 0.0f;
+        for (int i = threadIdx.x; i < k_dim; i += blockDim.x) {
+            float q_n = q_raw[i] * q_inv;
+            float k_n = k_raw[i] * k_inv;
+            sQ[i] = q_n * scale;
+            sK[i] = k_n;
+            my_attn += q_n * k_n;
+        }
+        for (int off = 16; off > 0; off >>= 1)
+            my_attn += __shfl_xor_sync(0xffffffff, my_attn, off);
+        if (lane == 0) warp_a[warp_id] = my_attn;
+        __syncthreads();
+        if (warp_id == 0) {
+            my_attn = (lane < n_warps) ? warp_a[lane] : 0.0f;
+            for (int off = 16; off > 0; off >>= 1)
+                my_attn += __shfl_xor_sync(0xffffffff, my_attn, off);
+            if (lane == 0) sQ[k_dim] = my_attn * scale;
+        }
+        __syncthreads();
+        float attn_score = sQ[k_dim];
+
+        // 4. Gate and beta (per-token a_proj/b_proj).
+        float alpha = __half2float(a_proj_tree[(size_t)t * num_v + head]);
+        float dt = dt_bias[head];
+        float ssm_a_val = a_log[head];
+        float g_log = ssm_a_val * logf(1.0f + expf(alpha + dt));
+        float g = expf(fminf(g_log, 50.0f));
+        float beta = 1.0f / (1.0f + expf(-__half2float(b_proj_tree[(size_t)t * num_v + head])));
+
+        // 5. State update on state_t (in-place) + output core_out_tree[t].
+        half* core_out_t = core_out_tree + ((size_t)t * num_v + head) * v_dim;
+        for (int vi = threadIdx.x; vi < v_dim; vi += blockDim.x) {
+            float sum1 = 0.0f, sum2 = 0.0f;
+            for (int kd = 0; kd < k_dim; kd++) {
+                float s = state_t[kd * v_dim + vi];
+                sum1 += s * sK[kd];
+                sum2 += s * sQ[kd];
+            }
+            float sv_new = beta * (v_raw[vi] - sum1 * g);
+            float out_val = sum2 * g + sv_new * attn_score;
+            core_out_t[vi] = __float2half(out_val);
+
+            for (int kd = 0; kd < k_dim; kd++) {
+                float s_new = g * state_t[kd * v_dim + vi] + sv_new * sK[kd];
+                if (s_new > 1e6f) s_new = 1e6f;
+                else if (s_new < -1e6f) s_new = -1e6f;
+                state_t[kd * v_dim + vi] = s_new;
+            }
+        }
+        __syncthreads();  // next iter reads state_t from global
     }
 }
