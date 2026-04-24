@@ -733,7 +733,12 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     // forward_gdn_tree / forward_attn_tree / forward_mlp_tree pipeline so
     // we can compare against MTP K=2 before expanding into real branching.
     bool spec_tree_enabled = false;
-    int   tree_budget = 3;
+    // Chain-tree depth. budget=3 is MTP K=2 equivalent (main + 2 drafts).
+    // Larger values extend the chain (e.g. 4 = 3 drafts) for higher per-iter
+    // expected tokens at the cost of per-token-forward_attn overhead.
+    int   tree_budget = getenv("MTP_TREE_BUDGET") ? atoi(getenv("MTP_TREE_BUDGET")) : 3;
+    if (tree_budget < 2) tree_budget = 2;
+    if (tree_budget > 8) tree_budget = 8;
     float* tree_hidden[4] = {nullptr,nullptr,nullptr,nullptr};   // [budget*H] fp32
     half*  tree_hidden_half[4] = {nullptr,nullptr,nullptr,nullptr};
     half*  tree_norm_buf   = nullptr;   // [budget*H] on last_gpu
@@ -742,6 +747,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     int*   tree_h_argmax   = nullptr;   // [budget] pinned
     float* tree_host_transfer = nullptr;// [budget*H] pinned for GPU→GPU copy
     QuantInput qi_logits_tree;
+    half*  h_final_draft2_tree = nullptr;  // second ping-pong buffer for budget > 3
     long long tree_accept_full_count = 0;
     long long tree_accept_partial_count = 0;
     long long tree_reject_count = 0;
@@ -837,6 +843,9 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         cudaMallocHost(&tree_h_argmax, (size_t)tree_budget * sizeof(int));
         cudaMallocHost(&tree_host_transfer, (size_t)tree_budget * H * sizeof(float));
         if (!h_final_draft1) cudaMalloc(&h_final_draft1, H * sizeof(half));   // reused for self-chain MTP
+        // Second ping-pong buffer for chain depths > 3 (budget > 3).
+        // We always alloc one so budget=3 path stays simple.
+        cudaMalloc(&h_final_draft2_tree, H * sizeof(half));
         // qi_logits_tree lazily sizes its q8 buffer on first quantize_chunk.
         // tree forward reuses gdn_bufs[g].chunk_* buffers, already alloc'd in
         // model init. No additional buffer pool needed here.
@@ -1271,20 +1280,41 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     // branching by growing budget and adding ancestor-mask attn.
                     if (spec_tree_enabled) {
                         auto sd0 = prof_now();
-                        // 1. Self-chain draft via MTP (same as K2).
-                        int draft1 = mtp.forward_with_state(norm_buf, max_idx, step + 1, h_final_draft1);
-                        int draft2 = mtp.forward(h_final_draft1, draft1, step + 2);
+                        // 1. Self-chain draft via MTP. Budget N means N-1 drafts
+                        //    chained: draft[0] from main's hidden, draft[k] from
+                        //    draft[k-1]'s post-final-norm hidden. Ping-pong two
+                        //    h_final buffers so forward_with_state can both read
+                        //    the previous h_final and write the new one.
+                        std::vector<int> drafts(tree_budget - 1);
+                        half* h_buf[2] = {h_final_draft1, h_final_draft2_tree};
+                        const half* h_prev_in = norm_buf;
+                        int prev_tok = max_idx;
+                        for (int d = 0; d < tree_budget - 1; d++) {
+                            if (d + 1 < tree_budget - 1) {
+                                drafts[d] = mtp.forward_with_state(
+                                    h_prev_in, prev_tok, step + 1 + d, h_buf[d & 1]);
+                                h_prev_in = h_buf[d & 1];
+                            } else {
+                                drafts[d] = mtp.forward(
+                                    h_prev_in, prev_tok, step + 1 + d);
+                            }
+                            prev_tok = drafts[d];
+                        }
                         cudaSetDevice(last_gpu);
                         if (do_gen_prof) g_mtp += prof_sync_ms(sd0, last_gpu);
 
-                        // 2. Upload chain parent_ids = [-1, 0, 1] to every GPU.
-                        int host_parents[3] = {-1, 0, 1};
-                        model.upload_parent_ids(host_parents, 0);
+                        // 2. Upload chain parent_ids = [-1, 0, 1, ..., N-2].
+                        std::vector<int> host_parents(tree_budget);
+                        host_parents[0] = -1;
+                        for (int i = 1; i < tree_budget; i++) host_parents[i] = i - 1;
+                        model.upload_parent_ids(host_parents.data(), 0);
 
-                        // 3. Embed 3 tokens into contiguous slots on GPU 0.
+                        // 3. Embed all budget tokens into contiguous slots on GPU 0.
                         cudaSetDevice(0);
                         auto se0 = prof_now();
-                        int tokens[3] = {max_idx, draft1, draft2};
+                        std::vector<int> tokens(tree_budget);
+                        tokens[0] = max_idx;
+                        for (int d = 0; d < tree_budget - 1; d++) tokens[d + 1] = drafts[d];
                         for (int b = 0; b < tree_budget; b++) {
                             half* dst = tree_hidden_half[0] + (size_t)b * H;
                             if (embd_t->type == GGML_TYPE_Q8_0)
@@ -1364,48 +1394,57 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         cudaMemcpy(tree_h_argmax, tree_d_argmax,
                                    (size_t)tree_budget * sizeof(int),
                                    cudaMemcpyDeviceToHost);
-                        int verify_a = tree_h_argmax[0]; // prediction at step+2 given main
-                        int verify_b = tree_h_argmax[1]; // prediction at step+3 given draft1
-                        int verify_c = tree_h_argmax[2]; // prediction at step+4 given draft2
                         if (do_gen_prof) {
                             g_logits += prof_sync_ms(sl0, last_gpu);
                             g_spec_iters++;
                         }
 
-                        bool accept1 = (verify_a == draft1);
-                        bool accept2 = accept1 && (verify_b == draft2);
-                        int accept_len = accept2 ? 3 : (accept1 ? 2 : 1);
+                        // Chain accept: longest prefix where verify[i] == drafts[i].
+                        // accept_len is the accepted chain length including the
+                        // main token itself; so accept_len in [1, tree_budget].
+                        int accept_len = 1;
+                        for (int d = 0; d < tree_budget - 1; d++) {
+                            if (tree_h_argmax[d] == drafts[d]) accept_len = d + 2;
+                            else break;
+                        }
 
-                        if (spec_total_count < 3)
-                            printf("[TREE] step=%d main=%d d1=%d d2=%d va=%d vb=%d vc=%d accept_len=%d\n",
-                                   step, max_idx, draft1, draft2,
-                                   verify_a, verify_b, verify_c, accept_len);
+                        if (spec_total_count < 3) {
+                            printf("[TREE] step=%d budget=%d main=%d drafts=[",
+                                   step, tree_budget, max_idx);
+                            for (int d = 0; d < tree_budget - 1; d++)
+                                printf("%s%d", d ? "," : "", drafts[d]);
+                            printf("] verify=[");
+                            for (int b = 0; b < tree_budget; b++)
+                                printf("%s%d", b ? "," : "", tree_h_argmax[b]);
+                            printf("] accept_len=%d\n", accept_len);
+                        }
                         spec_total_count++;
 
                         // 6. Commit accepted chain into GDN rec_state / conv_state.
                         model.commit_tree_gdn_chain(accept_len);
 
-                        // 7. Emit accepted tokens and roll back MTP KV / draft tail.
-                        if (accept_len == 3) {
-                            tree_accept_full_count++;
-                            spec_accept_count += 2;
-                            if (emit_tok(draft1)) break;
-                            if (emit_tok(draft2)) break;
-                            if (emit_tok(verify_c)) break;
-                            step += 3;
-                        } else if (accept_len == 2) {
-                            tree_accept_partial_count++;
-                            spec_accept_count += 1;
-                            if (emit_tok(draft1)) break;
-                            if (emit_tok(verify_b)) break;
-                            mtp.kv_rollback(1); // drop unused draft2 MTP slot
-                            step += 2;
-                        } else {
-                            tree_reject_count++;
-                            if (emit_tok(verify_a)) break;
-                            mtp.kv_rollback(2); // drop both drafts in MTP KV
-                            step += 1;
+                        // Counters.
+                        if (accept_len == tree_budget)      tree_accept_full_count++;
+                        else if (accept_len > 1)            tree_accept_partial_count++;
+                        else                                 tree_reject_count++;
+                        spec_accept_count += (accept_len - 1);
+
+                        // 7. Emit accepted drafts, then verify[accept_len-1] as
+                        //    the next-main prediction (provisional when
+                        //    accept_len==tree_budget).
+                        bool stopped = false;
+                        for (int i = 0; i < accept_len - 1 && !stopped; i++) {
+                            if (emit_tok(drafts[i])) stopped = true;
                         }
+                        if (!stopped) {
+                            if (emit_tok(tree_h_argmax[accept_len - 1])) stopped = true;
+                        }
+                        // MTP KV rollback: uploaded (tree_budget-1) drafts;
+                        // accepted (accept_len-1). Unused = tree_budget - accept_len.
+                        int unused_drafts = tree_budget - accept_len;
+                        if (unused_drafts > 0) mtp.kv_rollback(unused_drafts);
+                        step += accept_len;
+                        if (stopped) break;
                     } else
 
                     // ===================== MTP K=2 speculative decoding =====================
