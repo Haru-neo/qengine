@@ -597,7 +597,11 @@ struct QwenModel {
     // residual still uses `hidden` so the caller passes the matching token's
     // fp32 hidden slice.
     void forward_attn(int layer, float* hidden, int pos, cudaStream_t stream,
-                      bool external_proj = false) {
+                      bool external_proj = false,
+                      int slot_pos = -1,
+                      int mask_start = -1,
+                      int mask_len = 0,
+                      uint32_t mask_bits = 0xffffffffu) {
         int g = gpu->layer_gpu[layer];
         int H = cfg.hidden_size;
         int num_q = cfg.num_q_heads;
@@ -619,7 +623,10 @@ struct QwenModel {
         half* norm_out = bufs[g].norm_out;
         int total_qg = num_q * hd;
         int kv_dim = num_kv * hd;
-        int seq_len = pos + 1;  // including current token
+        // Tree mode separates RoPE position (`pos`) from KV cache slot.
+        // slot_pos < 0 means use pos (legacy single-node path).
+        int kv_slot = (slot_pos < 0) ? pos : slot_pos;
+        int seq_len = kv_slot + 1;  // attention range reaches this slot (inclusive)
         int q_out_dim = q_w->dims[1];
 
         if (!external_proj) {
@@ -670,19 +677,19 @@ struct QwenModel {
         apply_rope_kernel<<<(num_kv * half_rope + 255)/256, 256, 0, stream>>>(
             ab.k_proj, sin_pos, cos_pos, num_kv, hd, rope_dim);
 
-        // 6. Store K, V at position pos (fp16 or TurboQuant 3-bit)
+        // 6. Store K, V at kv_slot (may differ from RoPE pos in tree mode)
         if (use_turboquant) {
             auto& tq = tq_kv_caches[layer];
             int bpt = tq.blocks_per_token;
-            size_t off = (size_t)pos * bpt;
+            size_t off = (size_t)kv_slot * bpt;
             tq3_quantize_kernel<<<(bpt+31)/32, 32, 0, stream>>>(
                 ab.k_proj, &tq.k[off], bpt);
             tq3_quantize_kernel<<<(bpt+31)/32, 32, 0, stream>>>(
                 ab.v_proj, &tq.v[off], bpt);
         } else {
             auto& kv = kv_caches[layer];
-            half* k_cache_pos = kv.k + (size_t)pos * kv_dim;
-            half* v_cache_pos = kv.v + (size_t)pos * kv_dim;
+            half* k_cache_pos = kv.k + (size_t)kv_slot * kv_dim;
+            half* v_cache_pos = kv.v + (size_t)kv_slot * kv_dim;
             cudaMemcpyAsync(k_cache_pos, ab.k_proj, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
             cudaMemcpyAsync(v_cache_pos, ab.v_proj, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
         }
@@ -714,9 +721,16 @@ struct QwenModel {
             }
         } else {
             auto& kv = kv_caches[layer];
-            attn_score_kernel_h<<<score_grid, min(hd, 256), 0, stream>>>(
-                q_buf, kv.k, ab.attn_scores,
-                num_q, num_kv, hd, seq_len, scale);
+            if (mask_start >= 0) {
+                attn_score_kernel_h_tree_masked<<<score_grid, min(hd, 256), 0, stream>>>(
+                    q_buf, kv.k, ab.attn_scores,
+                    num_q, num_kv, hd, seq_len, scale,
+                    mask_start, mask_len, mask_bits);
+            } else {
+                attn_score_kernel_h<<<score_grid, min(hd, 256), 0, stream>>>(
+                    q_buf, kv.k, ab.attn_scores,
+                    num_q, num_kv, hd, seq_len, scale);
+            }
         }
 
         { int st = 1; while(st < seq_len && st < 256) st <<= 1;
@@ -1356,20 +1370,27 @@ struct QwenModel {
     }
 
     // ============ DDTree: attention forward over n_tokens tree nodes =========
-    // Sequential per-node forward_attn. Each node lands in KV slot (pos_base +
-    // node_idx). This skeleton does NOT apply an ancestor mask, so sibling
-    // nodes at the same depth will attend to each other's KV — correct ONLY
-    // for chain (parent_ids[t] == t-1) and for root-only branching (all parent
-    // == -1, and all siblings attend an identical prefix with their own slot).
-    // For general depth-L trees this is a TODO: add ancestor mask to
-    // attn_score_kernel_h. Correct results first by restricting tree shape to
-    // chains for initial bring-up.
+    // Sequential per-node forward_attn. Each node t lands in KV cache slot
+    // (pos_base + t), uses RoPE position (pos_base + depth[t]), and attends
+    // only its ancestor chain within the tree window — other tree slots
+    // (siblings, or nodes from parallel branches) are masked to -INF. For
+    // chain trees the mask is a noop because every slot < t is also an
+    // ancestor, but branching trees require this path for correctness.
+    // Requires upload_parent_ids() to have been called for the current tree.
     void forward_attn_tree(int layer, float* hidden_tree, int pos_base, int n_tokens,
                            const int* parent_ids_dev, cudaStream_t stream) {
         (void)parent_ids_dev;
         int H = cfg.hidden_size;
         for (int t = 0; t < n_tokens; t++) {
-            forward_attn(layer, hidden_tree + (size_t)t * H, pos_base + t, stream);
+            int rope_pos = pos_base + tree_depth_host[t];
+            int kv_slot  = pos_base + t;
+            uint32_t mbits = tree_ancestor_bits_host[t];
+            forward_attn(layer, hidden_tree + (size_t)t * H, rope_pos, stream,
+                         /*external_proj=*/false,
+                         /*slot_pos=*/kv_slot,
+                         /*mask_start=*/pos_base,
+                         /*mask_len=*/n_tokens,
+                         /*mask_bits=*/mbits);
         }
     }
 
@@ -2524,6 +2545,11 @@ struct QwenModel {
     int   tree_budget   = 0;
     std::vector<int*> tree_parent_ids_d;   // per-GPU [budget] int32
     bool  tree_ready    = false;
+    // Host-side derived tree metadata, populated from parent_ids on upload.
+    // depth_host[t]      = distance from root (root=0)
+    // ancestor_bits_host = bit k set iff slot k is an ancestor of t (self included)
+    std::vector<int>      tree_depth_host;
+    std::vector<uint32_t> tree_ancestor_bits_host;
     // Per-GDN-layer saved post-qkv-projection values for the current tree's
     // nodes. commit_tree_gdn_chain reads this to slide conv_state forward
     // along the accepted chain.
@@ -2572,12 +2598,27 @@ struct QwenModel {
 
     // Host → all GPUs broadcast of the current tree's parent_ids array.
     // Caller supplies host_parent_ids[tree_budget].
+    // Also derives per-node depth and ancestor-mask bitsets for the
+    // sequential attention path. Requires tree_budget <= 32 (one uint32
+    // per node's ancestor mask; enforced by alloc_tree_decode clamp).
     void upload_parent_ids(const int* host_parent_ids, cudaStream_t stream = 0) {
         for (int g = 0; g < gpu->num_gpus; g++) {
             cudaSetDevice(g);
             cudaMemcpyAsync(tree_parent_ids_d[g], host_parent_ids,
                             (size_t)tree_budget * sizeof(int),
                             cudaMemcpyHostToDevice, stream);
+        }
+        tree_depth_host.assign(tree_budget, 0);
+        tree_ancestor_bits_host.assign(tree_budget, 0u);
+        for (int t = 0; t < tree_budget; t++) {
+            int p = host_parent_ids[t];
+            if (p < 0) {
+                tree_depth_host[t] = 0;
+                tree_ancestor_bits_host[t] = 1u << t;
+            } else {
+                tree_depth_host[t] = tree_depth_host[p] + 1;
+                tree_ancestor_bits_host[t] = tree_ancestor_bits_host[p] | (1u << t);
+            }
         }
     }
 
@@ -2604,6 +2645,62 @@ struct QwenModel {
     // layer's rec_state and conv_state. Chain assumption: the accepted node
     // indices are exactly [0, 1, ..., L-1] in tree_gdn_inter / tree_qkv_persist.
     // L must satisfy 1 <= L <= kw-1 (kw=4 for Qwen3.5, so L in {1, 2, 3}).
+    // DDTree: commit accepted GDN state for an arbitrary slot path (used for
+    // branching where the accepted slots are not a prefix of [0..n-1]).
+    // host_slots[0..path_len-1] are tree-node indices in branch-root-first
+    // order. conv_state_commit_chain_kernel slides the convolution window
+    // forward by appending each node's qkv_persist in turn.
+    std::vector<int*> commit_path_node_ids_d;
+    bool commit_path_node_ids_ready = false;
+    void ensure_commit_path_node_ids() {
+        if (commit_path_node_ids_ready) return;
+        commit_path_node_ids_d.assign(gpu->num_gpus, nullptr);
+        for (int g = 0; g < gpu->num_gpus; g++) {
+            cudaSetDevice(g);
+            cudaMalloc(&commit_path_node_ids_d[g], (size_t)tree_budget * sizeof(int));
+        }
+        commit_path_node_ids_ready = true;
+    }
+    void commit_tree_gdn_path(const int* host_slots, int path_len) {
+        if (path_len <= 0) return;
+        if (!tree_ready || !tree_qkv_persist_ready) return;
+        static const bool fallback_gdn = getenv("TREE_FALLBACK_GDN") != nullptr;
+        if (fallback_gdn) return;
+        ensure_commit_path_node_ids();
+
+        int num_v = cfg.linear_v_heads;
+        int k_dim = cfg.linear_k_dim;
+        int v_dim = cfg.linear_v_dim;
+        size_t state_sz = (size_t)num_v * k_dim * v_dim * sizeof(float);
+        auto* qkv_probe = t("blk.0.attn_qkv.weight");
+        int qkv_dim = qkv_probe->dims[1];
+        int kw = 4;
+
+        int final_slot = host_slots[path_len - 1];
+        for (int g = 0; g < gpu->num_gpus; g++) {
+            cudaSetDevice(g);
+            cudaMemcpyAsync(commit_path_node_ids_d[g], host_slots,
+                            (size_t)path_len * sizeof(int),
+                            cudaMemcpyHostToDevice, 0);
+        }
+        for (int layer = 0; layer < cfg.num_layers; layer++) {
+            if (is_attn_layer(layer)) continue;
+            int g = gpu->layer_gpu[layer];
+            cudaSetDevice(g);
+            float* src = tree_gdn_inter[layer]
+                + (size_t)final_slot * num_v * k_dim * v_dim;
+            cudaMemcpyAsync(gdn_states[layer].rec_state, src, state_sz,
+                            cudaMemcpyDeviceToDevice, 0);
+            int threads = 256;
+            int blocks  = (qkv_dim + threads - 1) / threads;
+            conv_state_commit_chain_kernel<<<blocks, threads, 0, 0>>>(
+                gdn_states[layer].conv_state,
+                tree_qkv_persist[layer],
+                commit_path_node_ids_d[g],
+                qkv_dim, kw, path_len);
+        }
+    }
+
     void commit_tree_gdn_chain(int accept_len) {
         if (accept_len <= 0) return;
         if (!tree_ready || !tree_qkv_persist_ready) return;

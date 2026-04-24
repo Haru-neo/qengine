@@ -573,6 +573,16 @@ struct MTPHead {
         return tok;
     }
 
+    // DDTree: copy the last forward()'s post-final-norm hidden into `dst` so
+    // the caller can chain a subsequent MTP forward from it. Must be called
+    // immediately after forward() / forward_topk() and before any other
+    // forward() overwrites h_final. `dst` must be half[H] on gpu_id.
+    void copy_h_final_to(half* dst, cudaStream_t stream = 0) {
+        cudaSetDevice(gpu_id);
+        cudaMemcpyAsync(dst, h_final, H * sizeof(half),
+                        cudaMemcpyDeviceToDevice, stream);
+    }
+
     // DDTree: forward followed by top-K argmax instead of top-1. Fills
     // `out_ids[0..K-1]` with the K highest-logit token ids (sorted descending)
     // and, if non-null, `out_logits[0..K-1]` with their fp32 logits. Also

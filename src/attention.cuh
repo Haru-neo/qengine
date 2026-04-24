@@ -294,6 +294,61 @@ __global__ void attn_score_kernel_h(
     }
 }
 
+// DDTree: same as attn_score_kernel_h but writes -INF for KV slots that the
+// current query is not allowed to attend to (sibling tree branches). A mask
+// is applied to positions in [mask_start, mask_start + mask_len) — bit k of
+// mask_bits set means slot (mask_start + k) is an ancestor of the query.
+// Positions outside the [mask_start, mask_start+mask_len) window are treated
+// as the pre-tree prefix and remain visible (no mask).
+__global__ void attn_score_kernel_h_tree_masked(
+    const half* __restrict__ q,
+    const half* __restrict__ k_cache,
+    float* __restrict__ scores,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    float scale,
+    int mask_start,
+    int mask_len,
+    uint32_t mask_bits
+) {
+    int q_head = blockIdx.x;
+    int pos = blockIdx.y;
+    if (q_head >= num_q_heads || pos >= seq_len) return;
+
+    bool in_tree = (pos >= mask_start) && (pos < mask_start + mask_len);
+    bool masked  = in_tree && !((mask_bits >> (pos - mask_start)) & 1u);
+
+    int kv_head = q_head / (num_q_heads / num_kv_heads);
+    const half* qh = q + q_head * head_dim;
+    const half* kh = k_cache + pos * num_kv_heads * head_dim + kv_head * head_dim;
+
+    float sum = 0.0f;
+    if (!masked) {
+        for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
+            sum += __half2float(qh[i]) * __half2float(kh[i]);
+        for (int off = 16; off > 0; off >>= 1)
+            sum += __shfl_xor_sync(0xffffffff, sum, off);
+    }
+
+    __shared__ float warp_sums[8];
+    int warp_id = threadIdx.x >> 5;
+    int lane_id = threadIdx.x & 31;
+    int n_warps = (blockDim.x + 31) >> 5;
+    if (lane_id == 0) warp_sums[warp_id] = sum;
+    __syncthreads();
+    if (warp_id == 0) {
+        sum = (lane_id < n_warps) ? warp_sums[lane_id] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1)
+            sum += __shfl_xor_sync(0xffffffff, sum, off);
+        if (lane_id == 0) {
+            float out = masked ? -1e30f : (sum * scale);
+            scores[q_head * seq_len + pos] = out;
+        }
+    }
+}
+
 // ============ TurboQuant 3-bit fused attention score kernel ============
 // Block layout: ONE block per (kv_head, pos) processing all `gqa_ratio`
 // query heads that share the kv_head. Cooperative dequant of K[pos,

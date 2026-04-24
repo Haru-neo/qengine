@@ -1280,33 +1280,69 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     // branching by growing budget and adding ancestor-mask attn.
                     if (spec_tree_enabled) {
                         auto sd0 = prof_now();
-                        // 1. Self-chain draft via MTP. Budget N means N-1 drafts
-                        //    chained: draft[0] from main's hidden, draft[k] from
-                        //    draft[k-1]'s post-final-norm hidden. Ping-pong two
-                        //    h_final buffers so forward_with_state can both read
-                        //    the previous h_final and write the new one.
+                        // MTP_TREE_BRANCH=1: root fan-out of top-2 drafts.
+                        //   budget=3 → depth 1 (tree [root, a, b], parents [-1,0,0])
+                        //   budget=5 → depth 2 (tree [root, a, b, aa, bb],
+                        //                       parents [-1, 0, 0, 1, 2])
+                        //   Grandchildren aa, bb come from a per-branch MTP
+                        //   forward(h_root, a|b, step+2); each is rolled back
+                        //   immediately so MTP KV keeps only the root slot.
+                        // Default (chain): budget=N chain, drafts = [d0, d1, ...]
+                        //   with parents = [-1, 0, 1, ..., N-2].
+                        static const bool use_branch = getenv("MTP_TREE_BRANCH") != nullptr;
+                        bool branch_mode = use_branch &&
+                                           (tree_budget == 3 || tree_budget == 5);
+                        int  branch_depth = (tree_budget == 5) ? 2 : 1;
                         std::vector<int> drafts(tree_budget - 1);
-                        half* h_buf[2] = {h_final_draft1, h_final_draft2_tree};
-                        const half* h_prev_in = norm_buf;
-                        int prev_tok = max_idx;
-                        for (int d = 0; d < tree_budget - 1; d++) {
-                            if (d + 1 < tree_budget - 1) {
-                                drafts[d] = mtp.forward_with_state(
-                                    h_prev_in, prev_tok, step + 1 + d, h_buf[d & 1]);
-                                h_prev_in = h_buf[d & 1];
-                            } else {
-                                drafts[d] = mtp.forward(
-                                    h_prev_in, prev_tok, step + 1 + d);
+                        std::vector<int> host_parents(tree_budget);
+                        host_parents[0] = -1;
+                        if (branch_mode) {
+                            // Root: MTP top-2 at step+1.
+                            int top_ids[4] = {-1,-1,-1,-1};
+                            mtp.forward_topk(norm_buf, max_idx, step + 1, 2,
+                                             top_ids, nullptr);
+                            drafts[0] = top_ids[0];
+                            drafts[1] = top_ids[1];
+                            host_parents[1] = 0;
+                            host_parents[2] = 0;
+                            if (branch_depth == 2) {
+                                // Save the root's h_final so both branches can
+                                // chain off it. h_final_draft1 is otherwise
+                                // only used by the chain path, so reuse it.
+                                half* h_root = h_final_draft1;
+                                mtp.copy_h_final_to(h_root, 0);
+                                // Branch a: next-token draft at slot 3.
+                                drafts[2] = mtp.forward(h_root, drafts[0], step + 2);
+                                mtp.kv_rollback(1);
+                                // Branch b: next-token draft at slot 4.
+                                drafts[3] = mtp.forward(h_root, drafts[1], step + 2);
+                                mtp.kv_rollback(1);
+                                host_parents[3] = 1;
+                                host_parents[4] = 2;
                             }
-                            prev_tok = drafts[d];
+                        } else {
+                            // Chain fallback.
+                            half* h_buf[2] = {h_final_draft1, h_final_draft2_tree};
+                            const half* h_prev_in = norm_buf;
+                            int prev_tok = max_idx;
+                            for (int d = 0; d < tree_budget - 1; d++) {
+                                if (d + 1 < tree_budget - 1) {
+                                    drafts[d] = mtp.forward_with_state(
+                                        h_prev_in, prev_tok, step + 1 + d, h_buf[d & 1]);
+                                    h_prev_in = h_buf[d & 1];
+                                } else {
+                                    drafts[d] = mtp.forward(
+                                        h_prev_in, prev_tok, step + 1 + d);
+                                }
+                                prev_tok = drafts[d];
+                            }
+                            for (int i = 1; i < tree_budget; i++) host_parents[i] = i - 1;
                         }
                         cudaSetDevice(last_gpu);
                         if (do_gen_prof) g_mtp += prof_sync_ms(sd0, last_gpu);
 
-                        // 2. Upload chain parent_ids = [-1, 0, 1, ..., N-2].
-                        std::vector<int> host_parents(tree_budget);
-                        host_parents[0] = -1;
-                        for (int i = 1; i < tree_budget; i++) host_parents[i] = i - 1;
+                        // 2. Upload parent_ids (also triggers host-side depth +
+                        //    ancestor-bitmask derivation for attn tree path).
                         model.upload_parent_ids(host_parents.data(), 0);
 
                         // 3. Embed all budget tokens into contiguous slots on GPU 0.
@@ -1399,18 +1435,54 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                             g_spec_iters++;
                         }
 
-                        // Chain accept: longest prefix where verify[i] == drafts[i].
-                        // accept_len is the accepted chain length including the
-                        // main token itself; so accept_len in [1, tree_budget].
+                        // Accept logic — differs for chain vs branch mode.
                         int accept_len = 1;
-                        for (int d = 0; d < tree_budget - 1; d++) {
-                            if (tree_h_argmax[d] == drafts[d]) accept_len = d + 2;
-                            else break;
+                        int accepted_final_slot = 0;  // slot index of last accepted node
+                        std::vector<int> accepted_path = {0};  // slot indices of accepted chain
+                        int emit_final_verify_slot = 0;  // which verify[] to emit as next-main
+                        if (branch_mode) {
+                            // Root fan-out. verify[0] is main's slot-0
+                            // prediction (next token at step+2).
+                            // Depth 1: verify[0]==drafts[0] → branch a accept,
+                            //          verify[0]==drafts[1] → branch b accept.
+                            // Depth 2 further checks verify[1]==drafts[2] (aa)
+                            // or verify[2]==drafts[3] (bb) on the selected
+                            // branch for one extra accepted token.
+                            if (tree_h_argmax[0] == drafts[0]) {
+                                accept_len = 2;
+                                accepted_path = {0, 1};
+                                if (branch_depth == 2 && tree_h_argmax[1] == drafts[2]) {
+                                    accept_len = 3;
+                                    accepted_path = {0, 1, 3};
+                                }
+                            } else if (tree_h_argmax[0] == drafts[1]) {
+                                accept_len = 2;
+                                accepted_path = {0, 2};
+                                if (branch_depth == 2 && tree_h_argmax[2] == drafts[3]) {
+                                    accept_len = 3;
+                                    accepted_path = {0, 2, 4};
+                                }
+                            } else {
+                                accept_len = 1;
+                                accepted_path = {0};
+                            }
+                            accepted_final_slot = accepted_path.back();
+                            emit_final_verify_slot = accepted_path.back();
+                        } else {
+                            // Chain: longest matching prefix.
+                            for (int d = 0; d < tree_budget - 1; d++) {
+                                if (tree_h_argmax[d] == drafts[d]) accept_len = d + 2;
+                                else break;
+                            }
+                            accepted_path.resize(accept_len);
+                            for (int i = 0; i < accept_len; i++) accepted_path[i] = i;
+                            accepted_final_slot = accept_len - 1;
+                            emit_final_verify_slot = accept_len - 1;
                         }
 
                         if (spec_total_count < 3) {
-                            printf("[TREE] step=%d budget=%d main=%d drafts=[",
-                                   step, tree_budget, max_idx);
+                            printf("[TREE] step=%d budget=%d mode=%s main=%d drafts=[",
+                                   step, tree_budget, branch_mode ? "branch" : "chain", max_idx);
                             for (int d = 0; d < tree_budget - 1; d++)
                                 printf("%s%d", d ? "," : "", drafts[d]);
                             printf("] verify=[");
@@ -1420,8 +1492,12 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         }
                         spec_total_count++;
 
-                        // 6. Commit accepted chain into GDN rec_state / conv_state.
-                        model.commit_tree_gdn_chain(accept_len);
+                        // 6. Commit accepted path into GDN rec_state / conv_state.
+                        if (branch_mode) {
+                            model.commit_tree_gdn_path(accepted_path.data(), (int)accepted_path.size());
+                        } else {
+                            model.commit_tree_gdn_chain(accept_len);
+                        }
 
                         // Counters.
                         if (accept_len == tree_budget)      tree_accept_full_count++;
@@ -1429,20 +1505,35 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         else                                 tree_reject_count++;
                         spec_accept_count += (accept_len - 1);
 
-                        // 7. Emit accepted drafts, then verify[accept_len-1] as
-                        //    the next-main prediction (provisional when
-                        //    accept_len==tree_budget).
+                        // 7. Emit accepted drafts (in slot order along the path),
+                        //    then verify[emit_final_verify_slot] as the next-main
+                        //    prediction.
                         bool stopped = false;
-                        for (int i = 0; i < accept_len - 1 && !stopped; i++) {
-                            if (emit_tok(drafts[i])) stopped = true;
+                        for (int i = 1; i < (int)accepted_path.size() && !stopped; i++) {
+                            int slot = accepted_path[i];
+                            // drafts[slot - 1] is the token that occupied slot i
+                            // (drafts[0] occupies slot 1, drafts[1] occupies slot 2, ...)
+                            if (emit_tok(drafts[slot - 1])) stopped = true;
                         }
                         if (!stopped) {
-                            if (emit_tok(tree_h_argmax[accept_len - 1])) stopped = true;
+                            if (emit_tok(tree_h_argmax[emit_final_verify_slot])) stopped = true;
                         }
-                        // MTP KV rollback: uploaded (tree_budget-1) drafts;
-                        // accepted (accept_len-1). Unused = tree_budget - accept_len.
-                        int unused_drafts = tree_budget - accept_len;
-                        if (unused_drafts > 0) mtp.kv_rollback(unused_drafts);
+
+                        // MTP KV rollback.
+                        //   chain: uploaded (tree_budget-1) drafts; accepted
+                        //          (accept_len-1). Unused = tree_budget - accept_len.
+                        //   branch: root forward_topk committed exactly 1 slot;
+                        //          always roll it back so MTP KV is clean at the
+                        //          next step (cold-start the following iter's
+                        //          MTP). This avoids the hole problem when the
+                        //          accepted branch didn't come from the KV-cached
+                        //          top-1.
+                        if (branch_mode) {
+                            mtp.kv_rollback(1);
+                        } else {
+                            int unused_drafts = tree_budget - accept_len;
+                            if (unused_drafts > 0) mtp.kv_rollback(unused_drafts);
+                        }
                         step += accept_len;
                         if (stopped) break;
                     } else
