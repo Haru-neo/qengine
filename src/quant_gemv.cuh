@@ -1128,7 +1128,11 @@ inline void quant_gemv_chunk(void* weight, ggml_type type,
         // K-dim reduction (thread-strided + warp/cross-warp shuffle) matches
         // the per-token `gemv_q8_0_q8` order exactly, so each output column
         // is bit-equal to a per-token call. Pays a prefill throughput cost.
-        static const bool bit_exact = getenv("BIT_EXACT_GEMM") != nullptr;
+        // Default ON: nN GEMV peeling matches per-token gemv_q8_0_q8 K-dim
+        // reduction tree column-wise. Pairs with FLASH_ATTN=0 default for
+        // chunked-vs-pertoken bit-exactness. Set BIT_EXACT_GEMM_OFF=1 to
+        // fall back to the GEMM-tile path (faster prefill, drift).
+        static const bool bit_exact = getenv("BIT_EXACT_GEMM_OFF") == nullptr;
         if (bit_exact) {
             while (remaining >= 16) {
                 gemv_q8_0_q8_nN<16><<<M, threads, 0, stream>>>(weight, xp, op, K, M, 16);

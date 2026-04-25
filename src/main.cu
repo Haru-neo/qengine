@@ -907,9 +907,15 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         // FlashAttention fused score+softmax+value is now default ON for the
         // 27B shape (head_dim=256, num_kv=4, num_q=24). ~1.8× prefill speedup
         // vs strict block-per-score, code-value accurate (Korean Rust
-        // Singleton `value: 42` preserved). Set FLASH_ATTN=0 to force off.
+        // Default OFF: FA fused (`flash_attn_chunk_fused`) is the only chunked
+        // attn path that drifts from per-token forward_attn. The strict score
+        // kernel + softmax_chunk + value_chunk path matches per-token bit-exact
+        // when paired with BIT_EXACT_GEMM=1 (verified 2026-04-25 via per-(layer,
+        // token) hidden hash bisect: 320/320 hashes equal vs DISABLE_CHUNKED).
+        // Set FLASH_ATTN=1 to opt back into the FA fused path (faster prefill,
+        // accepts the drift).
         const char* fa_env = getenv("FLASH_ATTN");
-        g_use_flash_attn = (fa_env == nullptr) ? true : (fa_env[0] == '1');
+        g_use_flash_attn = (fa_env == nullptr) ? false : (fa_env[0] == '1');
         g_attn_score_ms = g_attn_softmax_ms = g_attn_value_ms
                        = g_attn_fused_ms  = g_attn_other_ms = 0.0;
         double t_embed = 0, t_xfer = 0, t_attn = 0, t_gdn = 0, t_mlp = 0;
