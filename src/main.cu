@@ -1290,25 +1290,30 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         // Default (chain): budget=N chain, drafts = [d0, d1, ...]
                         //   with parents = [-1, 0, 1, ..., N-2].
                         static const bool use_branch = getenv("MTP_TREE_BRANCH") != nullptr;
+                        // Supported branching shapes:
+                        //   budget=3: fanout=2, depth=1 → [root, a, b]
+                        //   budget=4: fanout=3, depth=1 → [root, a, b, c]
+                        //   budget=5: fanout=2, depth=2 → [root, a, b, aa, bb]
                         bool branch_mode = use_branch &&
-                                           (tree_budget == 3 || tree_budget == 5);
-                        int  branch_depth = (tree_budget == 5) ? 2 : 1;
+                                           (tree_budget == 3 || tree_budget == 4 || tree_budget == 5);
+                        int  branch_fanout = (tree_budget == 4) ? 3 : 2;
+                        int  branch_depth  = (tree_budget == 5) ? 2 : 1;
                         std::vector<int> drafts(tree_budget - 1);
                         std::vector<int> host_parents(tree_budget);
                         host_parents[0] = -1;
                         if (branch_mode) {
-                            // Root: MTP top-2 at step+1.
+                            // Root: MTP top-K at step+1 (K == branch_fanout).
                             int top_ids[4] = {-1,-1,-1,-1};
-                            mtp.forward_topk(norm_buf, max_idx, step + 1, 2,
+                            mtp.forward_topk(norm_buf, max_idx, step + 1, branch_fanout,
                                              top_ids, nullptr);
-                            drafts[0] = top_ids[0];
-                            drafts[1] = top_ids[1];
-                            host_parents[1] = 0;
-                            host_parents[2] = 0;
+                            for (int k = 0; k < branch_fanout; k++) {
+                                drafts[k] = top_ids[k];
+                                host_parents[k + 1] = 0;
+                            }
                             if (branch_depth == 2) {
-                                // Save the root's h_final so both branches can
-                                // chain off it. h_final_draft1 is otherwise
-                                // only used by the chain path, so reuse it.
+                                // fanout=2 only. Save the root's h_final so both
+                                // branches can chain off it. h_final_draft1 is
+                                // otherwise only used by the chain path, so reuse it.
                                 half* h_root = h_final_draft1;
                                 mtp.copy_h_final_to(h_root, 0);
                                 // Branch a: next-token draft at slot 3.
@@ -1443,28 +1448,32 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         if (branch_mode) {
                             // Root fan-out. verify[0] is main's slot-0
                             // prediction (next token at step+2).
-                            // Depth 1: verify[0]==drafts[0] → branch a accept,
-                            //          verify[0]==drafts[1] → branch b accept.
-                            // Depth 2 further checks verify[1]==drafts[2] (aa)
-                            // or verify[2]==drafts[3] (bb) on the selected
-                            // branch for one extra accepted token.
-                            if (tree_h_argmax[0] == drafts[0]) {
-                                accept_len = 2;
-                                accepted_path = {0, 1};
-                                if (branch_depth == 2 && tree_h_argmax[1] == drafts[2]) {
-                                    accept_len = 3;
-                                    accepted_path = {0, 1, 3};
+                            // Depth 1, fanout K: verify[0]==drafts[k] → branch k accept.
+                            // Depth 2, fanout 2: further checks verify[1]==drafts[2] (aa)
+                            //                    or verify[2]==drafts[3] (bb) on the
+                            //                    selected branch for one extra accepted token.
+                            accept_len = 1;
+                            accepted_path = {0};
+                            int matched_branch = -1;
+                            for (int k = 0; k < branch_fanout; k++) {
+                                if (tree_h_argmax[0] == drafts[k]) {
+                                    matched_branch = k;
+                                    break;
                                 }
-                            } else if (tree_h_argmax[0] == drafts[1]) {
+                            }
+                            if (matched_branch >= 0) {
                                 accept_len = 2;
-                                accepted_path = {0, 2};
-                                if (branch_depth == 2 && tree_h_argmax[2] == drafts[3]) {
-                                    accept_len = 3;
-                                    accepted_path = {0, 2, 4};
+                                accepted_path = {0, matched_branch + 1};
+                                if (branch_depth == 2) {
+                                    // fanout=2 depth=2: grandchildren are at slots 3,4
+                                    // (drafts[2]=aa at slot 3, drafts[3]=bb at slot 4).
+                                    int grand_slot = matched_branch + 3;  // slot 3 or 4
+                                    int grand_draft = matched_branch + 2; // drafts[2] or drafts[3]
+                                    if (tree_h_argmax[matched_branch + 1] == drafts[grand_draft]) {
+                                        accept_len = 3;
+                                        accepted_path = {0, matched_branch + 1, grand_slot};
+                                    }
                                 }
-                            } else {
-                                accept_len = 1;
-                                accepted_path = {0};
                             }
                             accepted_final_slot = accepted_path.back();
                             emit_final_verify_slot = accepted_path.back();
