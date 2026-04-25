@@ -1294,10 +1294,13 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         //   budget=3: fanout=2, depth=1 → [root, a, b]
                         //   budget=4: fanout=3, depth=1 → [root, a, b, c]
                         //   budget=5: fanout=2, depth=2 → [root, a, b, aa, bb]
+                        //   budget=7: fanout=2, depth=3 → [root, a, b, aa, bb, aaa, bbb]
                         bool branch_mode = use_branch &&
-                                           (tree_budget == 3 || tree_budget == 4 || tree_budget == 5);
+                                           (tree_budget == 3 || tree_budget == 4 ||
+                                            tree_budget == 5 || tree_budget == 7);
                         int  branch_fanout = (tree_budget == 4) ? 3 : 2;
-                        int  branch_depth  = (tree_budget == 5) ? 2 : 1;
+                        int  branch_depth  = (tree_budget == 5) ? 2 :
+                                             (tree_budget == 7) ? 3 : 1;
                         std::vector<int> drafts(tree_budget - 1);
                         std::vector<int> host_parents(tree_budget);
                         host_parents[0] = -1;
@@ -1311,19 +1314,36 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                                 host_parents[k + 1] = 0;
                             }
                             if (branch_depth == 2) {
-                                // fanout=2 only. Save the root's h_final so both
-                                // branches can chain off it. h_final_draft1 is
-                                // otherwise only used by the chain path, so reuse it.
+                                // fanout=2, depth=2. Save the root's h_final so both
+                                // branches can chain off it.
                                 half* h_root = h_final_draft1;
                                 mtp.copy_h_final_to(h_root, 0);
-                                // Branch a: next-token draft at slot 3.
                                 drafts[2] = mtp.forward(h_root, drafts[0], step + 2);
                                 mtp.kv_rollback(1);
-                                // Branch b: next-token draft at slot 4.
                                 drafts[3] = mtp.forward(h_root, drafts[1], step + 2);
                                 mtp.kv_rollback(1);
                                 host_parents[3] = 1;
                                 host_parents[4] = 2;
+                            } else if (branch_depth == 3) {
+                                // fanout=2, depth=3. Tree slots:
+                                //   0:root  1:a   2:b   3:aa  4:bb  5:aaa 6:bbb
+                                // drafts indices: 0=a 1=b 2=aa 3=bb 4=aaa 5=bbb
+                                half* h_root = h_final_draft1;
+                                mtp.copy_h_final_to(h_root, 0);
+                                // Branch a chain: forward(root, a) → aa,
+                                // then forward(h_aa, aa) → aaa.
+                                half* h_chain = h_final_draft2_tree;
+                                drafts[2] = mtp.forward_with_state(h_root, drafts[0], step + 2, h_chain);
+                                drafts[4] = mtp.forward(h_chain, drafts[2], step + 3);
+                                mtp.kv_rollback(2);
+                                // Branch b chain (reuses h_chain buffer).
+                                drafts[3] = mtp.forward_with_state(h_root, drafts[1], step + 2, h_chain);
+                                drafts[5] = mtp.forward(h_chain, drafts[3], step + 3);
+                                mtp.kv_rollback(2);
+                                host_parents[3] = 1;  // aa  ← a
+                                host_parents[4] = 2;  // bb  ← b
+                                host_parents[5] = 3;  // aaa ← aa
+                                host_parents[6] = 4;  // bbb ← bb
                             }
                         } else {
                             // Chain fallback.
@@ -1452,6 +1472,8 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                             // Depth 2, fanout 2: further checks verify[1]==drafts[2] (aa)
                             //                    or verify[2]==drafts[3] (bb) on the
                             //                    selected branch for one extra accepted token.
+                            // Depth 3, fanout 2: same chain extended one more level
+                            //                    via verify[grand_slot]==drafts[great_idx].
                             accept_len = 1;
                             accepted_path = {0};
                             int matched_branch = -1;
@@ -1464,14 +1486,23 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                             if (matched_branch >= 0) {
                                 accept_len = 2;
                                 accepted_path = {0, matched_branch + 1};
-                                if (branch_depth == 2) {
-                                    // fanout=2 depth=2: grandchildren are at slots 3,4
-                                    // (drafts[2]=aa at slot 3, drafts[3]=bb at slot 4).
-                                    int grand_slot = matched_branch + 3;  // slot 3 or 4
-                                    int grand_draft = matched_branch + 2; // drafts[2] or drafts[3]
+                                if (branch_depth >= 2) {
+                                    // depth ≥ 2 path is fanout=2 only.
+                                    // Slots: branch a (m=0): {1,3,5}, b (m=1): {2,4,6}
+                                    // Drafts: a→aa,aaa = {2,4}; b→bb,bbb = {3,5}
+                                    int grand_slot  = matched_branch + 3;
+                                    int grand_draft = matched_branch + 2;
                                     if (tree_h_argmax[matched_branch + 1] == drafts[grand_draft]) {
                                         accept_len = 3;
                                         accepted_path = {0, matched_branch + 1, grand_slot};
+                                        if (branch_depth >= 3) {
+                                            int great_slot  = matched_branch + 5;
+                                            int great_draft = matched_branch + 4;
+                                            if (tree_h_argmax[grand_slot] == drafts[great_draft]) {
+                                                accept_len = 4;
+                                                accepted_path.push_back(great_slot);
+                                            }
+                                        }
                                     }
                                 }
                             }
