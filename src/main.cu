@@ -1053,6 +1053,31 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                             sample[4], sample[5], sample[6], sample[7]);
                     fflush(stderr);
                 }
+                // DUMP_PREFILL_HASH=1: per-token hidden hash for the whole
+                // chunk after each layer. Pair with the same env in the
+                // per-token (DISABLE_CHUNKED_PREFILL=1) path to bisect the
+                // exact (layer, token) where chunked drifts from per-token.
+                static const bool dump_prefill_hash = getenv("DUMP_PREFILL_HASH") != nullptr;
+                if (dump_prefill_hash) {
+                    cudaSetDevice(g); cudaDeviceSynchronize();
+                    static thread_local std::vector<float> host_buf;
+                    host_buf.resize((size_t)chunk_n * H);
+                    cudaMemcpy(host_buf.data(), h_chunk,
+                               (size_t)chunk_n * H * sizeof(float),
+                               cudaMemcpyDeviceToHost);
+                    for (int t = 0; t < chunk_n; t++) {
+                        uint64_t h = 0xcbf29ce484222325ULL;
+                        const float* p = host_buf.data() + (size_t)t * H;
+                        for (int i = 0; i < H; i++) {
+                            uint32_t b; memcpy(&b, &p[i], 4);
+                            h = (h ^ (uint64_t)b) * 0x100000001b3ULL;
+                        }
+                        fprintf(stderr, "[CHK L%02d t%03d %s] hash=%016lx\n",
+                                layer, chunk_pos + t,
+                                is_attn ? "attn" : "gdn ", h);
+                    }
+                    fflush(stderr);
+                }
             }
             cudaSetDevice(last_gpu); cudaDeviceSynchronize();
 
@@ -1164,6 +1189,26 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                             layer, is_attn ? "attn" : "gdn ",
                             sample[0], sample[1], sample[2], sample[3],
                             sample[4], sample[5], sample[6], sample[7]);
+                    fflush(stderr);
+                }
+                // DUMP_PREFILL_HASH=1 (per-token side): for each step <
+                // prompt_ids.size() (prefill phase via DISABLE_CHUNKED_PREFILL),
+                // emit the same per-(layer,token) hash format as the chunked
+                // path for diff. Only emit while we're still processing prompt
+                // tokens; once past prompt the hash is just generation noise.
+                static const bool dump_prefill_hash = getenv("DUMP_PREFILL_HASH") != nullptr;
+                if (dump_prefill_hash && step < (int)prompt_ids.size()) {
+                    cudaSetDevice(g); cudaDeviceSynchronize();
+                    static thread_local std::vector<float> host_buf;
+                    host_buf.resize(H);
+                    cudaMemcpy(host_buf.data(), h, H * sizeof(float), cudaMemcpyDeviceToHost);
+                    uint64_t hh = 0xcbf29ce484222325ULL;
+                    for (int i = 0; i < H; i++) {
+                        uint32_t b; memcpy(&b, &host_buf[i], 4);
+                        hh = (hh ^ (uint64_t)b) * 0x100000001b3ULL;
+                    }
+                    fprintf(stderr, "[CHK L%02d t%03d %s] hash=%016lx\n",
+                            layer, step, is_attn ? "attn" : "gdn ", hh);
                     fflush(stderr);
                 }
             }
