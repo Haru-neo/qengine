@@ -629,18 +629,48 @@ struct QwenModel {
         int seq_len = kv_slot + 1;  // attention range reaches this slot (inclusive)
         int q_out_dim = q_w->dims[1];
 
+        // ATTN_DUMP_LAYER=L + ATTN_DUMP_POS=P → first 8 elements of each
+        // attn sub-step output for layer L at position P. Pair with the
+        // same envs in forward_attn_chunk to bisect chunked-vs-pertoken
+        // drift to a specific sub-step.
+        static const int attn_dump_layer = []{ const char* e=getenv("ATTN_DUMP_LAYER"); return e?atoi(e):-1; }();
+        static const int attn_dump_pos   = []{ const char* e=getenv("ATTN_DUMP_POS");   return e?atoi(e):-1; }();
+        bool attn_do_dump = (attn_dump_layer == layer) && (attn_dump_pos == pos);
+        auto attn_dump_h = [&](const char* tag, const half* buf, int n=256) {
+            if (!attn_do_dump) return;
+            cudaSetDevice(g); cudaDeviceSynchronize();
+            std::vector<half> h(n); cudaMemcpy(h.data(), buf, n*sizeof(half), cudaMemcpyDeviceToHost);
+            double sum_abs = 0.0; for (int i=0;i<n;i++) sum_abs += fabs((double)__half2float(h[i]));
+            fprintf(stderr, "[ATTN-PT L%d %-14s sa=%.6f]", layer, tag, sum_abs);
+            for (int i=0;i<8;i++) fprintf(stderr, " %.5f", __half2float(h[i]));
+            fprintf(stderr, "\n"); fflush(stderr);
+        };
+        auto attn_dump_f = [&](const char* tag, const float* buf, int n=256) {
+            if (!attn_do_dump) return;
+            cudaSetDevice(g); cudaDeviceSynchronize();
+            std::vector<float> h(n); cudaMemcpy(h.data(), buf, n*sizeof(float), cudaMemcpyDeviceToHost);
+            double sum_abs = 0.0; for (int i=0;i<n;i++) sum_abs += fabs((double)h[i]);
+            fprintf(stderr, "[ATTN-PT L%d %-14s sa=%.6f]", layer, tag, sum_abs);
+            for (int i=0;i<8;i++) fprintf(stderr, " %.5f", h[i]);
+            fprintf(stderr, "\n"); fflush(stderr);
+        };
+
         if (!external_proj) {
             // 1. RMSNorm (FP32 hidden in)
             if (norm_w->type == GGML_TYPE_F32)
                 rms_norm_f32in_f32w(norm_out, hidden, (float*)norm_w->data, 1, H, eps, stream);
             else
                 rms_norm_f32in(norm_out, hidden, (half*)norm_w->data, 1, H, eps, stream);
+            attn_dump_h("norm_out", norm_out);
 
             // 2. Q/K/V projections
             gpu_qi[g].quantize(norm_out, H, stream);
             quant_gemv(q_w->data, q_w->type, norm_out, ab.q_proj, H, q_out_dim, &gpu_qi[g], stream);
             quant_gemv(k_w->data, k_w->type, norm_out, ab.k_proj, H, kv_dim, &gpu_qi[g], stream);
             quant_gemv(v_w->data, v_w->type, norm_out, ab.v_proj, H, kv_dim, &gpu_qi[g], stream);
+            attn_dump_h("q_proj", ab.q_proj);
+            attn_dump_h("k_proj", ab.k_proj);
+            attn_dump_h("v_proj", ab.v_proj);
         }
         // else: caller has already populated ab.q_proj / ab.k_proj / ab.v_proj.
 
@@ -649,6 +679,7 @@ struct QwenModel {
         half* gate_buf = ab.gate_buf;
         deinterleave_qg_kernel<<<(total_qg+255)/256, 256, 0, stream>>>(
             ab.q_proj, q_buf, gate_buf, num_q, hd);
+        attn_dump_h("q_deint", q_buf);
 
         // 4. Head RMSNorm
         int tn = min(hd, 128);
@@ -666,6 +697,8 @@ struct QwenModel {
             head_rms_norm_kernel<<<num_kv, tn, tn * sizeof(float), stream>>>(
                 ab.k_proj, (float*)k_norm_w->data, num_kv, hd, eps);
         }
+        attn_dump_h("q_after_qnorm", q_buf);
+        attn_dump_h("k_after_qnorm", ab.k_proj);
 
         // 5. RoPE
         int rope_dim = rope.rope_dim;
@@ -676,6 +709,8 @@ struct QwenModel {
             q_buf, sin_pos, cos_pos, num_q, hd, rope_dim);
         apply_rope_kernel<<<(num_kv * half_rope + 255)/256, 256, 0, stream>>>(
             ab.k_proj, sin_pos, cos_pos, num_kv, hd, rope_dim);
+        attn_dump_h("q_after_rope", q_buf);
+        attn_dump_h("k_after_rope", ab.k_proj);
 
         // 6. Store K, V at kv_slot (may differ from RoPE pos in tree mode)
         if (use_turboquant) {
@@ -732,10 +767,12 @@ struct QwenModel {
                     num_q, num_kv, hd, seq_len, scale);
             }
         }
+        attn_dump_f("score", ab.attn_scores, seq_len);
 
         { int st = 1; while(st < seq_len && st < 256) st <<= 1;
         softmax_kernel<<<num_q, st, st * sizeof(float), stream>>>(
             ab.attn_scores, num_q, seq_len); }
+        attn_dump_f("softmax", ab.attn_scores, seq_len);
 
         if (use_turboquant) {
             auto& tq = tq_kv_caches[layer];
@@ -760,15 +797,18 @@ struct QwenModel {
                 ab.attn_scores, kv.v, q_buf,
                 num_q, num_kv, hd, seq_len);
         }
+        attn_dump_h("value_out", q_buf);
 
         // 8. Output gate: out *= sigmoid(gate)
         apply_gate_sigmoid<<<(total_qg+255)/256, 256, 0, stream>>>(
             q_buf, gate_buf, total_qg);
+        attn_dump_h("after_gate", q_buf);
 
         // 9. Output projection
         half* proj_out = bufs[g].mlp_down;
         gpu_qi_inter[g].quantize(q_buf, num_q * hd, stream);
         quant_gemv(o_w->data, o_w->type, q_buf, proj_out, num_q * hd, H, &gpu_qi_inter[g], stream);
+        attn_dump_h("o_proj", proj_out);
 
         // 10. Residual into FP32 hidden
         add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(hidden, proj_out, H);
@@ -1451,6 +1491,34 @@ struct QwenModel {
             cudaMalloc(&ab.attn_chunk_oproj,    (size_t)CHUNK_SIZE * H         * sizeof(half));
         }
 
+        // ATTN_DUMP_LAYER + ATTN_DUMP_POS dump for an arbitrary token in
+        // this chunk. POS is the absolute token position; if it falls inside
+        // [start_pos, start_pos + n_tokens) we dump that t_idx's sub-step
+        // outputs (otherwise no-op).
+        static const int attn_dump_layer = []{ const char* e=getenv("ATTN_DUMP_LAYER"); return e?atoi(e):-1; }();
+        static const int attn_dump_pos   = []{ const char* e=getenv("ATTN_DUMP_POS");   return e?atoi(e):-1; }();
+        int target_t = attn_dump_pos - start_pos;
+        bool attn_do_dump = (attn_dump_layer == layer)
+                          && (target_t >= 0 && target_t < n_tokens);
+        auto attn_dump_h = [&](const char* tag, const half* buf, int n=256) {
+            if (!attn_do_dump) return;
+            cudaSetDevice(g); cudaDeviceSynchronize();
+            std::vector<half> h(n); cudaMemcpy(h.data(), buf, n*sizeof(half), cudaMemcpyDeviceToHost);
+            double sum_abs = 0.0; for (int i=0;i<n;i++) sum_abs += fabs((double)__half2float(h[i]));
+            fprintf(stderr, "[ATTN-CK L%d %-14s sa=%.6f]", layer, tag, sum_abs);
+            for (int i=0;i<8;i++) fprintf(stderr, " %.5f", __half2float(h[i]));
+            fprintf(stderr, "\n"); fflush(stderr);
+        };
+        auto attn_dump_f = [&](const char* tag, const float* buf, int n=256) {
+            if (!attn_do_dump) return;
+            cudaSetDevice(g); cudaDeviceSynchronize();
+            std::vector<float> h(n); cudaMemcpy(h.data(), buf, n*sizeof(float), cudaMemcpyDeviceToHost);
+            double sum_abs = 0.0; for (int i=0;i<n;i++) sum_abs += fabs((double)h[i]);
+            fprintf(stderr, "[ATTN-CK L%d %-14s sa=%.6f]", layer, tag, sum_abs);
+            for (int i=0;i<8;i++) fprintf(stderr, " %.5f", h[i]);
+            fprintf(stderr, "\n"); fflush(stderr);
+        };
+
         // 1. Batched RMSNorm: rows=n_tokens, output → mlp_chunk_norm
         //    (mlp_chunk_norm is reused; MLP runs after attn and re-norms).
         if (norm_w->type == GGML_TYPE_F32) {
@@ -1460,6 +1528,7 @@ struct QwenModel {
             rms_norm_f32in(buf.mlp_chunk_norm, hidden_chunk, (half*)norm_w->data,
                            n_tokens, H, eps, stream);
         }
+        attn_dump_h("norm_out", buf.mlp_chunk_norm + (size_t)target_t * H);
 
         // 2. Quantize all n_tokens × H normed values once
         gpu_qi[g].quantize_chunk(buf.mlp_chunk_norm, H, n_tokens, stream);
@@ -1471,6 +1540,9 @@ struct QwenModel {
                          H, kv_dim, n_tokens, stream);
         quant_gemv_chunk(v_w->data, v_w->type, gpu_qi[g].q8_buf, ab.attn_chunk_v,
                          H, kv_dim, n_tokens, stream);
+        attn_dump_h("q_proj", ab.attn_chunk_q + (size_t)target_t * q_out_dim);
+        attn_dump_h("k_proj", ab.attn_chunk_k + (size_t)target_t * kv_dim);
+        attn_dump_h("v_proj", ab.attn_chunk_v + (size_t)target_t * kv_dim);
 
         // 4. Batched deinterleave Q/gate, head-RMS, RoPE across all n_tokens.
         //    Single launch per op (blockIdx.y strides tokens) instead of
@@ -1497,6 +1569,7 @@ struct QwenModel {
             deinterleave_qg_kernel_chunk<<<deint_grid, 256, 0, stream>>>(
                 ab.attn_chunk_q, ab.attn_chunk_q_post, ab.attn_chunk_gate,
                 num_q, hd, n_tokens);
+            attn_dump_h("q_deint", ab.attn_chunk_q_post + (size_t)target_t * total_qg);
 
             static const bool skip_qk_norm_c = getenv("SKIP_QK_NORM") != nullptr;
             if (!skip_qk_norm_c) {
@@ -1507,6 +1580,8 @@ struct QwenModel {
                 head_rms_norm_kernel_chunk<<<k_rms_grid, tn, tn * sizeof(float), stream>>>(
                     ab.attn_chunk_k, (float*)k_norm_w->data, num_kv, hd, eps, n_tokens);
             }
+            attn_dump_h("q_after_qnorm", ab.attn_chunk_q_post + (size_t)target_t * total_qg);
+            attn_dump_h("k_after_qnorm", ab.attn_chunk_k + (size_t)target_t * kv_dim);
 
             dim3 rope_q_grid((num_q  * half_rope + 255) / 256, n_tokens);
             dim3 rope_k_grid((num_kv * half_rope + 255) / 256, n_tokens);
@@ -1516,6 +1591,8 @@ struct QwenModel {
             apply_rope_kernel_chunk<<<rope_k_grid, 256, 0, stream>>>(
                 ab.attn_chunk_k, rope.sin_table(g), rope.cos_table(g),
                 start_pos, num_kv, hd, rope_dim, n_tokens);
+            attn_dump_h("q_after_rope", ab.attn_chunk_q_post + (size_t)target_t * total_qg);
+            attn_dump_h("k_after_rope", ab.attn_chunk_k + (size_t)target_t * kv_dim);
         }
         // Bulk KV cache append. fp16 path: copy attn_chunk_k/v directly into
         // kv.k/kv.v at offset start_pos. TQ path: (1) quantize new K/V into
@@ -1633,6 +1710,11 @@ struct QwenModel {
                     /*row_stride=*/kv_max_seq);
             }
             if (g_profile_attn) g_attn_score_ms += pa_sync_ms(ts0);
+            bool sub_has_target = (sub_processed <= target_t && target_t < sub_processed + sub_n);
+            if (attn_do_dump && sub_has_target) {
+                int target_t_in_sub = target_t - sub_processed;
+                attn_dump_f("score",   scores_sub + (size_t)target_t_in_sub * num_q * kv_max_seq, sub_seq_total);
+            }
 
             // 6. Softmax (one block per (t_idx, q_head) row in this sub-chunk).
             auto tm0 = pa_now();
@@ -1645,6 +1727,10 @@ struct QwenModel {
                     /*wipe_end=*/sub_seq_total);
             }
             if (g_profile_attn) g_attn_softmax_ms += pa_sync_ms(tm0);
+            if (attn_do_dump && sub_has_target) {
+                int target_t_in_sub = target_t - sub_processed;
+                attn_dump_f("softmax", scores_sub + (size_t)target_t_in_sub * num_q * kv_max_seq, sub_seq_total);
+            }
 
             // 7. Value multiply. v2 grid: (num_kv × sub_n, d_blocks).
             auto tv0 = pa_now();
@@ -1658,6 +1744,10 @@ struct QwenModel {
                     /*row_stride=*/kv_max_seq);
             }
             if (g_profile_attn) g_attn_value_ms += pa_sync_ms(tv0);
+            if (attn_do_dump && sub_has_target) {
+                int target_t_in_sub = target_t - sub_processed;
+                attn_dump_h("value_out", out_sub + (size_t)target_t_in_sub * total_qg);
+            }
 
             sub_processed += sub_n;
         }
@@ -1670,6 +1760,7 @@ struct QwenModel {
             apply_gate_sigmoid_chunk<<<gate_grid, 256, 0, stream>>>(
                 ab.attn_chunk_out, ab.attn_chunk_gate, total_qg, n_tokens);
         }
+        attn_dump_h("after_gate", ab.attn_chunk_out + (size_t)target_t * total_qg);
 
         // 9. Batched output projection: quantize attn_chunk_out → q8_1 chunk,
         //    then chunked GEMV for o_proj.
@@ -1677,6 +1768,7 @@ struct QwenModel {
         quant_gemv_chunk(o_w->data, o_w->type,
                          gpu_qi_inter[g].q8_buf, ab.attn_chunk_oproj,
                          total_qg, H, n_tokens, stream);
+        attn_dump_h("o_proj", ab.attn_chunk_oproj + (size_t)target_t * H);
 
         // 10. Residual add into the fp32 hidden chunk (one launch).
         {
