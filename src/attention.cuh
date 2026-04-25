@@ -777,8 +777,9 @@ __global__ void softmax_kernel_chunk(
     // 3. Normalise. Positions in [active_len, wipe_end) get an explicit
     //    zero so the value kernel can read them safely; everything else
     //    stays stale (and is never read because the value kernel walks
-    //    only up to wipe_end-1).
-    float inv = 1.0f / sum;
+    //    only up to wipe_end-1). The +1e-10 matches per-token softmax_kernel
+    //    so chunked vs per-token outputs round identically.
+    float inv = 1.0f / (sum + 1e-10f);
     for (int i = threadIdx.x; i < active_len; i += blockDim.x)
         row[i] *= inv;
     for (int i = threadIdx.x + active_len; i < wipe_end; i += blockDim.x)

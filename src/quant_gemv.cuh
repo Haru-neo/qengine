@@ -1123,6 +1123,22 @@ inline void quant_gemv_chunk(void* weight, ggml_type type,
         half* op = output_chunk;
         int remaining = n_tokens;
 
+        // BIT_EXACT_GEMM=1 forces the GEMV-batched peeling path
+        // (`gemv_q8_0_q8_nN<NB>`) instead of the tiled GEMM. The nN GEMV's
+        // K-dim reduction (thread-strided + warp/cross-warp shuffle) matches
+        // the per-token `gemv_q8_0_q8` order exactly, so each output column
+        // is bit-equal to a per-token call. Pays a prefill throughput cost.
+        static const bool bit_exact = getenv("BIT_EXACT_GEMM") != nullptr;
+        if (bit_exact) {
+            while (remaining >= 16) {
+                gemv_q8_0_q8_nN<16><<<M, threads, 0, stream>>>(weight, xp, op, K, M, 16);
+                xp += 16 * (K / 32);
+                op += (size_t)16 * M;
+                remaining -= 16;
+            }
+            // < 16 tail handled by the existing peeling block below.
+        }
+
         // MLP_GEMM_V2 env selects the GEMM tile geometry. Default = 9
         // (32x128 2x8 BK=4) — winner of the 2026-04-21 sweep against 2868-tok
         // prefill: 1.72× faster total than v1 (92.7 → 159.2 t/s). Set to 0 to
