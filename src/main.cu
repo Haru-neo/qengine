@@ -682,16 +682,37 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     float* gpu_hidden[4];
     half*  gpu_hidden_half[4];  // scratch fp16 buffer for embedding dequant
     float* gpu_hidden_chunk[4]; // [CHUNK_SIZE * H] for chunked prompt processing
+    // ── Batched gen-step buffers (Phase C) ───────────────────────────────
+    // Sized for the worst case: every slot active in one batched forward.
+    // The buffers are reused per-step; the static allocation simplifies the
+    // code path vs lazy allocation while costing only num_slots × H × 4
+    // bytes per GPU (≈ 80 KB per slot at H=5120, negligible vs KV state).
+    int batch_cap = std::max(1, num_slots);
+    float* gpu_hidden_batch[4];
+    half*  gpu_hidden_half_batch[4];
+    int*   slot_ids_dev[4];      // per-GPU copy of slot ids for the batched call
+    int*   slot_pos_dev[4];      // per-GPU copy of per-slot logical positions
+    int*   dst_kv_pos_dev[4];    // per-GPU copy of slot * slot_max_seq + pos
     for (int g = 0; g < n_gpus; g++) {
         cudaSetDevice(g);
         cudaMalloc(&gpu_hidden[g], H * sizeof(float));
         cudaMalloc(&gpu_hidden_half[g], H * sizeof(half));
         cudaMalloc(&gpu_hidden_chunk[g], CHUNK_SIZE * H * sizeof(float));
+        cudaMalloc(&gpu_hidden_batch[g],      (size_t)batch_cap * H * sizeof(float));
+        cudaMalloc(&gpu_hidden_half_batch[g], (size_t)batch_cap * H * sizeof(half));
+        cudaMalloc(&slot_ids_dev[g],   (size_t)batch_cap * sizeof(int));
+        cudaMalloc(&slot_pos_dev[g],   (size_t)batch_cap * sizeof(int));
+        cudaMalloc(&dst_kv_pos_dev[g], (size_t)batch_cap * sizeof(int));
     }
     cudaSetDevice(last_gpu);
     half* logits_buf; cudaMalloc(&logits_buf, V * sizeof(half));
     half* norm_buf; cudaMalloc(&norm_buf, H * sizeof(half));
+    half* logits_batch; cudaMalloc(&logits_batch, (size_t)batch_cap * V * sizeof(half));
+    half* norm_batch;   cudaMalloc(&norm_batch,   (size_t)batch_cap * H * sizeof(half));
+    int*  d_argmax_batch;       cudaMalloc(&d_argmax_batch, (size_t)batch_cap * sizeof(int));
+    int*  h_argmax_batch_pinned; cudaMallocHost(&h_argmax_batch_pinned, (size_t)batch_cap * sizeof(int));
     float* host_transfer; cudaMallocHost(&host_transfer, H * sizeof(float));
+    float* host_batch_transfer; cudaMallocHost(&host_batch_transfer, (size_t)batch_cap * H * sizeof(float));
     float* host_chunk_transfer; cudaMallocHost(&host_chunk_transfer, CHUNK_SIZE * H * sizeof(float));
     QuantInput qi_logits;
     // GPU argmax fast path: when temp=0 and rep_penalty=1.0 we can pick the
@@ -2291,6 +2312,123 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
 
         if (out_completion_tokens) *out_completion_tokens = (int)generated.size();
         return tok.decode(generated);
+    };
+
+    // ──── Phase C: forward_step_batched ────────────────────────────────────
+    // Process one new token from each of N slots in a single forward pass.
+    // Returns the sampled token id (greedy / temp=0) for each slot in
+    // out_tokens[N]. Only handles plain greedy gen — no spec/MTP/DDTree —
+    // since the spec scaffolding is still single-slot. Caller is responsible
+    // for embedding decisions, stop-tag detection, and KV slot lifetime.
+    //
+    // Inputs (host-side):
+    //   N            : number of active slots (1 ≤ N ≤ batch_cap)
+    //   slot_ids[N]  : which slot each entry occupies (0..num_slots-1)
+    //   token_ids[N] : the input token to embed for each slot's next forward
+    //   slot_pos[N]  : the logical position in each slot at which to write
+    //                  the new K/V (i.e. the # tokens already in the slot;
+    //                  the K/V for this token lands at this index).
+    //
+    // Outputs:
+    //   out_tokens[N] : sampled next token id per slot (host array)
+    auto forward_step_batched = [&](int N,
+                                    const int* slot_ids,
+                                    const int* token_ids,
+                                    const int* slot_pos,
+                                    int* out_tokens) {
+        if (N <= 0) return;
+        // Build per-GPU host index buffers for slot_ids / slot_pos / dst_kv_pos.
+        // dst_kv_pos[i] = slot_ids[i] * slot_max_seq + slot_pos[i]  (physical
+        // KV index for the new token's K/V).
+        std::vector<int> dst_kv_host(N);
+        for (int i = 0; i < N; i++) {
+            dst_kv_host[i] = slot_ids[i] * model.slot_max_seq + slot_pos[i];
+        }
+        for (int g = 0; g < n_gpus; g++) {
+            cudaSetDevice(g);
+            cudaMemcpyAsync(slot_ids_dev[g], slot_ids, N * sizeof(int),
+                            cudaMemcpyHostToDevice);
+            cudaMemcpyAsync(slot_pos_dev[g], slot_pos, N * sizeof(int),
+                            cudaMemcpyHostToDevice);
+            cudaMemcpyAsync(dst_kv_pos_dev[g], dst_kv_host.data(), N * sizeof(int),
+                            cudaMemcpyHostToDevice);
+        }
+        cudaSetDevice(0);
+
+        // 1. Embed N tokens onto GPU 0 → gpu_hidden_half_batch[0] [N, H] half,
+        //    then convert to fp32 → gpu_hidden_batch[0] [N, H] fp32.
+        for (int i = 0; i < N; i++) {
+            int tid = token_ids[i];
+            half* dst = gpu_hidden_half_batch[0] + (size_t)i * H;
+            if (embd_t->type == GGML_TYPE_Q8_0)
+                dequant_embd_q8_0_row<<<(H + 255) / 256, 256>>>(embd_t->data, dst, tid, H);
+            else if (embd_t->type == GGML_TYPE_Q5_K)
+                dequant_embd_q5k_row_v2<<<(H + 255) / 256, 256>>>(embd_t->data, dst, tid, H);
+            else if (embd_t->type == GGML_TYPE_Q6_K)
+                dequant_embd_q6k_row_v2<<<(H + 255) / 256, 256>>>(embd_t->data, dst, tid, H);
+        }
+        {
+            int total = N * H;
+            half_to_float_kernel<<<(total + 255) / 256, 256>>>(
+                gpu_hidden_half_batch[0], gpu_hidden_batch[0], total);
+        }
+
+        // 2. Layer loop with cross-GPU transfers of the [N, H] fp32 block.
+        float* h = gpu_hidden_batch[0];
+        for (int layer = 0; layer < model.cfg.num_layers; layer++) {
+            int g = gpu_model.layer_gpu[layer];
+            int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
+            if (g != prev_g) {
+                cudaSetDevice(prev_g); cudaDeviceSynchronize();
+                cudaMemcpy(host_batch_transfer, h,
+                           (size_t)N * H * sizeof(float), cudaMemcpyDeviceToHost);
+                cudaSetDevice(g);
+                cudaMemcpy(gpu_hidden_batch[g], host_batch_transfer,
+                           (size_t)N * H * sizeof(float), cudaMemcpyHostToDevice);
+                h = gpu_hidden_batch[g];
+            } else {
+                cudaSetDevice(g);
+            }
+            bool is_attn = model.is_attn_layer(layer);
+            if (is_attn) {
+                model.forward_attn_step_batched(layer, h, N,
+                                                slot_ids, slot_pos,
+                                                dst_kv_pos_dev[g], slot_pos_dev[g], 0);
+            } else {
+                model.forward_gdn_step_batched(layer, h, N, slot_ids, 0);
+            }
+            // forward_mlp_chunk handles N rows directly (stateless across slots).
+            model.forward_mlp_chunk(layer, h, N, 0);
+        }
+
+        // 3. Final RMSNorm + LM head + per-slot argmax on last_gpu.
+        cudaSetDevice(last_gpu);
+        cudaDeviceSynchronize();
+        // hidden_batch lives on last_gpu (pipeline ended there).
+        // RMSNorm rows=N → norm_batch [N, H] half.
+        if (out_norm_t->type == GGML_TYPE_F32) {
+            rms_norm_f32in_f32w(norm_batch, h, (float*)out_norm_t->data,
+                                N, H, model.cfg.rms_norm_eps, 0);
+        } else {
+            rms_norm_f32in(norm_batch, h, (half*)out_norm_t->data,
+                           N, H, model.cfg.rms_norm_eps, 0);
+        }
+        // Quantize all N normed rows once, then batched LM head GEMV.
+        // qi_logits is a serve_qwen-local QuantInput; quantize_chunk handles
+        // the N×H flat span (block boundaries align with token boundaries).
+        qi_logits.quantize_chunk(norm_batch, H, N, 0);
+        quant_gemv_chunk(embd_t->data, embd_t->type,
+                         qi_logits.q8_buf,
+                         logits_batch, H, V, N, 0);
+        // Per-slot greedy argmax. The reduce inside argmax_half_kernel is
+        // single-block, so launching N kernels is cheap (each is ~50 µs).
+        for (int i = 0; i < N; i++) {
+            argmax_half_kernel<<<1, 1024>>>(logits_batch + (size_t)i * V, V,
+                                            d_argmax_batch + i);
+        }
+        cudaMemcpy(h_argmax_batch_pinned, d_argmax_batch, N * sizeof(int),
+                   cudaMemcpyDeviceToHost);
+        for (int i = 0; i < N; i++) out_tokens[i] = h_argmax_batch_pinned[i];
     };
 
     // ──── Continuous batching scheduler ────────────────────────────────────
