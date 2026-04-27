@@ -821,13 +821,27 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     spec_k2_enabled   = (spec_enabled && getenv("MTP_K2")   != nullptr && getenv("MTP_TREE") == nullptr);
     spec_tree_enabled = (spec_enabled && getenv("MTP_TREE") != nullptr);
 
+    // Continuous batching N>1 is incompatible with the MTP/DFlash spec paths:
+    // those carry single-global state (mtp.kv, gdn snapshots, dflash capture
+    // buffer) that's only safe with a single in-flight sequence on slot 0. The
+    // batched gen loop runs plain greedy across all slots. Force-disable the
+    // spec flags so the user gets a clear log instead of silent N=1-only spec.
+    if (num_slots > 1 && (spec_enabled || spec_k2_enabled || spec_tree_enabled)) {
+        printf("[server] num_slots=%d > 1: disabling MTP/spec paths "
+               "(slot-0-only state, incompatible with batched gen)\n", num_slots);
+        spec_enabled = spec_k2_enabled = spec_tree_enabled = false;
+    }
+
     // ── DFlash speculative decoding (block-diffusion drafter + DDTree verify) ─
     // Activated when DFLASH=1 AND DFLASH_DRAFT_PATH=<safetensors path>.
     // Disables the MTP-based speculative paths above since DFlash uses its own
     // 5-layer non-causal drafter + target hidden capture hook.
     bool dflash_enabled = false;
     dflash::DecodeState dflash_state;
-    if (getenv("DFLASH")) {
+    if (getenv("DFLASH") && num_slots > 1) {
+        printf("[dflash] num_slots=%d > 1: DFlash needs slot-0-only capture "
+               "buffer — disabled. Run with --slots 1 for DFlash.\n", num_slots);
+    } else if (getenv("DFLASH")) {
         const char* dflash_path = getenv("DFLASH_DRAFT_PATH");
         if (!dflash_path) {
             printf("[dflash] DFLASH=1 but DFLASH_DRAFT_PATH unset — disabled\n");
