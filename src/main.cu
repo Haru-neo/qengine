@@ -2545,6 +2545,38 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 return;
             }
 
+            // Multi-slot fast path: when this is slot 0 AND no other slots are
+            // currently active, route through the legacy generate_impl path so
+            // we get MTP/spec speedup (~28 t/s instead of 20 t/s for batched
+            // N=1). SlotManager allocates lowest-index first, so the first
+            // arriving request always gets slot 0. Other slots only run
+            // batched gen — they use forward_step_batched via the gen loop.
+            //
+            // Race: if another slot becomes active while we're mid-legacy, the
+            // gen loop will block on forward_mutex until our legacy completes,
+            // serializing them. Acceptable: MTP-accelerated slot-0 finishes
+            // faster than a batched N=2 step would, and other slots queue.
+            // QWEN_NO_LEGACY_FAST_PATH=1 disables this optimization (always
+            // batched) — useful for benchmarking pure batched throughput.
+            if (slot == 0 && getenv("QWEN_NO_LEGACY_FAST_PATH") == nullptr) {
+                bool alone;
+                {
+                    std::lock_guard<std::mutex> g(gen_loop_mu);
+                    alone = true;
+                    for (int s = 1; s < num_slots; s++) {
+                        if (slot_gen_state[s]->active) { alone = false; break; }
+                    }
+                }
+                if (alone) {
+                    std::lock_guard<std::mutex> lk(sched.forward_mutex());
+                    final_text = generate_impl(seq.prompt_ids, seq.max_tokens,
+                                               seq.cached_prompt_tokens,
+                                               &completion_tokens, on_tok, slot);
+                    if (seq.on_done) seq.on_done(std::move(final_text), completion_tokens);
+                    return;
+                }
+            }
+
             // Batched path: prefill + first-token sample under the mutex via
             // generate_impl's handoff hook, then drive remaining tokens via
             // the gen-loop thread.
