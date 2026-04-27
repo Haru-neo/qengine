@@ -7,6 +7,7 @@
 #include <string>
 #include <cstdio>
 #include <chrono>
+#include <mutex>
 
 // PROFILE_ATTN=1 (set before forward_attn_chunk runs) enables per-phase sync
 // timers inside forward_attn_chunk. Accumulates score/softmax/value/other
@@ -1203,11 +1204,17 @@ struct QwenModel {
         reset_gdn_states_inner();
     }
 
-    // ============ Prefix cache ============
-    // Single-slot snapshot of per-attn KV (first N positions) + per-GDN
-    // recurrent state, taken at end of a chunk-aligned position. Caller
-    // sets `cached_prompt_tokens` in API request to opt in. Skips re-prefilling
-    // matched prefix on next request with the same first N tokens.
+    // ============ Prefix cache (per-slot) ============
+    // Each slot owns a snapshot of (KV [0, N) + GDN recurrent state) taken at
+    // a chunk-aligned position. On the next request that hits the same first
+    // N tokens, the engine restores the snapshot into that slot's KV/GDN
+    // state and skips re-prefilling those positions.
+    //
+    // Going per-slot lets concurrent clients with different system prompts
+    // each cache their own prefix — which is the actual win for the bot
+    // workload (each request shares a long fixed prefix with only the tail
+    // varying). Prior single-slot design invalidated the cache whenever a
+    // request with a different prefix landed.
     struct PrefixSnapshot {
         std::vector<int> tokens;
         int  n_pos = 0;
@@ -1218,124 +1225,153 @@ struct QwenModel {
         std::unordered_map<int, std::pair<float*, float*>> gdn_copy;
         int kv_capacity = 0;  // currently allocated KV slice length
     };
-    PrefixSnapshot prefix_cache;
+    std::vector<PrefixSnapshot> prefix_caches;   // size = num_slots
+    std::mutex                  prefix_caches_mu; // protects access from worker threads
+    void ensure_prefix_caches() {
+        if ((int)prefix_caches.size() != num_slots) prefix_caches.resize(num_slots);
+    }
 
-    void free_prefix_cache_buffers() {
-        for (auto& [layer, kv] : prefix_cache.kv_copy) {
+    void free_prefix_cache_buffers(int slot) {
+        ensure_prefix_caches();
+        if (slot < 0 || slot >= num_slots) return;
+        PrefixSnapshot& pc = prefix_caches[slot];
+        for (auto& [layer, kv] : pc.kv_copy) {
             cudaSetDevice(gpu->layer_gpu[layer]);
             cudaFree(kv.first); cudaFree(kv.second);
         }
-        for (auto& [layer, gd] : prefix_cache.gdn_copy) {
+        for (auto& [layer, gd] : pc.gdn_copy) {
             cudaSetDevice(gpu->layer_gpu[layer]);
             cudaFree(gd.first); cudaFree(gd.second);
         }
-        prefix_cache.kv_copy.clear();
-        prefix_cache.gdn_copy.clear();
-        prefix_cache.kv_capacity = 0;
-        prefix_cache.valid = false;
-        prefix_cache.n_pos = 0;
-        prefix_cache.tokens.clear();
+        pc.kv_copy.clear();
+        pc.gdn_copy.clear();
+        pc.kv_capacity = 0;
+        pc.valid = false;
+        pc.n_pos = 0;
+        pc.tokens.clear();
     }
 
     // Returns N restored if hit (caller skips first N tokens of prefill),
-    // or 0 on miss. Caller must NOT call reset_all_states before this on a
-    // potential hit; this method handles state setup itself.
+    // or 0 on miss. The slot's state is fully reset on hit (not via the
+    // global reset), so this method must run BEFORE the caller's reset.
     int try_restore_prefix_cache(const std::vector<int>& prompt_tokens,
-                                 int requested_cached) {
-        if (requested_cached <= 0 || !prefix_cache.valid) return 0;
+                                 int requested_cached, int slot = 0) {
+        ensure_prefix_caches();
+        if (slot < 0 || slot >= num_slots) return 0;
+        std::lock_guard<std::mutex> lk(prefix_caches_mu);
+        PrefixSnapshot& pc = prefix_caches[slot];
+        if (requested_cached <= 0 || !pc.valid) return 0;
         int N = (requested_cached / CHUNK_SIZE) * CHUNK_SIZE;
-        if (N <= 0 || N != prefix_cache.n_pos) return 0;
+        if (N <= 0 || N != pc.n_pos) return 0;
         if (N > (int)prompt_tokens.size()) return 0;
         for (int i = 0; i < N; i++) {
-            if (prompt_tokens[i] != prefix_cache.tokens[i]) return 0;
+            if (prompt_tokens[i] != pc.tokens[i]) return 0;
         }
-        // Hit: reset all state to zeros, then copy snapshot into [0, N).
-        reset_all_states();
+        // Hit: reset slot state, then copy snapshot into the slot's KV[0, N)
+        // and the slot's GDN state.
+        reset_slot_states(slot);
         int num_kv = cfg.num_kv_heads, hd = cfg.head_dim, kv_dim = num_kv * hd;
-        auto* qkv = t("blk.0.attn_qkv.weight");
-        int qkv_dim = qkv->dims[1];
-        int num_v = cfg.linear_v_heads, k_dim = cfg.linear_k_dim, v_dim = cfg.linear_v_dim;
+        size_t slot_kv_off = (size_t)slot * slot_max_seq * kv_dim;
         for (auto& [layer, kv] : kv_caches) {
-            auto it = prefix_cache.kv_copy.find(layer);
-            if (it == prefix_cache.kv_copy.end()) continue;
+            auto it = pc.kv_copy.find(layer);
+            if (it == pc.kv_copy.end()) continue;
             int g = gpu->layer_gpu[layer];
             cudaSetDevice(g);
-            cudaMemcpy(kv.k, it->second.first,
+            cudaMemcpy(kv.k + slot_kv_off, it->second.first,
                        (size_t)N * kv_dim * sizeof(half), cudaMemcpyDeviceToDevice);
-            cudaMemcpy(kv.v, it->second.second,
+            cudaMemcpy(kv.v + slot_kv_off, it->second.second,
                        (size_t)N * kv_dim * sizeof(half), cudaMemcpyDeviceToDevice);
         }
+        size_t conv_sz = (size_t)gdn_qkv_dim_cached * 4 * sizeof(float);
+        size_t rec_sz  = (size_t)gdn_rec_per_slot * sizeof(float);
         for (int layer = 0; layer < cfg.num_layers; layer++) {
             if (!gdn_states[layer].conv_state) continue;
-            auto it = prefix_cache.gdn_copy.find(layer);
-            if (it == prefix_cache.gdn_copy.end()) continue;
+            auto it = pc.gdn_copy.find(layer);
+            if (it == pc.gdn_copy.end()) continue;
             int g = gpu->layer_gpu[layer];
             cudaSetDevice(g);
-            cudaMemcpy(gdn_states[layer].conv_state, it->second.first,
-                       qkv_dim * 4 * sizeof(float), cudaMemcpyDeviceToDevice);
-            cudaMemcpy(gdn_states[layer].rec_state, it->second.second,
-                       num_v * k_dim * v_dim * sizeof(float), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(gdn_conv_slot(layer, slot), it->second.first,
+                       conv_sz, cudaMemcpyDeviceToDevice);
+            cudaMemcpy(gdn_rec_slot(layer, slot), it->second.second,
+                       rec_sz,  cudaMemcpyDeviceToDevice);
         }
         return N;
     }
 
-    // Snapshot current state as prefix cache for tokens[0..n_pos). Allocates
-    // device buffers lazily; reallocates if n_pos differs from prior snapshot.
-    void save_prefix_snapshot(const std::vector<int>& prompt_tokens, int n_pos) {
+    // Snapshot the slot's current KV[0..n_pos) + GDN state into its prefix
+    // slot. Lazily (re)allocates the snapshot buffers; reallocates when the
+    // requested length differs from the prior allocation.
+    void save_prefix_snapshot(const std::vector<int>& prompt_tokens, int n_pos, int slot = 0) {
+        ensure_prefix_caches();
+        if (slot < 0 || slot >= num_slots) return;
         if (n_pos <= 0 || n_pos > (int)prompt_tokens.size()) return;
+        std::lock_guard<std::mutex> lk(prefix_caches_mu);
+        PrefixSnapshot& pc = prefix_caches[slot];
         int num_kv = cfg.num_kv_heads, hd = cfg.head_dim, kv_dim = num_kv * hd;
-        auto* qkv = t("blk.0.attn_qkv.weight");
-        int qkv_dim = qkv->dims[1];
-        int num_v = cfg.linear_v_heads, k_dim = cfg.linear_k_dim, v_dim = cfg.linear_v_dim;
+        size_t slot_kv_off = (size_t)slot * slot_max_seq * kv_dim;
 
-        if (prefix_cache.kv_capacity != n_pos) {
-            free_prefix_cache_buffers();
+        if (pc.kv_capacity != n_pos) {
+            // free without re-locking — we already hold prefix_caches_mu and
+            // free_prefix_cache_buffers does no locking.
+            for (auto& [layer, kv] : pc.kv_copy) {
+                cudaSetDevice(gpu->layer_gpu[layer]);
+                cudaFree(kv.first); cudaFree(kv.second);
+            }
+            for (auto& [layer, gd] : pc.gdn_copy) {
+                cudaSetDevice(gpu->layer_gpu[layer]);
+                cudaFree(gd.first); cudaFree(gd.second);
+            }
+            pc.kv_copy.clear();
+            pc.gdn_copy.clear();
+            pc.kv_capacity = 0;
+            pc.valid = false;
         }
-        if (prefix_cache.kv_copy.empty()) {
+        if (pc.kv_copy.empty()) {
             for (auto& [layer, kv] : kv_caches) {
                 int g = gpu->layer_gpu[layer];
                 cudaSetDevice(g);
                 half *kc = nullptr, *vc = nullptr;
                 cudaMalloc(&kc, (size_t)n_pos * kv_dim * sizeof(half));
                 cudaMalloc(&vc, (size_t)n_pos * kv_dim * sizeof(half));
-                prefix_cache.kv_copy[layer] = {kc, vc};
+                pc.kv_copy[layer] = {kc, vc};
             }
             for (int layer = 0; layer < cfg.num_layers; layer++) {
                 if (!gdn_states[layer].conv_state) continue;
                 int g = gpu->layer_gpu[layer];
                 cudaSetDevice(g);
                 float *cc = nullptr, *rc = nullptr;
-                cudaMalloc(&cc, qkv_dim * 4 * sizeof(float));
-                cudaMalloc(&rc, num_v * k_dim * v_dim * sizeof(float));
-                prefix_cache.gdn_copy[layer] = {cc, rc};
+                cudaMalloc(&cc, gdn_qkv_dim_cached * 4 * sizeof(float));
+                cudaMalloc(&rc, gdn_rec_per_slot * sizeof(float));
+                pc.gdn_copy[layer] = {cc, rc};
             }
-            prefix_cache.kv_capacity = n_pos;
+            pc.kv_capacity = n_pos;
         }
         for (auto& [layer, kv] : kv_caches) {
-            auto it = prefix_cache.kv_copy.find(layer);
-            if (it == prefix_cache.kv_copy.end()) continue;
+            auto it = pc.kv_copy.find(layer);
+            if (it == pc.kv_copy.end()) continue;
             int g = gpu->layer_gpu[layer];
             cudaSetDevice(g);
-            cudaMemcpy(it->second.first,  kv.k,
+            cudaMemcpy(it->second.first,  kv.k + slot_kv_off,
                        (size_t)n_pos * kv_dim * sizeof(half), cudaMemcpyDeviceToDevice);
-            cudaMemcpy(it->second.second, kv.v,
+            cudaMemcpy(it->second.second, kv.v + slot_kv_off,
                        (size_t)n_pos * kv_dim * sizeof(half), cudaMemcpyDeviceToDevice);
         }
+        size_t conv_sz = (size_t)gdn_qkv_dim_cached * 4 * sizeof(float);
+        size_t rec_sz  = (size_t)gdn_rec_per_slot * sizeof(float);
         for (int layer = 0; layer < cfg.num_layers; layer++) {
             if (!gdn_states[layer].conv_state) continue;
-            auto it = prefix_cache.gdn_copy.find(layer);
-            if (it == prefix_cache.gdn_copy.end()) continue;
+            auto it = pc.gdn_copy.find(layer);
+            if (it == pc.gdn_copy.end()) continue;
             int g = gpu->layer_gpu[layer];
             cudaSetDevice(g);
-            cudaMemcpy(it->second.first,  gdn_states[layer].conv_state,
-                       qkv_dim * 4 * sizeof(float), cudaMemcpyDeviceToDevice);
-            cudaMemcpy(it->second.second, gdn_states[layer].rec_state,
-                       num_v * k_dim * v_dim * sizeof(float), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(it->second.first,  gdn_conv_slot(layer, slot),
+                       conv_sz, cudaMemcpyDeviceToDevice);
+            cudaMemcpy(it->second.second, gdn_rec_slot(layer, slot),
+                       rec_sz,  cudaMemcpyDeviceToDevice);
         }
-        prefix_cache.tokens.assign(prompt_tokens.begin(),
-                                   prompt_tokens.begin() + n_pos);
-        prefix_cache.n_pos = n_pos;
-        prefix_cache.valid = true;
+        pc.tokens.assign(prompt_tokens.begin(), prompt_tokens.begin() + n_pos);
+        pc.n_pos = n_pos;
+        pc.valid = true;
     }
 
     void reset_gdn_states_inner() {

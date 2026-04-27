@@ -910,22 +910,16 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         // do a normal full reset.
         int prefix_skip = 0;
         if (cached_prompt_tokens > 0) {
-            // Prefix cache is currently slot-0 only (single-snapshot global
-            // state). Slots > 0 just do a per-slot reset for now.
-            if (slot == 0) {
-                prefix_skip = model.try_restore_prefix_cache(prompt_ids, cached_prompt_tokens);
-                if (prefix_skip > 0) {
-                    printf("[CACHE] hit: skipped %d tok of prefill\n", prefix_skip);
-                    fflush(stdout);
-                }
+            prefix_skip = model.try_restore_prefix_cache(prompt_ids, cached_prompt_tokens, slot);
+            if (prefix_skip > 0) {
+                printf("[CACHE slot=%d] hit: skipped %d tok of prefill\n", slot, prefix_skip);
+                fflush(stdout);
             }
         }
         if (prefix_skip == 0) {
-            if (slot == 0) {
-                model.reset_all_states();
-            } else {
-                model.reset_slot_states(slot);
-            }
+            // Reset only this slot's state. For slot 0 with num_slots=1
+            // this is equivalent to reset_all_states (the previous default).
+            model.reset_slot_states(slot);
         }
         // Chunk-aligned snapshot point for THIS request. Only save when the
         // chunked prefill crosses this exact boundary. Capped to prompt_len-1
@@ -952,9 +946,14 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         int output_tokens = 0;
         // Reset MTP KV cache at the start of each generate() call so its
         // attention window matches the main model's per-request context.
-        if (mtp_loaded) mtp.reset_kv();
-        mtp_pending_draft = -1;
-        mtp_pending_draft_step = -1;
+        // MTP head's KV cache is a single global resource; only the slot-0
+        // generate path invokes spec, so the reset/pending-draft state only
+        // makes sense for slot 0.
+        if (slot == 0) {
+            if (mtp_loaded) mtp.reset_kv();
+            mtp_pending_draft = -1;
+            mtp_pending_draft_step = -1;
+        }
 
         // ============ Phase 1: chunked prompt processing ============
         // Process prompt in CHUNK_SIZE token chunks. Skip the very last prompt
@@ -1169,9 +1168,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
             // the snapshot already exists and content is identical).
             if (snapshot_target > 0 && prefix_skip == 0
                 && chunk_pos == snapshot_target) {
-                if (slot == 0) {
-                    model.save_prefix_snapshot(prompt_ids, snapshot_target);
-                }
+                model.save_prefix_snapshot(prompt_ids, snapshot_target, slot);
                 printf("[CACHE] snapshot saved at pos=%d\n", snapshot_target);
                 fflush(stdout);
             }
