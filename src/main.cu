@@ -2295,6 +2295,16 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         if (!generated.empty()) {
             std::string full_text = tok.decode(generated);
             printf("[API FULL TEXT]\n%s\n[/API FULL TEXT]\n", full_text.c_str());
+            // Diag: dump raw token IDs (first 16, last 8) so we can see
+            // when decode produces empty text but generated has entries.
+            int n = (int)generated.size();
+            printf("[API TOK_IDS n=%d] head:", n);
+            for (int i = 0; i < std::min(16, n); i++) printf(" %d", generated[i]);
+            if (n > 24) {
+                printf(" ... tail:");
+                for (int i = std::max(16, n - 8); i < n; i++) printf(" %d", generated[i]);
+            }
+            printf("\n");
         }
         if (mtp_loaded && mtp_total_count > 0) {
             printf("[MTP] accept %lld / %lld = %.1f%%\n",
