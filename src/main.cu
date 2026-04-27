@@ -925,11 +925,20 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     // so concurrent workers serialize GPU execution while keeping per-slot
     // KV+GDN state isolated. Phase C will replace that mutex with a true
     // batched_step that processes N slots in a single forward.
+    // batched_handoff_first_tok / batched_handoff_slot_pos: when non-null,
+    // generate_impl runs prefix-restore + chunked prefill + the single per-token
+    // forward at step==prompt_len-1 (which samples the FIRST generated token,
+    // pushes it to `generated`, and fires on_token for it), then breaks out of
+    // the per-token loop. The caller picks up where this left off and drives
+    // subsequent tokens via the batched gen-step path. *first_tok is the
+    // sampled token, *slot_pos is the next position to write (= prompt_len).
     auto generate_impl = [&](const std::vector<int>& prompt_ids, int max_tokens,
                              int cached_prompt_tokens,
                              int* out_completion_tokens,
                              const std::function<void(int)>& on_token,
-                             int slot = 0) -> std::string {
+                             int slot = 0,
+                             int* batched_handoff_first_tok = nullptr,
+                             int* batched_handoff_slot_pos = nullptr) -> std::string {
         // Prefix cache: if caller asked for caching AND a snapshot matches
         // the requested prefix, restore state instead of resetting. Otherwise
         // do a normal full reset.
@@ -2262,6 +2271,16 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     if (on_token) on_token(max_idx);
                 }
             }
+
+            // Batched gen handoff: caller wants control after the very first
+            // token. State is now: KV+GDN at slot_pos=prompt_len, first_tok in
+            // generated[0] and on_token already fired.
+            if (batched_handoff_first_tok && step == (int)prompt_ids.size() - 1
+                && !generated.empty()) {
+                *batched_handoff_first_tok = generated.back();
+                if (batched_handoff_slot_pos) *batched_handoff_slot_pos = (int)prompt_ids.size();
+                break;
+            }
         }
 
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -2416,8 +2435,10 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         // Quantize all N normed rows once, then batched LM head GEMV.
         // qi_logits is a serve_qwen-local QuantInput; quantize_chunk handles
         // the N×H flat span (block boundaries align with token boundaries).
+        // LM head weights live on last_gpu (output.weight, not the embedding
+        // tensor which is on GPU 0).
         qi_logits.quantize_chunk(norm_batch, H, N, 0);
-        quant_gemv_chunk(embd_t->data, embd_t->type,
+        quant_gemv_chunk(out_w->data, out_w->type,
                          qi_logits.q8_buf,
                          logits_batch, H, V, N, 0);
         // Per-slot greedy argmax. The reduce inside argmax_half_kernel is
@@ -2442,23 +2463,201 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     // remain race-free. Phase B will replace this with a batched_step that
     // processes N slots in a single forward and amortizes weight loads,
     // unlocking real concurrent throughput.
+    // ──── Per-slot batched gen state + dedicated gen-loop thread ──────────
+    // When num_slots > 1 we want concurrent requests to share a single
+    // batched forward per token. The split:
+    //   - Prefill (chunked) + first-token sample : single-slot, runs under the
+    //     scheduler's forward_mutex (legacy generate_impl with handoff break).
+    //   - Per-token gen loop                    : driven by the gen-loop
+    //     thread below, which collects all "active" slots each iter and
+    //     calls forward_step_batched once across them. One token per slot
+    //     per iter; per-slot stop conditions handled in the distribute step.
+    // Spec / MTP / DFlash / DDTree paths only apply to slot 0 single-stream
+    // mode and are skipped here (the batched gen loop is plain greedy).
+    struct SlotGenState {
+        bool active = false;
+        int  next_tok = -1;       // token to embed at the next batched step
+        int  slot_pos = 0;        // physical KV write position for that step
+        int  output_tokens = 0;
+        int  max_gen = 0;
+        bool in_think = false;
+        std::vector<int>          generated;
+        std::function<void(int)>  on_token;
+        // Completion signaling (the run_fn waits on this after handing the
+        // sequence off to the gen loop).
+        std::mutex                done_mu;
+        std::condition_variable   done_cv;
+        bool                      done = false;
+    };
+    std::vector<std::unique_ptr<SlotGenState>> slot_gen_state;
+    slot_gen_state.reserve(num_slots);
+    for (int i = 0; i < num_slots; i++) slot_gen_state.emplace_back(new SlotGenState());
+
+    std::mutex              gen_loop_mu;
+    std::condition_variable gen_loop_cv;
+    std::atomic<bool>       gen_loop_stop{false};
+    auto any_active = [&]() {
+        for (auto& s : slot_gen_state) if (s->active) return true;
+        return false;
+    };
+
+    std::thread gen_loop_thread;  // started below, after `sched` is in scope.
+
     qwen_engine::GenScheduler sched(num_slots,
         /*run_fn=*/[&](qwen_engine::Sequence& seq, int slot) {
-            std::string utf8_buf;
             auto on_tok = [&](int tok_id) {
                 if (seq.on_token) seq.on_token(tok_id);
             };
             int completion_tokens = 0;
             std::string final_text;
-            {
+
+            if (num_slots <= 1) {
+                // Single-slot legacy path: full generate_impl under mutex.
                 std::lock_guard<std::mutex> lk(sched.forward_mutex());
                 final_text = generate_impl(seq.prompt_ids, seq.max_tokens,
                                            seq.cached_prompt_tokens,
                                            &completion_tokens, on_tok, slot);
+                if (seq.on_done) seq.on_done(std::move(final_text), completion_tokens);
+                return;
             }
-            if (seq.on_done) seq.on_done(std::move(final_text), completion_tokens);
+
+            // Batched path: prefill + first-token sample under the mutex via
+            // generate_impl's handoff hook, then drive remaining tokens via
+            // the gen-loop thread.
+            int first_tok = -1, slot_pos_after = 0;
+            {
+                std::lock_guard<std::mutex> lk(sched.forward_mutex());
+                generate_impl(seq.prompt_ids, seq.max_tokens,
+                              seq.cached_prompt_tokens,
+                              &completion_tokens, on_tok, slot,
+                              &first_tok, &slot_pos_after);
+            }
+            // Reset per-slot gen state.
+            auto& st = *slot_gen_state[slot];
+            {
+                std::lock_guard<std::mutex> lk(gen_loop_mu);
+                st.active = false;
+                st.done = false;
+                st.in_think = false;
+                st.output_tokens = 0;
+                st.generated.clear();
+                st.on_token = on_tok;
+                int prompt_len = (int)seq.prompt_ids.size();
+                st.max_gen = seq.max_tokens > 0
+                             ? seq.max_tokens
+                             : std::max(64, max_seq - prompt_len - 64);
+            }
+            // first_tok already pushed into generate_impl's local `generated`
+            // and on_token fired. Replicate the bookkeeping here so our
+            // SlotGenState matches the model's side.
+            bool stop = false;
+            if (first_tok < 0) {
+                // generate_impl took an early exit before sampling (max_tokens=0
+                // or empty prompt). Treat as immediate stop.
+                stop = true;
+            } else if (first_tok == 248046 || first_tok == 248044 || first_tok == 248045) {
+                stop = true;  // EOS as first sampled token: nothing to gen.
+            } else {
+                st.generated.push_back(first_tok);
+                if (first_tok == 248068) st.in_think = true;
+                if (first_tok == 248069) st.in_think = false;
+                if (!st.in_think) st.output_tokens++;
+                if (st.output_tokens >= st.max_gen) stop = true;
+            }
+            if (!stop) {
+                {
+                    std::lock_guard<std::mutex> lk(gen_loop_mu);
+                    st.next_tok = first_tok;
+                    st.slot_pos = slot_pos_after;
+                    st.active = true;
+                }
+                gen_loop_cv.notify_one();
+                // Wait until the gen loop signals completion for this slot.
+                std::unique_lock<std::mutex> lk(st.done_mu);
+                st.done_cv.wait(lk, [&]() { return st.done; });
+            }
+            final_text = tok.decode(st.generated);
+            int n_completion = (int)st.generated.size();
+            if (seq.on_done) seq.on_done(std::move(final_text), n_completion);
         });
-    printf("[server] continuous batching: %d concurrent slot(s)\n", num_slots);
+    printf("[server] continuous batching: %d concurrent slot(s)%s\n",
+           num_slots, num_slots > 1 ? " (batched gen loop active)" : "");
+
+    // Now that `sched` exists, spawn the batched gen-loop thread. It pulls
+    // active slots from slot_gen_state and runs forward_step_batched under
+    // sched.forward_mutex() so prefill/single-slot forwards stay race-free.
+    if (num_slots > 1) {
+        gen_loop_thread = std::thread([&]() {
+            std::vector<int> a_slots, a_toks, a_pos, a_out;
+            a_slots.reserve(num_slots); a_toks.reserve(num_slots);
+            a_pos.reserve(num_slots);   a_out.reserve(num_slots);
+            while (!gen_loop_stop.load(std::memory_order_acquire)) {
+                a_slots.clear(); a_toks.clear(); a_pos.clear();
+                {
+                    std::unique_lock<std::mutex> lk(gen_loop_mu);
+                    gen_loop_cv.wait_for(lk, std::chrono::milliseconds(2),
+                        [&]() { return gen_loop_stop.load() || any_active(); });
+                    if (gen_loop_stop.load()) return;
+                    for (int s = 0; s < num_slots; s++) {
+                        if (slot_gen_state[s]->active) {
+                            a_slots.push_back(s);
+                            a_toks.push_back(slot_gen_state[s]->next_tok);
+                            a_pos.push_back(slot_gen_state[s]->slot_pos);
+                        }
+                    }
+                }
+                if (a_slots.empty()) continue;
+                int N = (int)a_slots.size();
+                a_out.assign(N, 0);
+                {
+                    std::lock_guard<std::mutex> lk(sched.forward_mutex());
+                    forward_step_batched(N, a_slots.data(), a_toks.data(),
+                                         a_pos.data(), a_out.data());
+                }
+                std::vector<int> finished_slots;
+                {
+                    std::lock_guard<std::mutex> lk(gen_loop_mu);
+                    for (int i = 0; i < N; i++) {
+                        int s = a_slots[i];
+                        auto& st = *slot_gen_state[s];
+                        int tok_id = a_out[i];
+                        st.slot_pos += 1;
+                        bool stop = false;
+                        if (tok_id == 248046 || tok_id == 248044 || tok_id == 248045) {
+                            stop = true;
+                        } else {
+                            st.generated.push_back(tok_id);
+                            if (st.on_token) st.on_token(tok_id);
+                            if (tok_id == 248068) st.in_think = true;
+                            if (tok_id == 248069) st.in_think = false;
+                            if (!st.in_think) st.output_tokens++;
+                            if (st.output_tokens >= st.max_gen) stop = true;
+                            if (!stop && st.generated.size() >= 4) {
+                                std::vector<int> tail(st.generated.end()-4, st.generated.end());
+                                std::string ts = tok.decode(tail);
+                                if (ts.find("</tool_call>") != std::string::npos) stop = true;
+                            }
+                            if (!stop && st.slot_pos >= max_seq - 1) stop = true;
+                        }
+                        if (stop) {
+                            st.active = false;
+                            finished_slots.push_back(s);
+                        } else {
+                            st.next_tok = tok_id;
+                        }
+                    }
+                }
+                for (int s : finished_slots) {
+                    auto& st = *slot_gen_state[s];
+                    {
+                        std::lock_guard<std::mutex> lk(st.done_mu);
+                        st.done = true;
+                    }
+                    st.done_cv.notify_all();
+                }
+            }
+        });
+    }
 
     HttpServer server;
     server.port = port;
@@ -2572,7 +2771,14 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         return tok.encode(text);
     };
 
-    return server.start(port) ? 0 : 1;
+    bool ok = server.start(port);
+    // Stop + join the batched gen loop before tearing down captures.
+    if (gen_loop_thread.joinable()) {
+        gen_loop_stop.store(true, std::memory_order_release);
+        gen_loop_cv.notify_all();
+        gen_loop_thread.join();
+    }
+    return ok ? 0 : 1;
 }
 
 // ============ Gemma serve mode ============
