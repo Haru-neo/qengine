@@ -666,7 +666,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     model.gpu = &gpu_model;
     model.init_config(gguf);
     model.alloc_buffers();
-    model.init_gdn_states();
+    model.init_gdn_states(num_slots);
     model.init_attention(max_seq, num_slots);
 
     int H = model.cfg.hidden_size;
@@ -899,7 +899,11 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     // so streaming benefits from the same spec decoding path as non-stream.
     // Slot-aware generate. `slot` selects the per-request KV+GDN partition.
     // Single-request server callers pass slot=0; the continuous-batching
-    // scheduler passes the per-Sequence slot id.
+    // scheduler passes the per-Sequence slot id. The Phase B scheduler holds
+    // a global forward mutex around the entire call (see run_fn in serve_qwen)
+    // so concurrent workers serialize GPU execution while keeping per-slot
+    // KV+GDN state isolated. Phase C will replace that mutex with a true
+    // batched_step that processes N slots in a single forward.
     auto generate_impl = [&](const std::vector<int>& prompt_ids, int max_tokens,
                              int cached_prompt_tokens,
                              int* out_completion_tokens,
