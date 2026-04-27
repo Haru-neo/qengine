@@ -483,9 +483,9 @@ static std::vector<ChatMessage> json_get_messages(const std::string& json) {
 
 // ============ HTTP Server ============
 
-using GenerateFunc = std::function<std::string(const std::vector<int>& prompt_ids, int max_tokens, int* out_completion_tokens)>;
+using GenerateFunc = std::function<std::string(const std::vector<int>& prompt_ids, int max_tokens, int cached_prompt_tokens, int* out_completion_tokens)>;
 using StreamCallback = std::function<void(const std::string& token_text, bool is_done)>;
-using StreamGenerateFunc = std::function<void(const std::vector<int>& prompt_ids, int max_tokens, StreamCallback cb)>;
+using StreamGenerateFunc = std::function<void(const std::vector<int>& prompt_ids, int max_tokens, int cached_prompt_tokens, StreamCallback cb)>;
 
 struct HttpServer {
     int port;
@@ -539,6 +539,12 @@ struct HttpServer {
         // 500 here: the API caller may legitimately want a long response
         // and the engine has the KV context room for it.
         int max_tokens = json_get_int(body, "max_tokens", 0);
+        // Prefix cache opt-in: caller declares the first N tokens of this
+        // prompt are intended to be cached for the next request. Engine
+        // rounds N down to chunk boundary, snapshots state at that point,
+        // and on the next call with the same first N tokens skips re-prefill
+        // up to N. 0 (default) = no caching.
+        int cached_prompt_tokens = json_get_int(body, "cached_prompt_tokens", 0);
         bool stream = body.find("\"stream\"") != std::string::npos &&
                       (body.find("\"stream\":true") != std::string::npos ||
                        body.find("\"stream\": true") != std::string::npos);
@@ -677,7 +683,7 @@ struct HttpServer {
                 send_sse(client_fd, "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\""
                     + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<think>\\n\"},\"finish_reason\":null}]}");
             }
-            stream_generate_fn(prompt_ids, max_tokens, [&](const std::string& token, bool done) {
+            stream_generate_fn(prompt_ids, max_tokens, cached_prompt_tokens, [&](const std::string& token, bool done) {
                 if (done) {
                     // Parse accumulated output for tool calls
                     auto parsed_calls = parse_tool_calls(stream_accum);
@@ -707,7 +713,7 @@ struct HttpServer {
         } else {
             // Non-streaming response
             int completion_tokens = 0;
-            std::string generated_text = generate_fn(prompt_ids, max_tokens, &completion_tokens);
+            std::string generated_text = generate_fn(prompt_ids, max_tokens, cached_prompt_tokens, &completion_tokens);
 
             // The chat encoder may prefill "<think>\n" into the prompt, in
             // which case the generated text starts mid-think with no opening
@@ -866,8 +872,14 @@ struct HttpServer {
             inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
             printf("[API] Connection from %s\n", client_ip);
 
-            // Handle synchronously (one request at a time for GPU safety)
-            handle_client(client_fd);
+            // Continuous batching: hand each client off to its own thread so
+            // concurrent requests aren't serialized at the socket layer.
+            // generate_fn / stream_generate_fn submit Sequences to the
+            // GenScheduler, which manages slot allocation and forward
+            // execution. Detach: each thread tears itself down on completion.
+            std::thread([this, client_fd]() {
+                this->handle_client(client_fd);
+            }).detach();
         }
         return true;
     }

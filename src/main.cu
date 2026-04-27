@@ -7,6 +7,7 @@
 #include "turboquant.cuh"
 #include "tokenizer.h"
 #include "sampling.h"
+#include "scheduler.h"
 #include "server.h"
 #include "vision.cuh"
 #include "dflash_decode.cuh"
@@ -896,23 +897,35 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     // generated token id (in append order, including both tokens accepted by
     // a spec iter). The streaming wrapper below uses it to drive SSE chunks
     // so streaming benefits from the same spec decoding path as non-stream.
+    // Slot-aware generate. `slot` selects the per-request KV+GDN partition.
+    // Single-request server callers pass slot=0; the continuous-batching
+    // scheduler passes the per-Sequence slot id.
     auto generate_impl = [&](const std::vector<int>& prompt_ids, int max_tokens,
                              int cached_prompt_tokens,
                              int* out_completion_tokens,
-                             const std::function<void(int)>& on_token) -> std::string {
+                             const std::function<void(int)>& on_token,
+                             int slot = 0) -> std::string {
         // Prefix cache: if caller asked for caching AND a snapshot matches
         // the requested prefix, restore state instead of resetting. Otherwise
         // do a normal full reset.
         int prefix_skip = 0;
         if (cached_prompt_tokens > 0) {
-            prefix_skip = model.try_restore_prefix_cache(prompt_ids, cached_prompt_tokens);
-            if (prefix_skip > 0) {
-                printf("[CACHE] hit: skipped %d tok of prefill\n", prefix_skip);
-                fflush(stdout);
+            // Prefix cache is currently slot-0 only (single-snapshot global
+            // state). Slots > 0 just do a per-slot reset for now.
+            if (slot == 0) {
+                prefix_skip = model.try_restore_prefix_cache(prompt_ids, cached_prompt_tokens);
+                if (prefix_skip > 0) {
+                    printf("[CACHE] hit: skipped %d tok of prefill\n", prefix_skip);
+                    fflush(stdout);
+                }
             }
         }
         if (prefix_skip == 0) {
-            model.reset_all_states();
+            if (slot == 0) {
+                model.reset_all_states();
+            } else {
+                model.reset_slot_states(slot);
+            }
         }
         // Chunk-aligned snapshot point for THIS request. Only save when the
         // chunked prefill crosses this exact boundary. Capped to prompt_len-1
@@ -1067,19 +1080,22 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     if (force_pt_attn) {
                         for (int tt = 0; tt < chunk_n; tt++) {
                             float* h_t = h_chunk + (size_t)tt * H;
-                            model.forward_attn(layer, h_t, chunk_pos + tt, 0);
+                            model.forward_attn(layer, h_t, chunk_pos + tt, 0,
+                                               /*external_proj=*/false, /*slot_pos=*/-1,
+                                               /*mask_start=*/-1, /*mask_len=*/0,
+                                               /*mask_bits=*/0xffffffffu, slot);
                         }
                     } else {
-                        model.forward_attn_chunk(layer, h_chunk, chunk_pos, chunk_n, 0);
+                        model.forward_attn_chunk(layer, h_chunk, chunk_pos, chunk_n, 0, slot);
                     }
                 } else {
                     if (force_pt_gdn) {
                         for (int tt = 0; tt < chunk_n; tt++) {
                             float* h_t = h_chunk + (size_t)tt * H;
-                            model.forward_gdn(layer, h_t, 0);
+                            model.forward_gdn(layer, h_t, 0, slot);
                         }
                     } else {
-                        model.forward_gdn_chunk(layer, h_chunk, chunk_n, 0);
+                        model.forward_gdn_chunk(layer, h_chunk, chunk_n, 0, slot);
                     }
                 }
                 if (do_prof) {
@@ -1153,7 +1169,9 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
             // the snapshot already exists and content is identical).
             if (snapshot_target > 0 && prefix_skip == 0
                 && chunk_pos == snapshot_target) {
-                model.save_prefix_snapshot(prompt_ids, snapshot_target);
+                if (slot == 0) {
+                    model.save_prefix_snapshot(prompt_ids, snapshot_target);
+                }
                 printf("[CACHE] snapshot saved at pos=%d\n", snapshot_target);
                 fflush(stdout);
             }
@@ -1242,9 +1260,12 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 auto ga0 = prof_now();
                 bool is_attn = model.is_attn_layer(layer);
                 if (is_attn)
-                    model.forward_attn(layer, h, step, 0);
+                    model.forward_attn(layer, h, step, 0,
+                                       /*external_proj=*/false, /*slot_pos=*/-1,
+                                       /*mask_start=*/-1, /*mask_len=*/0,
+                                       /*mask_bits=*/0xffffffffu, slot);
                 else
-                    model.forward_gdn(layer, h, 0);
+                    model.forward_gdn(layer, h, 0, slot);
                 if (do_gen_prof) {
                     double ms = prof_sync_ms(ga0, g);
                     if (is_attn) g_attn += ms; else g_gdn += ms;
@@ -1254,7 +1275,10 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 if (do_gen_prof) g_mlp += prof_sync_ms(gm0, g);
 
                 // DFlash hidden capture (no-op unless dflash mode enabled).
-                model.dflash_capture_layer(layer, h, step, g, 0);
+                // Slot-0 only — dflash uses a single global hidden buffer.
+                if (slot == 0) {
+                    model.dflash_capture_layer(layer, h, step, g, 0);
+                }
 
                 // DUMP_LAYERS=1: 각 layer 후 hidden state 처음 8 floats 출력.
                 // 마지막 prompt token (= prefill 직후 첫 per-token step) 에서만
@@ -1340,7 +1364,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 // at the NEXT iter by comparing that iter's main max_idx to the
                 // draft we saved here. mtp_pending_draft / _step persist across
                 // iters for that purpose.
-                if (mtp_loaded && !spec_enabled && step >= (int)prompt_ids.size() - 1 && getenv("MTP_ON")) {
+                if (slot == 0 && mtp_loaded && !spec_enabled && step >= (int)prompt_ids.size() - 1 && getenv("MTP_ON")) {
                     cudaError_t err_pre = cudaGetLastError();
                     if (err_pre != cudaSuccess && mtp_total_count == 0)
                         printf("[MTP] CUDA error BEFORE forward: %s\n", cudaGetErrorString(err_pre));
@@ -1402,7 +1426,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     // commit yet — main keeps producing tokens normally. Validates
                     // that draft.forward + capture buffer + lm_head all wire up.
                     // (Accept + KV/GDN rollback land in 6c-2 / 6c-3.)
-                    if (dflash_enabled) {
+                    if (slot == 0 && dflash_enabled) {
                         auto df0 = prof_now();
                         int B = dflash::DraftConfig::block_size;          // 16
                         int ctx_len_draft = step + 1;                     // capture[0..step] filled
@@ -1614,7 +1638,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     // forward_*_tree pipeline to shake out the DDTree kernels
                     // end-to-end. Once this matches K2, we'll widen to real
                     // branching by growing budget and adding ancestor-mask attn.
-                    if (spec_tree_enabled) {
+                    if (slot == 0 && spec_tree_enabled) {
                         auto sd0 = prof_now();
                         // MTP_TREE_BRANCH=1: root fan-out of top-2 drafts.
                         //   budget=3 → depth 1 (tree [root, a, b], parents [-1,0,0])
@@ -1923,7 +1947,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     //   verify_a == draft1 && verify_b == draft2 → accept both, provisional verify_c
                     //   verify_a == draft1                       → accept draft1 only
                     //   else                                      → reject both
-                    if (spec_k2_enabled) {
+                    if (slot == 0 && spec_k2_enabled) {
                         auto sd0 = prof_now();
                         // 1. Self-chain draft: MTP(norm_buf, max_idx, step+1) → draft1, h_final_draft1
                         //    Then MTP(h_final_draft1, draft1, step+2) → draft2.
@@ -2081,7 +2105,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                             mtp.kv_rollback(2);
                             step += 1;
                         }
-                    } else if (spec_enabled) {
+                    } else if (slot == 0 && spec_enabled) {
                         auto sd0 = prof_now();
                         // 1. MTP draft
                         int mtp_draft = mtp.forward(norm_buf, max_idx, step + 1);
@@ -2268,19 +2292,71 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         return tok.decode(generated);
     };
 
-    // Non-streaming wrapper: call the unified generate with no per-token cb.
-    auto generate = [&](const std::vector<int>& prompt_ids, int max_tokens,
-                        int cached_prompt_tokens,
-                        int* out_completion_tokens) -> std::string {
-        return generate_impl(prompt_ids, max_tokens, cached_prompt_tokens,
-                             out_completion_tokens, nullptr);
-    };
+    // ──── Continuous batching scheduler ────────────────────────────────────
+    // Each HTTP request is wrapped in a Sequence and submitted to the
+    // GenScheduler, which maintains a worker thread per slot. Workers pop
+    // pending sequences, allocate a slot, and call run_fn(seq, slot) — which
+    // forwards into generate_impl with that slot threaded through the model.
+    //
+    // GPU execution is currently serialized behind `sched.forward_mutex()`
+    // so the per-GPU scratch buffers (bufs[g], attn_bufs[g], gdn_bufs[g])
+    // remain race-free. Phase B will replace this with a batched_step that
+    // processes N slots in a single forward and amortizes weight loads,
+    // unlocking real concurrent throughput.
+    qwen_engine::GenScheduler sched(num_slots,
+        /*run_fn=*/[&](qwen_engine::Sequence& seq, int slot) {
+            std::string utf8_buf;
+            auto on_tok = [&](int tok_id) {
+                if (seq.on_token) seq.on_token(tok_id);
+            };
+            int completion_tokens = 0;
+            std::string final_text;
+            {
+                std::lock_guard<std::mutex> lk(sched.forward_mutex());
+                final_text = generate_impl(seq.prompt_ids, seq.max_tokens,
+                                           seq.cached_prompt_tokens,
+                                           &completion_tokens, on_tok, slot);
+            }
+            if (seq.on_done) seq.on_done(std::move(final_text), completion_tokens);
+        });
+    printf("[server] continuous batching: %d concurrent slot(s)\n", num_slots);
 
     HttpServer server;
     server.port = port;
     server.model_name = model_name;
     server.api_key = api_key;
-    server.generate_fn = generate;
+
+    // Non-streaming: submit a Sequence, wait on a future for the result.
+    server.generate_fn = [&](const std::vector<int>& prompt_ids, int max_tokens,
+                             int cached_prompt_tokens,
+                             int* out_completion_tokens) -> std::string {
+        auto seq = std::make_shared<qwen_engine::Sequence>();
+        seq->prompt_ids           = prompt_ids;
+        seq->max_tokens           = max_tokens;
+        seq->cached_prompt_tokens = cached_prompt_tokens;
+
+        std::mutex done_mu;
+        std::condition_variable done_cv;
+        bool done = false;
+        std::string final_text;
+        int comp = 0;
+        seq->on_done = [&](std::string text, int n) {
+            {
+                std::lock_guard<std::mutex> lk(done_mu);
+                final_text = std::move(text);
+                comp = n;
+                done = true;
+            }
+            done_cv.notify_all();
+        };
+        sched.submit(seq);
+        {
+            std::unique_lock<std::mutex> lk(done_mu);
+            done_cv.wait(lk, [&]() { return done; });
+        }
+        if (out_completion_tokens) *out_completion_tokens = comp;
+        return final_text;
+    };
     // Match llama.cpp: no <think> prefill. 모델이 자율적으로 필요 시
     // `<think>` 열고 닫음. 웹 UI splitThink 는 `<think>` 로 시작하는
     // stream 만 think block 으로 접고, 바로 답 오는 경우는 all-answer
@@ -2288,22 +2364,45 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     server.prefills_think_tag = false;
     server.sampling_params = &sp;
 
-    // Streaming wrapper: re-uses the unified generate_impl so it gets the
-    // same spec decoding speedup as non-streaming. The on_token callback
-    // decodes each token, buffers partial UTF-8 sequences, and pushes
-    // complete chunks through the SSE callback.
+    // Streaming wrapper. The scheduler invokes on_token on the worker thread
+    // that owns this sequence, so we decode + flush directly into the SSE
+    // callback. on_done finalizes the trailing UTF-8 buffer (in case a final
+    // multi-byte char straddled the last token boundary).
     server.stream_generate_fn = [&](const std::vector<int>& prompt_ids, int max_tokens,
                                     int cached_prompt_tokens, StreamCallback cb) {
-        std::string utf8_buf;
-        auto on_tok = [&](int tok_id) {
-            utf8_buf += tok.decode_token(tok_id);
-            std::string complete = Tokenizer::extract_complete_utf8(utf8_buf);
+        auto seq = std::make_shared<qwen_engine::Sequence>();
+        seq->prompt_ids           = prompt_ids;
+        seq->max_tokens           = max_tokens;
+        seq->cached_prompt_tokens = cached_prompt_tokens;
+
+        // utf8_buf is owned by the lambda captures — the worker thread runs
+        // on_token, then on_done; both fire before the request handler
+        // returns thanks to the cv wait below.
+        auto utf8_buf = std::make_shared<std::string>();
+        seq->on_token = [&, utf8_buf](int tok_id) {
+            *utf8_buf += tok.decode_token(tok_id);
+            std::string complete = Tokenizer::extract_complete_utf8(*utf8_buf);
             if (!complete.empty()) cb(complete, false);
         };
-        int dummy_count = 0;
-        generate_impl(prompt_ids, max_tokens, cached_prompt_tokens, &dummy_count, on_tok);
-        if (!utf8_buf.empty()) { cb(utf8_buf, false); utf8_buf.clear(); }
-        cb("", true);
+
+        std::mutex done_mu;
+        std::condition_variable done_cv;
+        bool done = false;
+        seq->on_done = [&, utf8_buf](std::string /*final_text*/, int /*n*/) {
+            if (!utf8_buf->empty()) { cb(*utf8_buf, false); utf8_buf->clear(); }
+            cb("", true);
+            {
+                std::lock_guard<std::mutex> lk(done_mu);
+                done = true;
+            }
+            done_cv.notify_all();
+        };
+
+        sched.submit(seq);
+        {
+            std::unique_lock<std::mutex> lk(done_mu);
+            done_cv.wait(lk, [&]() { return done; });
+        }
     };
 
     server.chat_encode_fn = [&](const std::vector<std::pair<std::string, std::string>>& msgs) {
