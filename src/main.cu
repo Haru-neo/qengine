@@ -9,6 +9,7 @@
 #include "sampling.h"
 #include "server.h"
 #include "vision.cuh"
+#include "dflash_decode.cuh"
 #include <cstdio>
 // Vision hooks (shared via global pointers — see main() wiring). When the CLI
 // is invoked with --mmproj + --image-raw, main() runs the ViT on GPU 0 and
@@ -659,13 +660,13 @@ int run_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, const SamplingPara
 
 // ============ Qwen serve mode: OpenAI-compatible HTTP API ============
 
-int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const Tokenizer& tok, const std::string& model_name, const std::string& api_key = "", int max_seq = 262144) {
+int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const Tokenizer& tok, const std::string& model_name, const std::string& api_key = "", int max_seq = 262144, int num_slots = 1) {
     QwenModel model;
     model.gpu = &gpu_model;
     model.init_config(gguf);
     model.alloc_buffers();
     model.init_gdn_states();
-    model.init_attention(max_seq);
+    model.init_attention(max_seq, num_slots);
 
     int H = model.cfg.hidden_size;
     int V = model.cfg.vocab_size;
@@ -797,6 +798,32 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     spec_enabled = (mtp_loaded && getenv("MTP_SPEC_OFF") == nullptr);
     spec_k2_enabled   = (spec_enabled && getenv("MTP_K2")   != nullptr && getenv("MTP_TREE") == nullptr);
     spec_tree_enabled = (spec_enabled && getenv("MTP_TREE") != nullptr);
+
+    // ── DFlash speculative decoding (block-diffusion drafter + DDTree verify) ─
+    // Activated when DFLASH=1 AND DFLASH_DRAFT_PATH=<safetensors path>.
+    // Disables the MTP-based speculative paths above since DFlash uses its own
+    // 5-layer non-causal drafter + target hidden capture hook.
+    bool dflash_enabled = false;
+    dflash::DecodeState dflash_state;
+    if (getenv("DFLASH")) {
+        const char* dflash_path = getenv("DFLASH_DRAFT_PATH");
+        if (!dflash_path) {
+            printf("[dflash] DFLASH=1 but DFLASH_DRAFT_PATH unset — disabled\n");
+        } else if (!dflash::dflash_init(dflash_state, dflash_path, model, max_seq)) {
+            printf("[dflash] init failed — disabled\n");
+        } else {
+            dflash_enabled = true;
+            // MVP: chain-only verify (budget = block_size = 16). KV slot ↔
+            // absolute pos identity holds, so accept_len truncation is free.
+            // Tree-branching (budget=22) needs KV/GDN rebuild and lands later.
+            tree_budget = dflash::DraftConfig::block_size;  // 16
+            dflash_state.budget = tree_budget;
+            // Disable MTP paths — DFlash has its own draft.
+            spec_enabled = spec_k2_enabled = spec_tree_enabled = false;
+            mtp_loaded = false;
+            printf("[dflash] active — chain MVP, budget=%d, MTP paths disabled\n", tree_budget);
+        }
+    }
     if (spec_enabled) {
         for (int g = 0; g < n_gpus; g++) {
             cudaSetDevice(g);
@@ -830,7 +857,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         model.alloc_gdn_snapshots_b();
         printf("[SPEC-K2] MTP K=2 speculative decoding enabled (self-chained draft, N=3 batched verify)\n");
     }
-    if (spec_tree_enabled) {
+    if (spec_tree_enabled || dflash_enabled) {
         for (int g = 0; g < n_gpus; g++) {
             cudaSetDevice(g);
             cudaMalloc(&tree_hidden[g],      (size_t)tree_budget * H * sizeof(float));
@@ -850,7 +877,8 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         // tree forward reuses gdn_bufs[g].chunk_* buffers, already alloc'd in
         // model init. No additional buffer pool needed here.
         model.alloc_tree_decode(tree_budget);
-        printf("[TREE] chain-tree decoding enabled (budget=%d, depth=chain)\n", tree_budget);
+        if (dflash_enabled) model.init_dflash_tree_scratch(tree_budget);
+        printf("[TREE] tree decoding buffers allocated (budget=%d)\n", tree_budget);
     }
     long long mtp_accept_count = 0;
     long long mtp_total_count  = 0;
@@ -869,9 +897,32 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     // a spec iter). The streaming wrapper below uses it to drive SSE chunks
     // so streaming benefits from the same spec decoding path as non-stream.
     auto generate_impl = [&](const std::vector<int>& prompt_ids, int max_tokens,
+                             int cached_prompt_tokens,
                              int* out_completion_tokens,
                              const std::function<void(int)>& on_token) -> std::string {
-        model.reset_all_states();
+        // Prefix cache: if caller asked for caching AND a snapshot matches
+        // the requested prefix, restore state instead of resetting. Otherwise
+        // do a normal full reset.
+        int prefix_skip = 0;
+        if (cached_prompt_tokens > 0) {
+            prefix_skip = model.try_restore_prefix_cache(prompt_ids, cached_prompt_tokens);
+            if (prefix_skip > 0) {
+                printf("[CACHE] hit: skipped %d tok of prefill\n", prefix_skip);
+                fflush(stdout);
+            }
+        }
+        if (prefix_skip == 0) {
+            model.reset_all_states();
+        }
+        // Chunk-aligned snapshot point for THIS request. Only save when the
+        // chunked prefill crosses this exact boundary. Capped to prompt_len-1
+        // (chunked prefill stops one short of the last prompt token).
+        int snapshot_target = (cached_prompt_tokens > 0)
+            ? (cached_prompt_tokens / QwenModel::CHUNK_SIZE) * QwenModel::CHUNK_SIZE
+            : 0;
+        if (snapshot_target > (int)prompt_ids.size() - 1) {
+            snapshot_target = ((int)prompt_ids.size() - 1) / QwenModel::CHUNK_SIZE * QwenModel::CHUNK_SIZE;
+        }
         std::vector<int> generated;
         // No default cap on response length: if the caller doesn't pass
         // max_tokens we let the model run all the way to the end of the
@@ -897,7 +948,10 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         // token so the existing per-token loop handles logits + sampling for it.
         int prompt_len = (int)prompt_ids.size();
         int prefill_len = prompt_len > 1 ? prompt_len - 1 : 0;
-        int chunk_pos = 0;
+        int chunk_pos = prefix_skip;
+        // If the cache hit covers the entire chunked-prefill range, skip
+        // the loop entirely. Last token still goes through per-token loop.
+        if (chunk_pos > prefill_len) chunk_pos = prefill_len;
         // PROFILE_PREFILL=1 env gates per-phase sync+timer. Adds sync overhead
         // so keep OFF for production. Phase totals printed at prefill end.
         const char* prof_env = getenv("PROFILE_PREFILL");
@@ -1043,6 +1097,11 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     model.forward_mlp_chunk(layer, h_chunk, chunk_n, 0);
                 }
                 if (do_prof) t_mlp += prof_sync_ms(tm0, g);
+
+                // DFlash hidden capture (no-op unless dflash mode enabled).
+                // Captures only configured layer ids into the GPU0 ring buffer.
+                model.dflash_capture_chunk(layer, h_chunk, chunk_pos, chunk_n, g, 0);
+
                 // DUMP_LAYERS=1: chunked prefill 경로에서도 마지막 prompt
                 // token 의 layer output hidden 처음 8 float 를 덤프한다.
                 // per-token 경로 (DISABLE_CHUNKED_PREFILL=1) 와 같은 포맷
@@ -1088,6 +1147,16 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
             cudaSetDevice(last_gpu); cudaDeviceSynchronize();
 
             chunk_pos += chunk_n;
+
+            // Snapshot prefix cache when chunk_pos lands exactly on the
+            // requested snapshot boundary (only on cache miss, since on hit
+            // the snapshot already exists and content is identical).
+            if (snapshot_target > 0 && prefix_skip == 0
+                && chunk_pos == snapshot_target) {
+                model.save_prefix_snapshot(prompt_ids, snapshot_target);
+                printf("[CACHE] snapshot saved at pos=%d\n", snapshot_target);
+                fflush(stdout);
+            }
         }
         if (do_prof) {
             double total = t_embed + t_xfer + t_attn + t_gdn + t_mlp;
@@ -1183,6 +1252,10 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 auto gm0 = prof_now();
                 model.forward_mlp(layer, h, 0);
                 if (do_gen_prof) g_mlp += prof_sync_ms(gm0, g);
+
+                // DFlash hidden capture (no-op unless dflash mode enabled).
+                model.dflash_capture_layer(layer, h, step, g, 0);
+
                 // DUMP_LAYERS=1: 각 layer 후 hidden state 처음 8 floats 출력.
                 // 마지막 prompt token (= prefill 직후 첫 per-token step) 에서만
                 // 찍어서 llama.cpp eval-callback 출력과 layer-wise 비교 가능.
@@ -1322,6 +1395,218 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         std::string tail = tok.decode(std::vector<int>(generated.end()-4, generated.end()));
                         if (tail.find("</tool_call>") != std::string::npos) break;
                     }
+
+                    // ===================== DFlash speculative decode =====================
+                    // Step 6c-1 (diagnostic only): predict the next 16-token block
+                    // with the DFlash draft, lm_head it, dump the chain. No accept
+                    // commit yet — main keeps producing tokens normally. Validates
+                    // that draft.forward + capture buffer + lm_head all wire up.
+                    // (Accept + KV/GDN rollback land in 6c-2 / 6c-3.)
+                    if (dflash_enabled) {
+                        auto df0 = prof_now();
+                        int B = dflash::DraftConfig::block_size;          // 16
+                        int ctx_len_draft = step + 1;                     // capture[0..step] filled
+
+                        // (1) noise_embed = [embed(max_idx), embed(MASK)*15]
+                        cudaSetDevice(0);
+                        half* noise = dflash_state.d_noise_embed;
+                        auto embed_row = [&](half* dst, int tok) {
+                            if (embd_t->type == GGML_TYPE_Q8_0)
+                                dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, dst, tok, H);
+                            else if (embd_t->type == GGML_TYPE_Q5_K)
+                                dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, dst, tok, H);
+                            else if (embd_t->type == GGML_TYPE_Q6_K)
+                                dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, dst, tok, H);
+                        };
+                        embed_row(noise, max_idx);
+                        for (int i = 1; i < B; i++)
+                            embed_row(noise + (size_t)i * H, dflash::DraftConfig::mask_token_id);
+
+                        // (2) positions
+                        dflash::prepare_positions(dflash_state, ctx_len_draft);
+
+                        // (3) draft forward → dflash_state.draft.h_buf [B, H] fp16
+                        dflash::draft_forward(
+                            dflash_state.draft,
+                            model.dflash_cap.gpu0_buf,
+                            noise,
+                            dflash_state.d_pos_q,
+                            dflash_state.d_pos_k,
+                            ctx_len_draft, 0);
+
+                        // (4) lm_head: draft hidden (GPU 0) → last_gpu via host pinned bridge
+                        static half* host_pinned_draft = nullptr;
+                        if (!host_pinned_draft)
+                            cudaMallocHost(&host_pinned_draft, (size_t)B * H * sizeof(half));
+                        cudaSetDevice(0); cudaDeviceSynchronize();
+                        cudaMemcpy(host_pinned_draft, dflash_state.draft.h_buf,
+                                   (size_t)B * H * sizeof(half),
+                                   cudaMemcpyDeviceToHost);
+                        cudaSetDevice(last_gpu);
+                        cudaMemcpy(tree_norm_buf, host_pinned_draft,
+                                   (size_t)B * H * sizeof(half),
+                                   cudaMemcpyHostToDevice);
+                        // Draft already applied final out_norm; skip rms_norm here.
+                        qi_logits_tree.quantize_chunk(tree_norm_buf, H, B, 0);
+                        quant_gemv_chunk(out_w->data, out_w->type,
+                                         qi_logits_tree.q8_buf,
+                                         tree_logits_buf, H, V, B, 0);
+                        for (int b = 0; b < B; b++)
+                            argmax_half_kernel<<<1, 1024>>>(
+                                tree_logits_buf + (size_t)b * V, V,
+                                tree_d_argmax + b);
+                        cudaMemcpy(tree_h_argmax, tree_d_argmax,
+                                   (size_t)B * sizeof(int),
+                                   cudaMemcpyDeviceToHost);
+
+                        // Slot 1..15 are drafts for positions step+2..step+16.
+                        // (Slot 0 is the draft's prediction for pos step+1, which
+                        //  duplicates main's max_idx — discarded.)
+                        int draft_chain[16];  // up to B-1 = 15 used
+                        for (int d = 0; d < B - 1; d++) draft_chain[d] = tree_h_argmax[d + 1];
+
+                        static int dflash_diag_count = 0;
+                        if (dflash_diag_count < 5) {
+                            printf("[dflash-diag] step=%d main=%d draft slot0=%d chain:",
+                                   step, max_idx, tree_h_argmax[0]);
+                            for (int i = 0; i < B - 1; i++) printf(" %d", draft_chain[i]);
+                            printf("\n");
+                            fflush(stdout);
+                            dflash_diag_count++;
+                        }
+                        if (do_gen_prof) g_mtp += prof_sync_ms(df0, last_gpu);
+
+                        // (6) Batched tree verify path (6c-3).
+                        // tokens = [max_idx, chain[0], ..., chain[14]] (16 slots).
+                        // parent_ids = [-1, 0, 1, ..., 14] (chain shape).
+                        // pos_base = step + 1 (slot t at absolute pos step+1+t).
+                        // We forward all 16 slots through every target layer, capturing
+                        // configured layer outputs into the GPU 0 scratch as we go.
+                        // After lm_head per slot, chain accept_drafts is the largest d
+                        // such that posterior[i] == chain[i] for all i < d.
+                        std::vector<int> tokens_h(tree_budget);
+                        std::vector<int> host_parents(tree_budget);
+                        tokens_h[0] = max_idx;
+                        host_parents[0] = -1;
+                        for (int t = 1; t < tree_budget; t++) {
+                            tokens_h[t]      = draft_chain[t - 1];
+                            host_parents[t]  = t - 1;
+                        }
+
+                        // (6a) Embed all 16 tokens onto GPU 0
+                        cudaSetDevice(0);
+                        auto se0 = prof_now();
+                        for (int b = 0; b < tree_budget; b++) {
+                            half* dst = tree_hidden_half[0] + (size_t)b * H;
+                            if (embd_t->type == GGML_TYPE_Q8_0)
+                                dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, dst, tokens_h[b], H);
+                            else if (embd_t->type == GGML_TYPE_Q5_K)
+                                dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, dst, tokens_h[b], H);
+                            else if (embd_t->type == GGML_TYPE_Q6_K)
+                                dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, dst, tokens_h[b], H);
+                        }
+                        half_to_float_kernel<<<(tree_budget*H+255)/256, 256>>>(
+                            tree_hidden_half[0], tree_hidden[0], tree_budget * H);
+                        if (do_gen_prof) g_embed += prof_sync_ms(se0, 0);
+
+                        model.upload_parent_ids(host_parents.data(), 0);
+
+                        // (6b) Tree forward 64 layers; capture per-layer hiddens.
+                        float* h_tree = tree_hidden[0];
+                        for (int layer = 0; layer < model.cfg.num_layers; layer++) {
+                            int g_l = gpu_model.layer_gpu[layer];
+                            int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
+                            if (g_l != prev_g) {
+                                cudaSetDevice(prev_g);
+                                cudaMemcpy(tree_host_transfer, h_tree,
+                                           (size_t)tree_budget * H * sizeof(float),
+                                           cudaMemcpyDeviceToHost);
+                                cudaSetDevice(g_l);
+                                cudaMemcpy(tree_hidden[g_l], tree_host_transfer,
+                                           (size_t)tree_budget * H * sizeof(float),
+                                           cudaMemcpyHostToDevice);
+                                h_tree = tree_hidden[g_l];
+                            } else cudaSetDevice(g_l);
+
+                            bool is_attn_t = model.is_attn_layer(layer);
+                            if (is_attn_t)
+                                model.forward_attn_tree(layer, h_tree, step + 1, tree_budget,
+                                                        model.tree_parent_ids_d[g_l], 0);
+                            else
+                                model.forward_gdn_tree(layer, h_tree, tree_budget,
+                                                       model.tree_parent_ids_d[g_l], 0);
+                            model.forward_mlp_tree(layer, h_tree, tree_budget,
+                                                   model.tree_parent_ids_d[g_l], 0);
+                            // Capture this layer's per-slot hidden into scratch
+                            // (no-op unless layer ∈ {1, 16, 31, 46, 61}).
+                            model.dflash_capture_tree_layer(layer, h_tree, tree_budget, g_l, 0);
+                        }
+
+                        // (6c) Batched lm_head per slot.
+                        cudaSetDevice(last_gpu); cudaDeviceSynchronize();
+                        auto sl0 = prof_now();
+                        if (out_norm_t->type == GGML_TYPE_F32)
+                            rms_norm_f32in_f32w(tree_norm_buf, h_tree, (float*)out_norm_t->data,
+                                                tree_budget, H, model.cfg.rms_norm_eps, 0);
+                        else
+                            rms_norm_f32in(tree_norm_buf, h_tree, (half*)out_norm_t->data,
+                                           tree_budget, H, model.cfg.rms_norm_eps, 0);
+                        qi_logits_tree.quantize_chunk(tree_norm_buf, H, tree_budget, 0);
+                        quant_gemv_chunk(out_w->data, out_w->type, qi_logits_tree.q8_buf,
+                                         tree_logits_buf, H, V, tree_budget, 0);
+                        for (int b = 0; b < tree_budget; b++)
+                            argmax_half_kernel<<<1, 1024>>>(
+                                tree_logits_buf + (size_t)b * V, V,
+                                tree_d_argmax + b);
+                        cudaMemcpy(tree_h_argmax, tree_d_argmax,
+                                   (size_t)tree_budget * sizeof(int), cudaMemcpyDeviceToHost);
+                        if (do_gen_prof) {
+                            g_logits += prof_sync_ms(sl0, last_gpu);
+                            g_spec_iters++;
+                        }
+
+                        // (6d) Chain accept: largest d such that posterior[i] == chain[i] for i<d.
+                        // posterior[i] = tree_h_argmax[i] = prediction for pos step+2+i.
+                        int accept_drafts = 0;
+                        for (int i = 0; i < tree_budget - 1; i++) {
+                            if (tree_h_argmax[i] == draft_chain[i]) accept_drafts++;
+                            else break;
+                        }
+                        // Bonus = posterior at slot accept_drafts (= chain[accept_drafts] if matched, or tree_h_argmax[accept_drafts] if rejected).
+                        int bonus = tree_h_argmax[accept_drafts];
+
+                        // (6e) Commit GDN state for chain prefix [slot 0..accept_drafts].
+                        int accept_len_slots = accept_drafts + 1;  // includes root
+                        model.commit_tree_gdn_chain(accept_len_slots);
+
+                        // (6f) Commit captured hiddens for accepted slots into main capture buffer.
+                        // Slot 0 (max_idx) at pos step+1, slot t at pos step+1+t.
+                        std::vector<int> commit_slots(accept_len_slots);
+                        for (int i = 0; i < accept_len_slots; i++) commit_slots[i] = i;
+                        model.dflash_commit_tree_capture(commit_slots.data(), accept_len_slots, step + 1);
+
+                        // (6g) Counters.
+                        if (accept_drafts == tree_budget - 1) tree_accept_full_count++;
+                        else if (accept_drafts > 0)            tree_accept_partial_count++;
+                        else                                    tree_reject_count++;
+                        spec_accept_count += accept_drafts;
+
+                        // (6h) Emit accepted drafts + bonus.
+                        bool stopped_dflash = false;
+                        for (int i = 0; i < accept_drafts && !stopped_dflash; i++) {
+                            if (emit_tok(draft_chain[i])) stopped_dflash = true;
+                        }
+                        if (!stopped_dflash) {
+                            if (emit_tok(bonus)) stopped_dflash = true;
+                        }
+
+                        // (6i) Step advance. Tokens emitted this iter (post-max_idx) = accept_drafts + 1.
+                        // Outer step++ adds 1; want next iter step = X + 1 + emitted + 1 - 1 = X + emitted + 1.
+                        // step += emitted; outer ++ → step + 1 = X + emitted + 1.
+                        step += accept_drafts + 1;
+                        if (stopped_dflash) break;
+                        continue;
+                    } else
 
                     // ===================== MTP_TREE chain-tree path (Phase 1) =====================
                     // Chain tree with parent_ids=[-1,0,1] is MTP K=2-equivalent in
@@ -1985,8 +2270,10 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
 
     // Non-streaming wrapper: call the unified generate with no per-token cb.
     auto generate = [&](const std::vector<int>& prompt_ids, int max_tokens,
+                        int cached_prompt_tokens,
                         int* out_completion_tokens) -> std::string {
-        return generate_impl(prompt_ids, max_tokens, out_completion_tokens, nullptr);
+        return generate_impl(prompt_ids, max_tokens, cached_prompt_tokens,
+                             out_completion_tokens, nullptr);
     };
 
     HttpServer server;
@@ -2005,7 +2292,8 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     // same spec decoding speedup as non-streaming. The on_token callback
     // decodes each token, buffers partial UTF-8 sequences, and pushes
     // complete chunks through the SSE callback.
-    server.stream_generate_fn = [&](const std::vector<int>& prompt_ids, int max_tokens, StreamCallback cb) {
+    server.stream_generate_fn = [&](const std::vector<int>& prompt_ids, int max_tokens,
+                                    int cached_prompt_tokens, StreamCallback cb) {
         std::string utf8_buf;
         auto on_tok = [&](int tok_id) {
             utf8_buf += tok.decode_token(tok_id);
@@ -2013,7 +2301,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
             if (!complete.empty()) cb(complete, false);
         };
         int dummy_count = 0;
-        generate_impl(prompt_ids, max_tokens, &dummy_count, on_tok);
+        generate_impl(prompt_ids, max_tokens, cached_prompt_tokens, &dummy_count, on_tok);
         if (!utf8_buf.empty()) { cb(utf8_buf, false); utf8_buf.clear(); }
         cb("", true);
     };
@@ -2084,7 +2372,9 @@ int serve_gemma(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
     float embd_scale = model.cfg.embd_scale;
 
     // Generate callback: takes prompt token IDs, returns generated text
-    auto generate = [&](const std::vector<int>& prompt_ids, int max_tokens, int* out_completion_tokens) -> std::string {
+    auto generate = [&](const std::vector<int>& prompt_ids, int max_tokens,
+                        int /*cached_prompt_tokens*/,
+                        int* out_completion_tokens) -> std::string {
         model.reset_all();
         std::vector<int> generated;
         auto t0 = std::chrono::high_resolution_clock::now();
@@ -2221,6 +2511,12 @@ int main(int argc, char** argv) {
     // 256K context fits comfortably, so bump the default accordingly. Can
     // always be overridden with --max-seq / -c.
     int max_seq = getenv("MTP_TQ") ? 262144 : 4096;
+    // Continuous batching: number of concurrent request slots. Each slot has
+    // its own KV+GDN state. 1 = legacy single-request behavior. Override via
+    // --slots N or QWEN_SLOTS env var. With slots=N, each slot gets max_seq
+    // tokens of context (so total physical KV is N×max_seq).
+    int num_slots = 1;
+    if (const char* e = getenv("QWEN_SLOTS")) num_slots = std::max(1, atoi(e));
     std::string prompt_text, api_key;
     std::string vision_mmproj_path, vision_test_image, image_raw_path;
     for (int i = 2; i < argc; i++) {
@@ -2234,6 +2530,8 @@ int main(int argc, char** argv) {
             max_seq = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
             max_seq = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--slots") == 0 && i + 1 < argc) {
+            num_slots = std::max(1, atoi(argv[++i]));
         } else if (strcmp(argv[i], "--vision-mmproj") == 0 && i + 1 < argc) {
             vision_mmproj_path = argv[++i];
         } else if (strcmp(argv[i], "--vision-test") == 0 && i + 1 < argc) {
@@ -2403,7 +2701,7 @@ int main(int argc, char** argv) {
       size_t d = model_name.find(".gguf"); if (d != std::string::npos) model_name = model_name.substr(0, d); }
 
     if (serve_port > 0 && arch == "qwen35") {
-        ret = serve_qwen(gguf, gpu_model, n_gpus, serve_port, tokenizer, model_name, api_key, max_seq);
+        ret = serve_qwen(gguf, gpu_model, n_gpus, serve_port, tokenizer, model_name, api_key, max_seq, num_slots);
     } else if (serve_port > 0) {
         ret = serve_gemma(gguf, gpu_model, n_gpus, serve_port);
     } else if (chat_mode && arch == "qwen35") {

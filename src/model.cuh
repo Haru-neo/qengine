@@ -87,6 +87,243 @@ struct QwenModel {
     GDNBuffers2 gdn_bufs2[4];
     GDNBuffers2 gdn_bufs3[4];
 
+    // ── DFlash target hidden capture ────────────────────────────────────────
+    // Used by speculative decoding via the DFlash draft. The capture buffer
+    // accumulates 5 selected layer outputs per committed token in the layout
+    // expected by the draft's `target_hidden_cat[ctx_len, 5*hidden]`:
+    //   gpu0_buf[(token_pos * n_slots + slot) * hidden + h]
+    // Cross-GPU transfer goes through host pinned memory (no P2P on CMP).
+    // Disabled by default; init_dflash_capture() turns it on.
+    struct DFlashCapture {
+        half* gpu0_buf       = nullptr;   // [max_ctx * n_slots * hidden] on GPU 0
+        half* staging[4]     = {};        // per-GPU [hidden] fp16 staging
+        half* host_pinned    = nullptr;   // [hidden] pinned host bridge
+        int   max_ctx        = 0;
+        int   n_slots        = 0;
+        int   layer_to_slot[256] = {};    // -1 if layer is not captured
+        bool  enabled        = false;
+
+        // Tree-mode scratch: holds per-slot fp16 hidden for each capture-layer
+        // during batched tree verify. Sized [n_slots × tree_budget × hidden].
+        // Layout: scratch[slot * tree_budget * H + tok * H + h].
+        // Filled by capture_tree_layer() during the tree forward; committed
+        // into gpu0_buf via commit_tree_capture() once accept path is known.
+        half* tree_scratch   = nullptr;
+        half* tree_host_pin  = nullptr;   // [tree_budget * hidden] pinned for cross-GPU
+        int   tree_capacity  = 0;         // budget the scratch was sized for
+    };
+    DFlashCapture dflash_cap;
+
+    void init_dflash_capture(int max_ctx_tokens, const int* layer_ids, int n_layers) {
+        int H = cfg.hidden_size;
+        dflash_cap.max_ctx = max_ctx_tokens;
+        dflash_cap.n_slots = n_layers;
+        for (int i = 0; i < 256; i++) dflash_cap.layer_to_slot[i] = -1;
+        for (int slot = 0; slot < n_layers; slot++) {
+            int L = layer_ids[slot];
+            if (L >= 0 && L < cfg.num_layers && L < 256)
+                dflash_cap.layer_to_slot[L] = slot;
+        }
+        cudaSetDevice(0);
+        size_t buf_bytes = (size_t)max_ctx_tokens * n_layers * H * sizeof(half);
+        cudaMalloc(&dflash_cap.gpu0_buf, buf_bytes);
+        cudaMemset(dflash_cap.gpu0_buf, 0, buf_bytes);
+        cudaMallocHost(&dflash_cap.host_pinned, H * sizeof(half));
+        for (int g = 0; g < gpu->num_gpus; g++) {
+            cudaSetDevice(g);
+            cudaMalloc(&dflash_cap.staging[g], H * sizeof(half));
+        }
+        cudaSetDevice(0);
+        dflash_cap.enabled = true;
+        printf("[dflash-capture] enabled, max_ctx=%d slots=%d buf=%.1f MB\n",
+               max_ctx_tokens, n_layers, buf_bytes / 1024.0 / 1024.0);
+    }
+
+    // Allocate tree-mode scratch for batched verify capture. Call once after
+    // alloc_tree_decode (so tree_budget is set). Sized to capture every slot
+    // for every captured layer in fp16.
+    void init_dflash_tree_scratch(int budget) {
+        if (!dflash_cap.enabled) return;
+        int H = cfg.hidden_size;
+        size_t bytes = (size_t)dflash_cap.n_slots * budget * H * sizeof(half);
+        cudaSetDevice(0);
+        cudaMalloc(&dflash_cap.tree_scratch, bytes);
+        cudaMallocHost(&dflash_cap.tree_host_pin, (size_t)budget * H * sizeof(half));
+        dflash_cap.tree_capacity = budget;
+        printf("[dflash-capture] tree scratch allocated: budget=%d, %.1f MB\n",
+               budget, bytes / 1024.0 / 1024.0);
+    }
+
+    // Capture every slot's fp16 hidden for `layer` (no-op unless `layer` is in
+    // the capture set). h_tree is fp32 [n_tokens × hidden] on `src_gpu`. Slot
+    // values land in dflash_cap.tree_scratch[slot_idx][0..n_tokens×H].
+    void dflash_capture_tree_layer(int layer, const float* h_tree, int n_tokens,
+                                   int src_gpu, cudaStream_t stream = 0) {
+        if (!dflash_cap.enabled) return;
+        if (layer < 0 || layer >= 256) return;
+        int slot = dflash_cap.layer_to_slot[layer];
+        if (slot < 0) return;
+        if (n_tokens <= 0 || n_tokens > dflash_cap.tree_capacity) return;
+        int H = cfg.hidden_size;
+
+        // Convert fp32 → fp16 on src_gpu, then route to GPU 0 scratch.
+        cudaSetDevice(src_gpu);
+        size_t bytes = (size_t)n_tokens * H * sizeof(half);
+        half* src_half = nullptr;
+        cudaMalloc(&src_half, bytes);
+        int total = n_tokens * H;
+        float_to_half_kernel<<<(total+255)/256, 256, 0, stream>>>(
+            h_tree, src_half, total);
+
+        half* scratch_dst = dflash_cap.tree_scratch
+                          + (size_t)slot * dflash_cap.tree_capacity * H;
+        if (src_gpu == 0) {
+            cudaMemcpyAsync(scratch_dst, src_half, bytes,
+                            cudaMemcpyDeviceToDevice, stream);
+        } else {
+            cudaMemcpyAsync(dflash_cap.tree_host_pin, src_half, bytes,
+                            cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+            cudaSetDevice(0);
+            cudaMemcpy(scratch_dst, dflash_cap.tree_host_pin, bytes,
+                       cudaMemcpyHostToDevice);
+        }
+        cudaSetDevice(src_gpu);
+        cudaFree(src_half);
+    }
+
+    // Commit the accepted tree path's hidden states to the main capture buffer.
+    // host_slots[i] is the tree-slot index of the i-th accepted token. After
+    // this call, gpu0_buf[(ctx_pos+i) * n_slots + slot] = scratch[slot][host_slots[i]]
+    // for every captured slot, and i = 0..accept_len-1.
+    void dflash_commit_tree_capture(const int* host_slots, int accept_len,
+                                    int ctx_pos) {
+        if (!dflash_cap.enabled) return;
+        if (accept_len <= 0) return;
+        int H = cfg.hidden_size;
+        cudaSetDevice(0);
+        for (int slot_idx = 0; slot_idx < dflash_cap.n_slots; slot_idx++) {
+            half* scratch_layer = dflash_cap.tree_scratch
+                                + (size_t)slot_idx * dflash_cap.tree_capacity * H;
+            for (int i = 0; i < accept_len; i++) {
+                int tree_slot = host_slots[i];
+                if (tree_slot < 0 || tree_slot >= dflash_cap.tree_capacity) continue;
+                if (ctx_pos + i >= dflash_cap.max_ctx) break;
+                half* src = scratch_layer + (size_t)tree_slot * H;
+                half* dst = dflash_cap.gpu0_buf
+                          + ((size_t)(ctx_pos + i) * dflash_cap.n_slots + slot_idx) * H;
+                cudaMemcpyAsync(dst, src, H * sizeof(half),
+                                cudaMemcpyDeviceToDevice, 0);
+            }
+        }
+    }
+
+    // Single-token capture: fp32 hidden on `src_gpu` → fp16 → GPU0 capture slot.
+    // No-op unless enabled and `layer` is one of the captured layers.
+    void dflash_capture_layer(int layer, const float* h_fp32, int token_pos,
+                              int src_gpu, cudaStream_t stream = 0) {
+        if (!dflash_cap.enabled) return;
+        if (layer < 0 || layer >= 256) return;
+        int slot = dflash_cap.layer_to_slot[layer];
+        if (slot < 0) return;
+        if (token_pos < 0 || token_pos >= dflash_cap.max_ctx) return;
+        int H = cfg.hidden_size;
+
+        // DFLASH_DUMP_CAPTURE=1: print first 8 floats of fp32 hidden for the
+        // first 3 token positions per slot. Pair with DUMP_LAYERS=1 on a
+        // per-token forward to verify capture matches the layer's actual output.
+        static const bool dump_cap = getenv("DFLASH_DUMP_CAPTURE") != nullptr;
+        if (dump_cap && token_pos < 3) {
+            cudaSetDevice(src_gpu); cudaDeviceSynchronize();
+            float sample[8];
+            cudaMemcpy(sample, h_fp32, 8 * sizeof(float), cudaMemcpyDeviceToHost);
+            fprintf(stderr, "[CAP-FP32 L%02d slot%d t%03d] %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f\n",
+                    layer, slot, token_pos,
+                    sample[0], sample[1], sample[2], sample[3],
+                    sample[4], sample[5], sample[6], sample[7]);
+            fflush(stderr);
+        }
+
+        cudaSetDevice(src_gpu);
+        half* stg = dflash_cap.staging[src_gpu];
+        float_to_half_kernel<<<(H+255)/256, 256, 0, stream>>>(h_fp32, stg, H);
+
+        half* dst = dflash_cap.gpu0_buf
+                  + ((size_t)token_pos * dflash_cap.n_slots + slot) * H;
+        if (src_gpu == 0) {
+            cudaMemcpyAsync(dst, stg, H * sizeof(half),
+                            cudaMemcpyDeviceToDevice, stream);
+        } else {
+            cudaMemcpyAsync(dflash_cap.host_pinned, stg, H * sizeof(half),
+                            cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+            cudaSetDevice(0);
+            cudaMemcpy(dst, dflash_cap.host_pinned, H * sizeof(half),
+                       cudaMemcpyHostToDevice);
+        }
+    }
+
+    // Chunk capture: fp32 [n_tokens, hidden] on `src_gpu` → fp16 → GPU0 with
+    // strided per-token write. Used by the prefill chunked path.
+    void dflash_capture_chunk(int layer, const float* h_chunk_fp32, int start_pos,
+                              int n_tokens, int src_gpu, cudaStream_t stream = 0) {
+        if (!dflash_cap.enabled) return;
+        if (layer < 0 || layer >= 256) return;
+        int slot = dflash_cap.layer_to_slot[layer];
+        if (slot < 0) return;
+        if (n_tokens <= 0) return;
+        if (start_pos < 0 || start_pos + n_tokens > dflash_cap.max_ctx) return;
+        int H = cfg.hidden_size;
+
+        static const bool dump_cap = getenv("DFLASH_DUMP_CAPTURE") != nullptr;
+        if (dump_cap && start_pos == 0) {
+            cudaSetDevice(src_gpu); cudaDeviceSynchronize();
+            for (int t = 0; t < std::min(3, n_tokens); t++) {
+                float sample[8];
+                cudaMemcpy(sample, h_chunk_fp32 + (size_t)t * H,
+                           8 * sizeof(float), cudaMemcpyDeviceToHost);
+                fprintf(stderr, "[CAP-FP32 L%02d slot%d t%03d] %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f\n",
+                        layer, slot, t,
+                        sample[0], sample[1], sample[2], sample[3],
+                        sample[4], sample[5], sample[6], sample[7]);
+            }
+            fflush(stderr);
+        }
+
+        cudaSetDevice(src_gpu);
+        size_t bytes = (size_t)n_tokens * H * sizeof(half);
+        half* chunk_half = nullptr;
+        cudaMalloc(&chunk_half, bytes);
+        int total = n_tokens * H;
+        float_to_half_kernel<<<(total+255)/256, 256, 0, stream>>>(
+            h_chunk_fp32, chunk_half, total);
+
+        if (src_gpu == 0) {
+            for (int i = 0; i < n_tokens; i++) {
+                half* dst = dflash_cap.gpu0_buf
+                          + ((size_t)(start_pos+i) * dflash_cap.n_slots + slot) * H;
+                cudaMemcpyAsync(dst, chunk_half + (size_t)i * H, H * sizeof(half),
+                                cudaMemcpyDeviceToDevice, stream);
+            }
+        } else {
+            half* host_buf = nullptr;
+            cudaMallocHost(&host_buf, bytes);
+            cudaMemcpyAsync(host_buf, chunk_half, bytes,
+                            cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+            cudaSetDevice(0);
+            for (int i = 0; i < n_tokens; i++) {
+                half* dst = dflash_cap.gpu0_buf
+                          + ((size_t)(start_pos+i) * dflash_cap.n_slots + slot) * H;
+                cudaMemcpy(dst, host_buf + (size_t)i * H, H * sizeof(half),
+                           cudaMemcpyHostToDevice);
+            }
+            cudaFreeHost(host_buf);
+        }
+        cudaSetDevice(src_gpu);
+        cudaFree(chunk_half);
+    }
+
     void init_config(GGUFFile& gguf) {
         auto arch = gguf.get_str("general.architecture");
         cfg.hidden_size = gguf.get_u32(arch + ".embedding_length");
@@ -442,12 +679,18 @@ struct QwenModel {
     AttnBuffers attn_bufs2[4];  // second-token attn buffers, for forward_attn_n2
     AttnBuffers attn_bufs3[4];  // third-token attn buffers, for forward_attn_n3 (MTP K=2)
     
-    void init_attention(int max_seq) {
+    void init_attention(int slot_max_seq_arg, int num_slots_arg = 1) {
         int num_q = cfg.num_q_heads;    // 24
         int num_kv = cfg.num_kv_heads;  // 4
         int hd = cfg.head_dim;          // 256
         float theta = 10000000.0f;
-        
+        // attn_scores buffer: per-token forward attends to AT MOST slot_max_seq
+        // positions (its own slot's range). With virtual slot partition we
+        // pass k_cache + slot_offset and seq_len = cur_len_in_slot, so the
+        // existing per-token kernel writes scores[q_head * cur_len + pos].
+        // That fits within num_q * slot_max_seq regardless of slot index.
+        int score_max_len = slot_max_seq_arg;
+
         // RoPE on each GPU that has attention layers
         for (int g = 0; g < gpu->num_gpus; g++) {
             cudaSetDevice(g);
@@ -455,13 +698,13 @@ struct QwenModel {
             cudaMalloc(&attn_bufs[g].q_proj, num_q * hd * 2 * sizeof(half));
             cudaMalloc(&attn_bufs[g].k_proj, num_kv * hd * sizeof(half));
             cudaMalloc(&attn_bufs[g].v_proj, num_kv * hd * sizeof(half));
-            cudaMalloc(&attn_bufs[g].attn_scores, num_q * max_seq * sizeof(float));
+            cudaMalloc(&attn_bufs[g].attn_scores, num_q * score_max_len * sizeof(float));
             cudaMalloc(&attn_bufs[g].attn_out, num_q * hd * sizeof(half));
             cudaMalloc(&attn_bufs[g].gate_buf, num_q * hd * sizeof(half));
         }
-        
+
         // RoPE table (same on all GPUs — just put on GPU 0 for now, copy as needed)
-        rope.init(max_seq, hd, cfg.rope_dim, theta, gpu->num_gpus);
+        rope.init(slot_max_seq_arg, hd, cfg.rope_dim, theta, gpu->num_gpus);
         
         // TurboQuant KV cache — only for attention layers, distributed across GPUs
         // For simplicity, per-GPU cache for layers on that GPU
@@ -475,8 +718,9 @@ struct QwenModel {
         
         printf("Attention: %d layers, %d Q heads, %d KV heads, head_dim=%d\n",
             attn_count, num_q, num_kv, hd);
-        printf("Max context: %d tokens\n", max_seq);
-        init_kv_cache(max_seq);
+        printf("Max context: %d tokens (per slot, %d slots = %d physical)\n",
+               slot_max_seq_arg, num_slots_arg, slot_max_seq_arg * num_slots_arg);
+        init_kv_cache(slot_max_seq_arg, num_slots_arg);
     }
     
     // Attention forward (seq_len=1, token generation)
@@ -490,7 +734,22 @@ struct QwenModel {
         half* v;  // [max_seq, num_kv * head_dim]
     };
     std::unordered_map<int, KVCache> kv_caches;
+    // Per-slot max attention range. Existing code (chunk scores stride, RoPE
+    // table size, etc.) reads `kv_max_seq` as "max seq the model can attend
+    // to in one request" — preserved as that semantic.
     int kv_max_seq = 0;
+
+    // Continuous batching: virtual KV partitioning.
+    //   physical KV layout = [slot 0 KV][slot 1 KV] ... [slot N-1 KV]
+    //   each slot's logical pos p maps to physical kv_slot = slot*kv_max_seq + p.
+    //   Attention against slot s passes k_cache + slot*kv_max_seq*kv_dim and
+    //   seq_len = cur_len_in_slot, so the existing per-token kernels work
+    //   unchanged. GDN recurrent state is duplicated per slot since it has no
+    //   positional indexing.
+    int num_slots = 1;
+    int slot_max_seq = 0;            // alias of kv_max_seq, kept for clarity
+    int kv_total_seq = 0;            // num_slots * slot_max_seq (physical)
+    int kv_slot_offset(int slot) const { return slot * slot_max_seq; }
 
     // ============ TurboQuant 3-bit KV cache (optional, MTP_TQ=1) ============
     // Drop-in replacement for the fp16 KV cache that compresses K/V to ~52
@@ -508,12 +767,15 @@ struct QwenModel {
     half* tq_v_buf[4] = {nullptr,nullptr,nullptr,nullptr};
     bool use_turboquant = false;
 
-    void init_kv_cache(int max_seq) {
-        kv_max_seq = max_seq;
+    void init_kv_cache(int slot_max_seq_arg, int num_slots_arg = 1) {
+        slot_max_seq = slot_max_seq_arg;
+        num_slots    = num_slots_arg > 0 ? num_slots_arg : 1;
+        kv_max_seq   = slot_max_seq;                // per-slot max attn range
+        kv_total_seq = slot_max_seq * num_slots;    // physical capacity
         int num_kv = cfg.num_kv_heads;
         int hd = cfg.head_dim;
         int kv_dim = num_kv * hd;
-        int kv_size = max_seq * kv_dim * sizeof(half);
+        int kv_size = kv_total_seq * kv_dim * sizeof(half);
         use_turboquant = (getenv("MTP_TQ") != nullptr);
 
         if (use_turboquant) {
@@ -522,7 +784,7 @@ struct QwenModel {
             // = 416 B per token (vs 2048 B fp16) → 4.92x compression.
             int bpt = kv_dim / TQ_BLOCK_SIZE;
             for (int g = 0; g < gpu->num_gpus; g++) tq3_init_signs(g);
-            size_t per_layer_bytes = (size_t)max_seq * bpt * sizeof(block_tq3);
+            size_t per_layer_bytes = (size_t)kv_total_seq * bpt * sizeof(block_tq3);
             for (int layer = 0; layer < cfg.num_layers; layer++) {
                 if (!is_attn_layer(layer)) continue;
                 int g = gpu->layer_gpu[layer];
@@ -535,16 +797,17 @@ struct QwenModel {
                 cudaMemset(kv.v, 0, per_layer_bytes);
                 tq_kv_caches[layer] = kv;
             }
-            // Per-GPU dequant scratch (size = max_seq * kv_dim half)
+            // Per-GPU dequant scratch (size = kv_total_seq * kv_dim half).
+            // Used by chunked attn TQ path which reads/writes [0..start_pos+n).
             for (int g = 0; g < gpu->num_gpus; g++) {
                 cudaSetDevice(g);
-                cudaMalloc(&tq_k_buf[g], (size_t)max_seq * kv_dim * sizeof(half));
-                cudaMalloc(&tq_v_buf[g], (size_t)max_seq * kv_dim * sizeof(half));
+                cudaMalloc(&tq_k_buf[g], (size_t)kv_total_seq * kv_dim * sizeof(half));
+                cudaMalloc(&tq_v_buf[g], (size_t)kv_total_seq * kv_dim * sizeof(half));
             }
             float total_mb = (float)tq_kv_caches.size() * per_layer_bytes * 2 / 1e6;
             float fp16_mb  = (float)tq_kv_caches.size() * kv_size * 2 / 1e6;
-            printf("KV cache (TurboQuant 3-bit): %d layers, %d max_seq, %.1f MB total (vs %.1f MB fp16, %.2fx compression)\n",
-                (int)tq_kv_caches.size(), max_seq, total_mb, fp16_mb, fp16_mb / total_mb);
+            printf("KV cache (TurboQuant 3-bit): %d layers, slot_max_seq=%d × %d slots = %d total, %.1f MB (vs %.1f MB fp16, %.2fx compression)\n",
+                (int)tq_kv_caches.size(), slot_max_seq, num_slots, kv_total_seq, total_mb, fp16_mb, fp16_mb / total_mb);
             return;
         }
 
@@ -559,9 +822,9 @@ struct QwenModel {
             cudaMemset(kv.v, 0, kv_size);
             kv_caches[layer] = kv;
         }
-        printf("KV cache (FP16): %d layers, %d max_seq, %.1f MB total\n",
-            (int)kv_caches.size(), max_seq,
-            (float)kv_caches.size() * kv_size * 2 / 1e6);
+        printf("KV cache (FP16): %d layers, slot_max_seq=%d × %d slots = %d total, %.1f MB\n",
+            (int)kv_caches.size(), slot_max_seq, num_slots, kv_total_seq,
+            (float)kv_caches.size() * kv_size / 1e6);
     }
 
     void reset_kv_cache() {
@@ -570,7 +833,7 @@ struct QwenModel {
         int kv_dim = num_kv * hd;
         if (use_turboquant) {
             int bpt = kv_dim / TQ_BLOCK_SIZE;
-            size_t sz = (size_t)kv_max_seq * bpt * sizeof(block_tq3);
+            size_t sz = (size_t)kv_total_seq * bpt * sizeof(block_tq3);
             for (auto& [layer, kv] : tq_kv_caches) {
                 int g = gpu->layer_gpu[layer];
                 cudaSetDevice(g);
@@ -579,12 +842,39 @@ struct QwenModel {
             }
             return;
         }
-        int kv_size = kv_max_seq * kv_dim * sizeof(half);
+        size_t kv_size = (size_t)kv_total_seq * kv_dim * sizeof(half);
         for (auto& [layer, kv] : kv_caches) {
             int g = gpu->layer_gpu[layer];
             cudaSetDevice(g);
             cudaMemset(kv.k, 0, kv_size);
             cudaMemset(kv.v, 0, kv_size);
+        }
+    }
+
+    // Reset only slot s's KV range. Cheaper than full reset when num_slots > 1.
+    void reset_kv_slot(int slot) {
+        if (slot < 0 || slot >= num_slots) return;
+        int num_kv = cfg.num_kv_heads, hd = cfg.head_dim;
+        int kv_dim = num_kv * hd;
+        if (use_turboquant) {
+            int bpt = kv_dim / TQ_BLOCK_SIZE;
+            size_t per_slot = (size_t)slot_max_seq * bpt * sizeof(block_tq3);
+            size_t off      = (size_t)slot * slot_max_seq * bpt;
+            for (auto& [layer, kv] : tq_kv_caches) {
+                int g = gpu->layer_gpu[layer];
+                cudaSetDevice(g);
+                cudaMemset(kv.k + off, 0, per_slot);
+                cudaMemset(kv.v + off, 0, per_slot);
+            }
+            return;
+        }
+        size_t per_slot = (size_t)slot_max_seq * kv_dim * sizeof(half);
+        size_t off_elem = (size_t)slot * slot_max_seq * kv_dim;
+        for (auto& [layer, kv] : kv_caches) {
+            int g = gpu->layer_gpu[layer];
+            cudaSetDevice(g);
+            cudaMemset(kv.k + off_elem, 0, per_slot);
+            cudaMemset(kv.v + off_elem, 0, per_slot);
         }
     }
 
@@ -601,7 +891,8 @@ struct QwenModel {
                       int slot_pos = -1,
                       int mask_start = -1,
                       int mask_len = 0,
-                      uint32_t mask_bits = 0xffffffffu) {
+                      uint32_t mask_bits = 0xffffffffu,
+                      int slot = 0) {
         int g = gpu->layer_gpu[layer];
         int H = cfg.hidden_size;
         int num_q = cfg.num_q_heads;
@@ -611,6 +902,10 @@ struct QwenModel {
         float eps = cfg.rms_norm_eps;
         float scale = 1.0f / sqrtf((float)hd);
         auto& ab = attn_bufs[g];
+        // Continuous batching: KV virtual slot offset. For slot==0 this is 0
+        // and behavior matches single-slot exactly (bit-exact).
+        int kv_dim_total = num_kv * hd;
+        size_t slot_kv_off = (size_t)slot * slot_max_seq * kv_dim_total;
 
         auto* norm_w = t(blk(layer, "attn_norm.weight"));
         auto* q_w = t(blk(layer, "attn_q.weight"));
@@ -712,19 +1007,20 @@ struct QwenModel {
         attn_dump_h("q_after_rope", q_buf);
         attn_dump_h("k_after_rope", ab.k_proj);
 
-        // 6. Store K, V at kv_slot (may differ from RoPE pos in tree mode)
+        // 6. Store K, V at slot_offset + kv_slot (may differ from RoPE pos in tree mode)
         if (use_turboquant) {
             auto& tq = tq_kv_caches[layer];
             int bpt = tq.blocks_per_token;
-            size_t off = (size_t)kv_slot * bpt;
+            size_t slot_off_blocks = (size_t)slot * slot_max_seq * bpt;
+            size_t off = slot_off_blocks + (size_t)kv_slot * bpt;
             tq3_quantize_kernel<<<(bpt+31)/32, 32, 0, stream>>>(
                 ab.k_proj, &tq.k[off], bpt);
             tq3_quantize_kernel<<<(bpt+31)/32, 32, 0, stream>>>(
                 ab.v_proj, &tq.v[off], bpt);
         } else {
             auto& kv = kv_caches[layer];
-            half* k_cache_pos = kv.k + (size_t)kv_slot * kv_dim;
-            half* v_cache_pos = kv.v + (size_t)kv_slot * kv_dim;
+            half* k_cache_pos = kv.k + slot_kv_off + (size_t)kv_slot * kv_dim;
+            half* v_cache_pos = kv.v + slot_kv_off + (size_t)kv_slot * kv_dim;
             cudaMemcpyAsync(k_cache_pos, ab.k_proj, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
             cudaMemcpyAsync(v_cache_pos, ab.v_proj, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
         }
@@ -740,30 +1036,34 @@ struct QwenModel {
         static const bool tq_fused = getenv("TQ_FUSED") != nullptr;
         if (use_turboquant) {
             auto& tq = tq_kv_caches[layer];
+            int slot_off_blocks_int = slot * slot_max_seq * tq.blocks_per_token;
+            block_tq3* tq_k_slot = tq.k + slot_off_blocks_int;
+            block_tq3* tq_v_slot = tq.v + slot_off_blocks_int;
             if (tq_fused) {
                 dim3 tq_score_grid(num_kv, seq_len);
                 int smem_bytes = hd * sizeof(float);
                 attn_score_kernel_tq3<<<tq_score_grid, hd, smem_bytes, stream>>>(
-                    q_buf, tq.k, ab.attn_scores,
+                    q_buf, tq_k_slot, ab.attn_scores,
                     num_q, num_kv, hd, seq_len, scale);
             } else {
                 int n_blocks_total = seq_len * tq.blocks_per_token;
                 tq3_dequantize_kernel<<<(n_blocks_total + 31)/32, 32, 0, stream>>>(
-                    tq.k, tq_k_buf[g], n_blocks_total);
+                    tq_k_slot, tq_k_buf[g], n_blocks_total);
                 attn_score_kernel_h<<<score_grid, min(hd, 256), 0, stream>>>(
                     q_buf, tq_k_buf[g], ab.attn_scores,
                     num_q, num_kv, hd, seq_len, scale);
             }
         } else {
             auto& kv = kv_caches[layer];
+            half* k_slot = kv.k + slot_kv_off;
             if (mask_start >= 0) {
                 attn_score_kernel_h_tree_masked<<<score_grid, min(hd, 256), 0, stream>>>(
-                    q_buf, kv.k, ab.attn_scores,
+                    q_buf, k_slot, ab.attn_scores,
                     num_q, num_kv, hd, seq_len, scale,
                     mask_start, mask_len, mask_bits);
             } else {
                 attn_score_kernel_h<<<score_grid, min(hd, 256), 0, stream>>>(
-                    q_buf, kv.k, ab.attn_scores,
+                    q_buf, k_slot, ab.attn_scores,
                     num_q, num_kv, hd, seq_len, scale);
             }
         }
@@ -776,25 +1076,28 @@ struct QwenModel {
 
         if (use_turboquant) {
             auto& tq = tq_kv_caches[layer];
+            int slot_off_blocks_int = slot * slot_max_seq * tq.blocks_per_token;
+            block_tq3* tq_v_slot = tq.v + slot_off_blocks_int;
             if (tq_fused) {
                 int blocks_per_kv_head = hd / TQ_BLOCK_SIZE;
                 dim3 tq_value_grid(num_kv, blocks_per_kv_head);
                 int smem_bytes = TQ_BLOCK_SIZE * sizeof(float);
                 attn_value_kernel_tq3<<<tq_value_grid, TQ_BLOCK_SIZE, smem_bytes, stream>>>(
-                    ab.attn_scores, tq.v, q_buf,
+                    ab.attn_scores, tq_v_slot, q_buf,
                     num_q, num_kv, hd, seq_len);
             } else {
                 int n_blocks_total = seq_len * tq.blocks_per_token;
                 tq3_dequantize_kernel<<<(n_blocks_total + 31)/32, 32, 0, stream>>>(
-                    tq.v, tq_v_buf[g], n_blocks_total);
+                    tq_v_slot, tq_v_buf[g], n_blocks_total);
                 attn_value_kernel_h<<<num_q, min(hd, 256), 0, stream>>>(
                     ab.attn_scores, tq_v_buf[g], q_buf,
                     num_q, num_kv, hd, seq_len);
             }
         } else {
             auto& kv = kv_caches[layer];
+            half* v_slot = kv.v + slot_kv_off;
             attn_value_kernel_h<<<num_q, min(hd, 256), 0, stream>>>(
-                ab.attn_scores, kv.v, q_buf,
+                ab.attn_scores, v_slot, q_buf,
                 num_q, num_kv, hd, seq_len);
         }
         attn_dump_h("value_out", q_buf);
@@ -819,13 +1122,28 @@ struct QwenModel {
     // recurrent state: [num_v_heads, k_head_dim, v_head_dim] per layer
     
     struct GDNState {
-        float* conv_state;    // [qkv_dim, 4] FP32
-        float* rec_state;    // [num_v_heads, k_dim, v_dim] FP32 (Volta has 1:32 fp64)
+        // Per-slot flat arrays. Slot s lives at:
+        //   conv_state + s * (qkv_dim * 4)
+        //   rec_state  + s * (num_v_heads * k_dim * v_dim)
+        // Allocation count = num_slots. With num_slots=1 the layout reduces to
+        // the original single-state layout, so single-request behavior is
+        // bit-exact preserved.
+        float* conv_state;    // [num_slots, qkv_dim, 4]
+        float* rec_state;     // [num_slots, num_v_heads, k_dim, v_dim]
     };
     std::vector<GDNState> gdn_states;
-    
+    int gdn_qkv_dim_cached = 0;     // qkv_dim (set in init_gdn_states)
+    int gdn_rec_per_slot = 0;       // num_v * k_dim * v_dim
+
+    inline float* gdn_conv_slot(int layer, int slot) {
+        return gdn_states[layer].conv_state + (size_t)slot * gdn_qkv_dim_cached * 4;
+    }
+    inline float* gdn_rec_slot(int layer, int slot) {
+        return gdn_states[layer].rec_state + (size_t)slot * gdn_rec_per_slot;
+    }
+
     int gdn_qkv_dim() { return 0; } // computed from tensor
-    
+
     void init_gdn_states() {
         // Get dimensions from first GDN layer
         auto* qkv = t("blk.0.attn_qkv.weight");
@@ -852,7 +1170,12 @@ struct QwenModel {
         cfg.linear_v_heads = num_v;
         cfg.linear_k_dim = k_dim;
         cfg.linear_v_dim = v_dim;
-        
+
+        gdn_qkv_dim_cached = qkv_dim;
+        gdn_rec_per_slot   = num_v * k_dim * v_dim;
+        size_t conv_bytes = (size_t)num_slots * qkv_dim * 4 * sizeof(float);
+        size_t rec_bytes  = (size_t)num_slots * gdn_rec_per_slot * sizeof(float);
+
         gdn_states.resize(cfg.num_layers);
         for (int layer = 0; layer < cfg.num_layers; layer++) {
             // Only GDN layers need state (every layer except 3,7,11,...,63)
@@ -864,12 +1187,15 @@ struct QwenModel {
             }
             int g = gpu->layer_gpu[layer];
             cudaSetDevice(g);
-            cudaMalloc(&gdn_states[layer].conv_state, qkv_dim * 4 * sizeof(float));
-            cudaMemset(gdn_states[layer].conv_state, 0, qkv_dim * 4 * sizeof(float));
-            cudaMalloc(&gdn_states[layer].rec_state, num_v * k_dim * v_dim * sizeof(float));
-            cudaMemset(gdn_states[layer].rec_state, 0, num_v * k_dim * v_dim * sizeof(float));
+            cudaMalloc(&gdn_states[layer].conv_state, conv_bytes);
+            cudaMemset(gdn_states[layer].conv_state, 0, conv_bytes);
+            cudaMalloc(&gdn_states[layer].rec_state, rec_bytes);
+            cudaMemset(gdn_states[layer].rec_state, 0, rec_bytes);
         }
-        printf("GDN states allocated for %d layers\n", cfg.num_layers);
+        printf("GDN states allocated for %d layers × %d slots (conv %.1f MB, rec %.1f MB total)\n",
+               cfg.num_layers, num_slots,
+               cfg.num_layers * (double)conv_bytes / 1e6,
+               cfg.num_layers * (double)rec_bytes  / 1e6);
     }
     
     void reset_all_states() {
@@ -877,26 +1203,181 @@ struct QwenModel {
         reset_gdn_states_inner();
     }
 
+    // ============ Prefix cache ============
+    // Single-slot snapshot of per-attn KV (first N positions) + per-GDN
+    // recurrent state, taken at end of a chunk-aligned position. Caller
+    // sets `cached_prompt_tokens` in API request to opt in. Skips re-prefilling
+    // matched prefix on next request with the same first N tokens.
+    struct PrefixSnapshot {
+        std::vector<int> tokens;
+        int  n_pos = 0;
+        bool valid = false;
+        // [layer] -> (k_copy[N*kv_dim], v_copy[N*kv_dim]) on layer's GPU
+        std::unordered_map<int, std::pair<half*, half*>> kv_copy;
+        // [layer] -> (conv_state_copy, rec_state_copy) on layer's GPU
+        std::unordered_map<int, std::pair<float*, float*>> gdn_copy;
+        int kv_capacity = 0;  // currently allocated KV slice length
+    };
+    PrefixSnapshot prefix_cache;
+
+    void free_prefix_cache_buffers() {
+        for (auto& [layer, kv] : prefix_cache.kv_copy) {
+            cudaSetDevice(gpu->layer_gpu[layer]);
+            cudaFree(kv.first); cudaFree(kv.second);
+        }
+        for (auto& [layer, gd] : prefix_cache.gdn_copy) {
+            cudaSetDevice(gpu->layer_gpu[layer]);
+            cudaFree(gd.first); cudaFree(gd.second);
+        }
+        prefix_cache.kv_copy.clear();
+        prefix_cache.gdn_copy.clear();
+        prefix_cache.kv_capacity = 0;
+        prefix_cache.valid = false;
+        prefix_cache.n_pos = 0;
+        prefix_cache.tokens.clear();
+    }
+
+    // Returns N restored if hit (caller skips first N tokens of prefill),
+    // or 0 on miss. Caller must NOT call reset_all_states before this on a
+    // potential hit; this method handles state setup itself.
+    int try_restore_prefix_cache(const std::vector<int>& prompt_tokens,
+                                 int requested_cached) {
+        if (requested_cached <= 0 || !prefix_cache.valid) return 0;
+        int N = (requested_cached / CHUNK_SIZE) * CHUNK_SIZE;
+        if (N <= 0 || N != prefix_cache.n_pos) return 0;
+        if (N > (int)prompt_tokens.size()) return 0;
+        for (int i = 0; i < N; i++) {
+            if (prompt_tokens[i] != prefix_cache.tokens[i]) return 0;
+        }
+        // Hit: reset all state to zeros, then copy snapshot into [0, N).
+        reset_all_states();
+        int num_kv = cfg.num_kv_heads, hd = cfg.head_dim, kv_dim = num_kv * hd;
+        auto* qkv = t("blk.0.attn_qkv.weight");
+        int qkv_dim = qkv->dims[1];
+        int num_v = cfg.linear_v_heads, k_dim = cfg.linear_k_dim, v_dim = cfg.linear_v_dim;
+        for (auto& [layer, kv] : kv_caches) {
+            auto it = prefix_cache.kv_copy.find(layer);
+            if (it == prefix_cache.kv_copy.end()) continue;
+            int g = gpu->layer_gpu[layer];
+            cudaSetDevice(g);
+            cudaMemcpy(kv.k, it->second.first,
+                       (size_t)N * kv_dim * sizeof(half), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(kv.v, it->second.second,
+                       (size_t)N * kv_dim * sizeof(half), cudaMemcpyDeviceToDevice);
+        }
+        for (int layer = 0; layer < cfg.num_layers; layer++) {
+            if (!gdn_states[layer].conv_state) continue;
+            auto it = prefix_cache.gdn_copy.find(layer);
+            if (it == prefix_cache.gdn_copy.end()) continue;
+            int g = gpu->layer_gpu[layer];
+            cudaSetDevice(g);
+            cudaMemcpy(gdn_states[layer].conv_state, it->second.first,
+                       qkv_dim * 4 * sizeof(float), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(gdn_states[layer].rec_state, it->second.second,
+                       num_v * k_dim * v_dim * sizeof(float), cudaMemcpyDeviceToDevice);
+        }
+        return N;
+    }
+
+    // Snapshot current state as prefix cache for tokens[0..n_pos). Allocates
+    // device buffers lazily; reallocates if n_pos differs from prior snapshot.
+    void save_prefix_snapshot(const std::vector<int>& prompt_tokens, int n_pos) {
+        if (n_pos <= 0 || n_pos > (int)prompt_tokens.size()) return;
+        int num_kv = cfg.num_kv_heads, hd = cfg.head_dim, kv_dim = num_kv * hd;
+        auto* qkv = t("blk.0.attn_qkv.weight");
+        int qkv_dim = qkv->dims[1];
+        int num_v = cfg.linear_v_heads, k_dim = cfg.linear_k_dim, v_dim = cfg.linear_v_dim;
+
+        if (prefix_cache.kv_capacity != n_pos) {
+            free_prefix_cache_buffers();
+        }
+        if (prefix_cache.kv_copy.empty()) {
+            for (auto& [layer, kv] : kv_caches) {
+                int g = gpu->layer_gpu[layer];
+                cudaSetDevice(g);
+                half *kc = nullptr, *vc = nullptr;
+                cudaMalloc(&kc, (size_t)n_pos * kv_dim * sizeof(half));
+                cudaMalloc(&vc, (size_t)n_pos * kv_dim * sizeof(half));
+                prefix_cache.kv_copy[layer] = {kc, vc};
+            }
+            for (int layer = 0; layer < cfg.num_layers; layer++) {
+                if (!gdn_states[layer].conv_state) continue;
+                int g = gpu->layer_gpu[layer];
+                cudaSetDevice(g);
+                float *cc = nullptr, *rc = nullptr;
+                cudaMalloc(&cc, qkv_dim * 4 * sizeof(float));
+                cudaMalloc(&rc, num_v * k_dim * v_dim * sizeof(float));
+                prefix_cache.gdn_copy[layer] = {cc, rc};
+            }
+            prefix_cache.kv_capacity = n_pos;
+        }
+        for (auto& [layer, kv] : kv_caches) {
+            auto it = prefix_cache.kv_copy.find(layer);
+            if (it == prefix_cache.kv_copy.end()) continue;
+            int g = gpu->layer_gpu[layer];
+            cudaSetDevice(g);
+            cudaMemcpy(it->second.first,  kv.k,
+                       (size_t)n_pos * kv_dim * sizeof(half), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(it->second.second, kv.v,
+                       (size_t)n_pos * kv_dim * sizeof(half), cudaMemcpyDeviceToDevice);
+        }
+        for (int layer = 0; layer < cfg.num_layers; layer++) {
+            if (!gdn_states[layer].conv_state) continue;
+            auto it = prefix_cache.gdn_copy.find(layer);
+            if (it == prefix_cache.gdn_copy.end()) continue;
+            int g = gpu->layer_gpu[layer];
+            cudaSetDevice(g);
+            cudaMemcpy(it->second.first,  gdn_states[layer].conv_state,
+                       qkv_dim * 4 * sizeof(float), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(it->second.second, gdn_states[layer].rec_state,
+                       num_v * k_dim * v_dim * sizeof(float), cudaMemcpyDeviceToDevice);
+        }
+        prefix_cache.tokens.assign(prompt_tokens.begin(),
+                                   prompt_tokens.begin() + n_pos);
+        prefix_cache.n_pos = n_pos;
+        prefix_cache.valid = true;
+    }
+
     void reset_gdn_states_inner() {
+        size_t conv_bytes = (size_t)num_slots * gdn_qkv_dim_cached * 4 * sizeof(float);
+        size_t rec_bytes  = (size_t)num_slots * gdn_rec_per_slot * sizeof(float);
         for (int layer = 0; layer < cfg.num_layers; layer++) {
             if (!gdn_states[layer].conv_state) continue;
             int g = gpu->layer_gpu[layer];
             cudaSetDevice(g);
-            auto* qkv = t("blk.0.attn_qkv.weight");
-            int qkv_dim = qkv->dims[1];
-            int num_v = cfg.linear_v_heads;
-            int k_dim = cfg.linear_k_dim;
-            int v_dim = cfg.linear_v_dim;
-            cudaMemset(gdn_states[layer].conv_state, 0, qkv_dim * 4 * sizeof(float));
-            cudaMemset(gdn_states[layer].rec_state, 0, num_v * k_dim * v_dim * sizeof(float));
+            cudaMemset(gdn_states[layer].conv_state, 0, conv_bytes);
+            cudaMemset(gdn_states[layer].rec_state, 0, rec_bytes);
         }
+    }
+
+    // Reset only slot s's GDN state.
+    void reset_gdn_slot(int slot) {
+        if (slot < 0 || slot >= num_slots) return;
+        size_t conv_off = (size_t)slot * gdn_qkv_dim_cached * 4;
+        size_t rec_off  = (size_t)slot * gdn_rec_per_slot;
+        size_t conv_sz  = gdn_qkv_dim_cached * 4 * sizeof(float);
+        size_t rec_sz   = gdn_rec_per_slot * sizeof(float);
+        for (int layer = 0; layer < cfg.num_layers; layer++) {
+            if (!gdn_states[layer].conv_state) continue;
+            int g = gpu->layer_gpu[layer];
+            cudaSetDevice(g);
+            cudaMemset(gdn_states[layer].conv_state + conv_off, 0, conv_sz);
+            cudaMemset(gdn_states[layer].rec_state  + rec_off,  0, rec_sz);
+        }
+    }
+
+    // Per-slot reset = KV range + GDN state for that slot only.
+    void reset_slot_states(int slot) {
+        reset_kv_slot(slot);
+        reset_gdn_slot(slot);
     }
     
     bool is_attn_layer(int layer) { return ((layer + 1) % 4 == 0); }
 
 
-    // GDN forward (seq_len=1, with cache)
-    void forward_gdn(int layer, float* hidden, cudaStream_t stream) {
+    // GDN forward (seq_len=1, with cache).  `slot` selects the per-request
+    // recurrent state (default 0 = legacy single-slot behavior).
+    void forward_gdn(int layer, float* hidden, cudaStream_t stream, int slot = 0) {
         int g = gpu->layer_gpu[layer];
         auto& buf = bufs[g];
         int H = cfg.hidden_size;
@@ -905,6 +1386,8 @@ struct QwenModel {
         int k_dim = cfg.linear_k_dim;
         int v_dim = cfg.linear_v_dim;
         int qkv_dim = 2 * num_k * k_dim + num_v * v_dim;
+        float* conv_state_slot = gdn_conv_slot(layer, slot);
+        float* rec_state_slot  = gdn_rec_slot(layer, slot);
 
         auto* norm_w  = t(blk(layer, "attn_norm.weight"));
         auto* qkv_w   = t(blk(layer, "attn_qkv.weight"));
@@ -943,7 +1426,7 @@ struct QwenModel {
         int threads_conv = min(qkv_dim, 256);
         int blocks_conv = (qkv_dim + threads_conv - 1) / threads_conv;
         conv1d_update_silu<<<blocks_conv, threads_conv, 0, stream>>>(
-            gdn_states[layer].conv_state,
+            conv_state_slot,
             qkv_out,
             (float*)conv_w->data,  // conv weight is F32
             conv_out,
@@ -969,7 +1452,7 @@ struct QwenModel {
             (float*)dt_bias_t->data,
             a_out,
             b_out,
-            gdn_states[layer].rec_state,
+            rec_state_slot,
             core_out,
             num_k, num_v, k_dim, v_dim
         );
@@ -1021,8 +1504,9 @@ struct QwenModel {
     }
 
     // ============ Chunked GDN forward (process N tokens together) ============
-    // hidden_chunk: [n_tokens, H] FP32 — read & updated in-place
-    void forward_gdn_chunk(int layer, float* hidden_chunk, int n_tokens, cudaStream_t stream) {
+    // hidden_chunk: [n_tokens, H] FP32 — read & updated in-place.
+    // `slot` selects per-request recurrent state (default 0 = legacy single-slot).
+    void forward_gdn_chunk(int layer, float* hidden_chunk, int n_tokens, cudaStream_t stream, int slot = 0) {
         int g = gpu->layer_gpu[layer];
         auto& buf = bufs[g];
         auto& gb = gdn_bufs[g];
@@ -1033,6 +1517,8 @@ struct QwenModel {
         int v_dim = cfg.linear_v_dim;
         int qkv_dim = 2 * num_k * k_dim + num_v * v_dim;
         int v_total = num_v * v_dim;
+        float* conv_state_slot = gdn_conv_slot(layer, slot);
+        float* rec_state_slot  = gdn_rec_slot(layer, slot);
 
         auto* norm_w  = t(blk(layer, "attn_norm.weight"));
         auto* qkv_w   = t(blk(layer, "attn_qkv.weight"));
@@ -1165,7 +1651,7 @@ struct QwenModel {
             int threads = min(qkv_dim, 256);
             int blocks  = (qkv_dim + threads - 1) / threads;
             conv1d_update_silu_chunk<<<blocks, threads, 0, stream>>>(
-                gdn_states[layer].conv_state, gb.chunk_qkv_half,
+                conv_state_slot, gb.chunk_qkv_half,
                 (float*)conv_w->data, gb.chunk_qkv, qkv_dim, kw, n_tokens);
         }
 
@@ -1205,7 +1691,7 @@ struct QwenModel {
                 (float*)dt_bias_t->data,
                 gb.chunk_a_proj,
                 gb.chunk_b_proj,
-                gdn_states[layer].rec_state,
+                rec_state_slot,
                 gb.chunk_core_out,
                 n_tokens, num_k, num_v, k_dim, v_dim
             );
@@ -1257,7 +1743,7 @@ struct QwenModel {
     // GPU; parent_ids_dev[t] == -1 means "parent is the pre-tree state".
     // Caller must have invoked `alloc_tree_decode(budget)` first.
     void forward_gdn_tree(int layer, float* hidden_tree, int n_tokens,
-                          const int* parent_ids_dev, cudaStream_t stream) {
+                          const int* parent_ids_dev, cudaStream_t stream, int slot = 0) {
         // Debug fallback: sequentially call non-tree forward_gdn for each node.
         // Correct for chain parent_ids=[-1, 0, 1, ..., n-1] because each call
         // updates rec_state/conv_state in-place, which is exactly what the
@@ -1270,7 +1756,7 @@ struct QwenModel {
         if (fallback_gdn) {
             int H = cfg.hidden_size;
             for (int t = 0; t < n_tokens; t++) {
-                forward_gdn(layer, hidden_tree + (size_t)t * H, stream);
+                forward_gdn(layer, hidden_tree + (size_t)t * H, stream, slot);
             }
             return;
         }
@@ -1283,6 +1769,8 @@ struct QwenModel {
         int v_dim = cfg.linear_v_dim;
         int qkv_dim = 2 * num_k * k_dim + num_v * v_dim;
         int v_total = num_v * v_dim;
+        float* conv_state_slot = gdn_conv_slot(layer, slot);
+        float* rec_state_slot  = gdn_rec_slot(layer, slot);
 
         auto* norm_w    = t(blk(layer, "attn_norm.weight"));
         auto* qkv_w     = t(blk(layer, "attn_qkv.weight"));
@@ -1339,7 +1827,7 @@ struct QwenModel {
             int threads = min(qkv_dim, 256);
             int blocks  = (qkv_dim + threads - 1) / threads;
             conv1d_update_silu_tree<8><<<blocks, threads, 0, stream>>>(
-                gdn_states[layer].conv_state,
+                conv_state_slot,
                 gb.chunk_qkv_half,
                 (float*)conv_w->data,
                 parent_ids_dev,
@@ -1360,7 +1848,7 @@ struct QwenModel {
                 (float*)dt_bias_t->data,
                 gb.chunk_a_proj,
                 gb.chunk_b_proj,
-                gdn_states[layer].rec_state,
+                rec_state_slot,
                 tree_gdn_inter[layer],
                 parent_ids_dev,
                 gb.chunk_core_out,
@@ -1418,7 +1906,7 @@ struct QwenModel {
     // ancestor, but branching trees require this path for correctness.
     // Requires upload_parent_ids() to have been called for the current tree.
     void forward_attn_tree(int layer, float* hidden_tree, int pos_base, int n_tokens,
-                           const int* parent_ids_dev, cudaStream_t stream) {
+                           const int* parent_ids_dev, cudaStream_t stream, int slot = 0) {
         (void)parent_ids_dev;
         int H = cfg.hidden_size;
         for (int t = 0; t < n_tokens; t++) {
@@ -1430,14 +1918,15 @@ struct QwenModel {
                          /*slot_pos=*/kv_slot,
                          /*mask_start=*/pos_base,
                          /*mask_len=*/n_tokens,
-                         /*mask_bits=*/mbits);
+                         /*mask_bits=*/mbits,
+                         /*slot=*/slot);
         }
     }
 
     // ============ Chunked attention forward (process N tokens) ============
     // For attention layers in prompt phase: process tokens sequentially through
     // forward_attn (KV cache requires sequential append). hidden_chunk is FP32.
-    void forward_attn_chunk(int layer, float* hidden_chunk, int start_pos, int n_tokens, cudaStream_t stream) {
+    void forward_attn_chunk(int layer, float* hidden_chunk, int start_pos, int n_tokens, cudaStream_t stream, int slot = 0) {
         int g = gpu->layer_gpu[layer];
         auto& ab = attn_bufs[g];
         auto& buf = bufs[g];
@@ -1449,6 +1938,9 @@ struct QwenModel {
         int total_qg = num_q * hd;
         float eps = cfg.rms_norm_eps;
         float scale = 1.0f / sqrtf((float)hd);
+        // Continuous batching: slot KV offset (0 for single-slot, no behavior change).
+        size_t slot_kv_off = (size_t)slot * slot_max_seq * kv_dim;
+        int slot_pos_off   = slot * slot_max_seq;
 
         auto* norm_w   = t(blk(layer, "attn_norm.weight"));
         auto* q_w      = t(blk(layer, "attn_q.weight"));
@@ -1459,7 +1951,10 @@ struct QwenModel {
         auto* o_w      = t(blk(layer, "attn_output.weight"));
         if (!norm_w || !q_w || !k_w || !v_w || !o_w) {
             for (int tt = 0; tt < n_tokens; tt++)
-                forward_attn(layer, hidden_chunk + (size_t)tt * H, start_pos + tt, stream);
+                forward_attn(layer, hidden_chunk + (size_t)tt * H, start_pos + tt, stream,
+                             /*external_proj=*/false, /*slot_pos=*/-1,
+                             /*mask_start=*/-1, /*mask_len=*/0,
+                             /*mask_bits=*/0xffffffffu, slot);
             return;
         }
         int q_out_dim = q_w->dims[1];
@@ -1475,7 +1970,10 @@ struct QwenModel {
                            && (o_w->type == GGML_TYPE_Q8_0);
         if (!can_batch_attn) {
             for (int tt = 0; tt < n_tokens; tt++)
-                forward_attn(layer, hidden_chunk + (size_t)tt * H, start_pos + tt, stream);
+                forward_attn(layer, hidden_chunk + (size_t)tt * H, start_pos + tt, stream,
+                             /*external_proj=*/false, /*slot_pos=*/-1,
+                             /*mask_start=*/-1, /*mask_len=*/0,
+                             /*mask_bits=*/0xffffffffu, slot);
             return;
         }
 
@@ -1556,13 +2054,16 @@ struct QwenModel {
         // with bulk-dequanted history + newly-computed tokens.
         half* k_cache_ptr;
         half* v_cache_ptr;
+        // For multi-slot: each pointer is offset to the slot's KV virtual
+        // partition. Downstream chunked attn kernels read [0, sub_seq_total)
+        // through this base, naturally seeing only the slot's tokens.
         if (use_turboquant) {
-            k_cache_ptr = tq_k_buf[g];
-            v_cache_ptr = tq_v_buf[g];
+            k_cache_ptr = tq_k_buf[g] + slot_kv_off;
+            v_cache_ptr = tq_v_buf[g] + slot_kv_off;
         } else {
             auto& kv = kv_caches[layer];
-            k_cache_ptr = kv.k;
-            v_cache_ptr = kv.v;
+            k_cache_ptr = kv.k + slot_kv_off;
+            v_cache_ptr = kv.v + slot_kv_off;
         }
         {
             dim3 deint_grid((total_qg + 255) / 256, n_tokens);
@@ -1608,21 +2109,25 @@ struct QwenModel {
                 auto& tq = tq_kv_caches[layer];
                 int bpt = tq.blocks_per_token;
                 int new_blocks = n_tokens * bpt;
+                size_t slot_blk_off = (size_t)slot * slot_max_seq * bpt;
+                block_tq3* tq_k_slot = tq.k + slot_blk_off;
+                block_tq3* tq_v_slot = tq.v + slot_blk_off;
                 tq3_quantize_kernel<<<(new_blocks + 31)/32, 32, 0, stream>>>(
-                    ab.attn_chunk_k, &tq.k[(size_t)start_pos * bpt], new_blocks);
+                    ab.attn_chunk_k, &tq_k_slot[(size_t)start_pos * bpt], new_blocks);
                 tq3_quantize_kernel<<<(new_blocks + 31)/32, 32, 0, stream>>>(
-                    ab.attn_chunk_v, &tq.v[(size_t)start_pos * bpt], new_blocks);
+                    ab.attn_chunk_v, &tq_v_slot[(size_t)start_pos * bpt], new_blocks);
                 if (start_pos > 0) {
                     int hist_blocks = start_pos * bpt;
+                    // Dequant slot's history into the slot-local fp16 scratch.
                     tq3_dequantize_kernel<<<(hist_blocks + 31)/32, 32, 0, stream>>>(
-                        tq.k, tq_k_buf[g], hist_blocks);
+                        tq_k_slot, tq_k_buf[g] + slot_kv_off, hist_blocks);
                     tq3_dequantize_kernel<<<(hist_blocks + 31)/32, 32, 0, stream>>>(
-                        tq.v, tq_v_buf[g], hist_blocks);
+                        tq_v_slot, tq_v_buf[g] + slot_kv_off, hist_blocks);
                 }
-                cudaMemcpyAsync(tq_k_buf[g] + (size_t)start_pos * kv_dim,
+                cudaMemcpyAsync(tq_k_buf[g] + slot_kv_off + (size_t)start_pos * kv_dim,
                                 ab.attn_chunk_k, new_bytes,
                                 cudaMemcpyDeviceToDevice, stream);
-                cudaMemcpyAsync(tq_v_buf[g] + (size_t)start_pos * kv_dim,
+                cudaMemcpyAsync(tq_v_buf[g] + slot_kv_off + (size_t)start_pos * kv_dim,
                                 ab.attn_chunk_v, new_bytes,
                                 cudaMemcpyDeviceToDevice, stream);
             } else {
@@ -2042,7 +2547,7 @@ struct QwenModel {
     // (deinterleave, head norm, RoPE, KV append, Q@K, softmax, @V, gate
     // sigmoid) are inherently sequential per-position.
     void forward_attn_n2(int layer, float* hidden_a, float* hidden_b,
-                         int pos_a, int pos_b, cudaStream_t stream) {
+                         int pos_a, int pos_b, cudaStream_t stream, int slot = 0) {
         int g = gpu->layer_gpu[layer];
         int H = cfg.hidden_size;
         int num_q = cfg.num_q_heads;
@@ -2052,6 +2557,8 @@ struct QwenModel {
         float scale = 1.0f / sqrtf((float)hd);
         auto& abA = attn_bufs[g];   auto& abB = attn_bufs2[g];
         auto& bA  = bufs[g];        auto& bB  = bufs2[g];
+        // Continuous batching: slot KV virtual offset (0 → no behavior change).
+        size_t slot_kv_off = (size_t)slot * slot_max_seq * (num_kv * hd);
 
         auto* norm_w   = t(blk(layer, "attn_norm.weight"));
         auto* q_w      = t(blk(layer, "attn_q.weight"));
@@ -2118,13 +2625,14 @@ struct QwenModel {
             if (use_turboquant) {
                 auto& tq = tq_kv_caches[layer];
                 int bpt = tq.blocks_per_token;
-                size_t off = (size_t)pos * bpt;
+                size_t slot_blk_off = (size_t)slot * slot_max_seq * bpt;
+                size_t off = slot_blk_off + (size_t)pos * bpt;
                 tq3_quantize_kernel<<<(bpt+31)/32, 32, 0, stream>>>(ab.k_proj, &tq.k[off], bpt);
                 tq3_quantize_kernel<<<(bpt+31)/32, 32, 0, stream>>>(ab.v_proj, &tq.v[off], bpt);
             } else {
                 auto& kv = kv_caches[layer];
-                half* k_cache_pos = kv.k + (size_t)pos * kv_dim;
-                half* v_cache_pos = kv.v + (size_t)pos * kv_dim;
+                half* k_cache_pos = kv.k + slot_kv_off + (size_t)pos * kv_dim;
+                half* v_cache_pos = kv.v + slot_kv_off + (size_t)pos * kv_dim;
                 cudaMemcpyAsync(k_cache_pos, ab.k_proj, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
                 cudaMemcpyAsync(v_cache_pos, ab.v_proj, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
             }
@@ -2133,47 +2641,51 @@ struct QwenModel {
             static const bool tq_fused = getenv("TQ_FUSED") != nullptr;
             if (use_turboquant) {
                 auto& tq = tq_kv_caches[layer];
+                int slot_off_blocks_int = slot * slot_max_seq * tq.blocks_per_token;
+                block_tq3* tq_k_slot = tq.k + slot_off_blocks_int;
                 if (tq_fused) {
                     dim3 tq_score_grid(num_kv, seq_len);
                     int smem_bytes = hd * sizeof(float);
                     attn_score_kernel_tq3<<<tq_score_grid, hd, smem_bytes, stream>>>(
-                        q_buf, tq.k, ab.attn_scores,
+                        q_buf, tq_k_slot, ab.attn_scores,
                         num_q, num_kv, hd, seq_len, scale);
                 } else {
                     int n_blocks_total = seq_len * tq.blocks_per_token;
                     tq3_dequantize_kernel<<<(n_blocks_total + 31)/32, 32, 0, stream>>>(
-                        tq.k, tq_k_buf[g], n_blocks_total);
+                        tq_k_slot, tq_k_buf[g], n_blocks_total);
                     attn_score_kernel_h<<<score_grid, min(hd, 256), 0, stream>>>(
                         q_buf, tq_k_buf[g], ab.attn_scores, num_q, num_kv, hd, seq_len, scale);
                 }
             } else {
                 auto& kv = kv_caches[layer];
                 attn_score_kernel_h<<<score_grid, min(hd, 256), 0, stream>>>(
-                    q_buf, kv.k, ab.attn_scores, num_q, num_kv, hd, seq_len, scale);
+                    q_buf, kv.k + slot_kv_off, ab.attn_scores, num_q, num_kv, hd, seq_len, scale);
             }
             { int st = 1; while(st < seq_len && st < 256) st <<= 1;
             softmax_kernel<<<num_q, st, st * sizeof(float), stream>>>(
                 ab.attn_scores, num_q, seq_len); }
             if (use_turboquant) {
                 auto& tq = tq_kv_caches[layer];
+                int slot_off_blocks_int = slot * slot_max_seq * tq.blocks_per_token;
+                block_tq3* tq_v_slot = tq.v + slot_off_blocks_int;
                 if (tq_fused) {
                     int blocks_per_kv_head = hd / TQ_BLOCK_SIZE;
                     dim3 tq_value_grid(num_kv, blocks_per_kv_head);
                     int smem_bytes = TQ_BLOCK_SIZE * sizeof(float);
                     attn_value_kernel_tq3<<<tq_value_grid, TQ_BLOCK_SIZE, smem_bytes, stream>>>(
-                        ab.attn_scores, tq.v, q_buf,
+                        ab.attn_scores, tq_v_slot, q_buf,
                         num_q, num_kv, hd, seq_len);
                 } else {
                     int n_blocks_total = seq_len * tq.blocks_per_token;
                     tq3_dequantize_kernel<<<(n_blocks_total + 31)/32, 32, 0, stream>>>(
-                        tq.v, tq_v_buf[g], n_blocks_total);
+                        tq_v_slot, tq_v_buf[g], n_blocks_total);
                     attn_value_kernel_h<<<num_q, min(hd, 256), 0, stream>>>(
                         ab.attn_scores, tq_v_buf[g], q_buf, num_q, num_kv, hd, seq_len);
                 }
             } else {
                 auto& kv = kv_caches[layer];
                 attn_value_kernel_h<<<num_q, min(hd, 256), 0, stream>>>(
-                    ab.attn_scores, kv.v, q_buf, num_q, num_kv, hd, seq_len);
+                    ab.attn_scores, kv.v + slot_kv_off, q_buf, num_q, num_kv, hd, seq_len);
             }
             apply_gate_sigmoid<<<(total_qg+255)/256, 256, 0, stream>>>(
                 q_buf, gate_buf, total_qg);
@@ -2202,7 +2714,7 @@ struct QwenModel {
     // (conv1d, gdn_recurrent_step, rms_norm_gated) is inherently per-token
     // and runs sequentially with a state snapshot taken between the two
     // tokens so a rejected second token can be rolled back exactly.
-    void forward_gdn_n2(int layer, float* hidden_a, float* hidden_b, cudaStream_t stream) {
+    void forward_gdn_n2(int layer, float* hidden_a, float* hidden_b, cudaStream_t stream, int slot = 0) {
         int g = gpu->layer_gpu[layer];
         auto& bA = bufs[g];      auto& bB = bufs2[g];
         auto& gA = gdn_bufs[g];  auto& gB = gdn_bufs2[g];
@@ -2213,6 +2725,8 @@ struct QwenModel {
         int v_dim = cfg.linear_v_dim;
         int qkv_dim = 2 * num_k * k_dim + num_v * v_dim;
         int v_total = num_v * v_dim;
+        float* conv_state_slot = gdn_conv_slot(layer, slot);
+        float* rec_state_slot  = gdn_rec_slot(layer, slot);
 
         auto* norm_w  = t(blk(layer, "attn_norm.weight"));
         auto* qkv_w   = t(blk(layer, "attn_qkv.weight"));
@@ -2265,36 +2779,39 @@ struct QwenModel {
         int threads_conv = min(qkv_dim, 256);
         int blocks_conv  = (qkv_dim + threads_conv - 1) / threads_conv;
         conv1d_update_silu<<<blocks_conv, threads_conv, 0, stream>>>(
-            gdn_states[layer].conv_state, bA.attn_out, (float*)conv_w->data,
+            conv_state_slot, bA.attn_out, (float*)conv_w->data,
             gA.conv_out, qkv_dim, kw);
         int gdn_smem = (2 * cfg.linear_k_dim + 1) * sizeof(float);
         gdn_recurrent_step<<<num_v, min(v_dim, 128), gdn_smem, stream>>>(
             gA.conv_out, (float*)a_log_t->data, (float*)dt_bias_t->data,
             bA.mlp_up, bA.mlp_down,
-            gdn_states[layer].rec_state, gA.core_out,
+            rec_state_slot, gA.core_out,
             num_k, num_v, k_dim, v_dim);
         rms_norm_gated_kernel<<<num_v, min(v_dim, 128), 128 * sizeof(float), stream>>>(
             gA.core_out, bA.mlp_gate, (float*)ssm_norm_w->data, gA.normed_out,
             num_v, v_dim, 1e-6f);
 
-        // 5. Snapshot GDN state for THIS layer (post-a, for reject rollback)
+        // 5. Snapshot GDN state for THIS layer (post-a, for reject rollback).
+        // gdn_snapshots is a single shared buffer (slot 0 only). MTP/spec is
+        // currently constrained to one slot at a time; the scheduler enforces
+        // this by serializing slots that opt into spec.
         if (snapshots_ready) {
             size_t conv_sz = qkv_dim * 4 * sizeof(float);
             size_t rec_sz  = (size_t)num_v * k_dim * v_dim * sizeof(float);
-            cudaMemcpyAsync(gdn_snapshots[layer].conv_state, gdn_states[layer].conv_state,
+            cudaMemcpyAsync(gdn_snapshots[layer].conv_state, conv_state_slot,
                             conv_sz, cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(gdn_snapshots[layer].rec_state, gdn_states[layer].rec_state,
+            cudaMemcpyAsync(gdn_snapshots[layer].rec_state, rec_state_slot,
                             rec_sz, cudaMemcpyDeviceToDevice, stream);
         }
 
         // 6. Token B: conv1d + recurrent + gated norm  (advances state to post-b)
         conv1d_update_silu<<<blocks_conv, threads_conv, 0, stream>>>(
-            gdn_states[layer].conv_state, bB.attn_out, (float*)conv_w->data,
+            conv_state_slot, bB.attn_out, (float*)conv_w->data,
             gB.conv_out, qkv_dim, kw);
         gdn_recurrent_step<<<num_v, min(v_dim, 128), gdn_smem, stream>>>(
             gB.conv_out, (float*)a_log_t->data, (float*)dt_bias_t->data,
             bB.mlp_up, bB.mlp_down,
-            gdn_states[layer].rec_state, gB.core_out,
+            rec_state_slot, gB.core_out,
             num_k, num_v, k_dim, v_dim);
         rms_norm_gated_kernel<<<num_v, min(v_dim, 128), 128 * sizeof(float), stream>>>(
             gB.core_out, bB.mlp_gate, (float*)ssm_norm_w->data, gB.normed_out,
@@ -2320,7 +2837,7 @@ struct QwenModel {
     // quant_gemv_n3. The per-token attention compute (KV append, score,
     // softmax, value, gate) runs sequentially for each of the three positions.
     void forward_attn_n3(int layer, float* hidden_a, float* hidden_b, float* hidden_c,
-                         int pos_a, int pos_b, int pos_c, cudaStream_t stream) {
+                         int pos_a, int pos_b, int pos_c, cudaStream_t stream, int slot = 0) {
         int g = gpu->layer_gpu[layer];
         int H = cfg.hidden_size;
         int num_q = cfg.num_q_heads;
@@ -2342,6 +2859,8 @@ struct QwenModel {
         int total_qg = num_q * hd;
         int kv_dim   = num_kv * hd;
         int q_out_dim = q_w->dims[1];
+        // Continuous batching: slot KV virtual offset.
+        size_t slot_kv_off = (size_t)slot * slot_max_seq * kv_dim;
 
         if (norm_w->type == GGML_TYPE_F32) {
             rms_norm_f32in_f32w_n3(bA.norm_out, bB.norm_out, bC.norm_out,
@@ -2391,13 +2910,14 @@ struct QwenModel {
             if (use_turboquant) {
                 auto& tq = tq_kv_caches[layer];
                 int bpt = tq.blocks_per_token;
-                size_t off = (size_t)pos * bpt;
+                size_t slot_blk_off = (size_t)slot * slot_max_seq * bpt;
+                size_t off = slot_blk_off + (size_t)pos * bpt;
                 tq3_quantize_kernel<<<(bpt+31)/32, 32, 0, stream>>>(ab.k_proj, &tq.k[off], bpt);
                 tq3_quantize_kernel<<<(bpt+31)/32, 32, 0, stream>>>(ab.v_proj, &tq.v[off], bpt);
             } else {
                 auto& kv = kv_caches[layer];
-                half* k_cache_pos = kv.k + (size_t)pos * kv_dim;
-                half* v_cache_pos = kv.v + (size_t)pos * kv_dim;
+                half* k_cache_pos = kv.k + slot_kv_off + (size_t)pos * kv_dim;
+                half* v_cache_pos = kv.v + slot_kv_off + (size_t)pos * kv_dim;
                 cudaMemcpyAsync(k_cache_pos, ab.k_proj, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
                 cudaMemcpyAsync(v_cache_pos, ab.v_proj, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
             }
@@ -2406,47 +2926,51 @@ struct QwenModel {
             static const bool tq_fused = getenv("TQ_FUSED") != nullptr;
             if (use_turboquant) {
                 auto& tq = tq_kv_caches[layer];
+                int slot_off_blocks_int = slot * slot_max_seq * tq.blocks_per_token;
+                block_tq3* tq_k_slot = tq.k + slot_off_blocks_int;
                 if (tq_fused) {
                     dim3 tq_score_grid(num_kv, seq_len);
                     int smem_bytes = hd * sizeof(float);
                     attn_score_kernel_tq3<<<tq_score_grid, hd, smem_bytes, stream>>>(
-                        q_buf, tq.k, ab.attn_scores,
+                        q_buf, tq_k_slot, ab.attn_scores,
                         num_q, num_kv, hd, seq_len, scale);
                 } else {
                     int n_blocks_total = seq_len * tq.blocks_per_token;
                     tq3_dequantize_kernel<<<(n_blocks_total + 31)/32, 32, 0, stream>>>(
-                        tq.k, tq_k_buf[g], n_blocks_total);
+                        tq_k_slot, tq_k_buf[g], n_blocks_total);
                     attn_score_kernel_h<<<score_grid, min(hd, 256), 0, stream>>>(
                         q_buf, tq_k_buf[g], ab.attn_scores, num_q, num_kv, hd, seq_len, scale);
                 }
             } else {
                 auto& kv = kv_caches[layer];
                 attn_score_kernel_h<<<score_grid, min(hd, 256), 0, stream>>>(
-                    q_buf, kv.k, ab.attn_scores, num_q, num_kv, hd, seq_len, scale);
+                    q_buf, kv.k + slot_kv_off, ab.attn_scores, num_q, num_kv, hd, seq_len, scale);
             }
             { int st = 1; while(st < seq_len && st < 256) st <<= 1;
               softmax_kernel<<<num_q, st, st * sizeof(float), stream>>>(
                   ab.attn_scores, num_q, seq_len); }
             if (use_turboquant) {
                 auto& tq = tq_kv_caches[layer];
+                int slot_off_blocks_int = slot * slot_max_seq * tq.blocks_per_token;
+                block_tq3* tq_v_slot = tq.v + slot_off_blocks_int;
                 if (tq_fused) {
                     int blocks_per_kv_head = hd / TQ_BLOCK_SIZE;
                     dim3 tq_value_grid(num_kv, blocks_per_kv_head);
                     int smem_bytes = TQ_BLOCK_SIZE * sizeof(float);
                     attn_value_kernel_tq3<<<tq_value_grid, TQ_BLOCK_SIZE, smem_bytes, stream>>>(
-                        ab.attn_scores, tq.v, q_buf,
+                        ab.attn_scores, tq_v_slot, q_buf,
                         num_q, num_kv, hd, seq_len);
                 } else {
                     int n_blocks_total = seq_len * tq.blocks_per_token;
                     tq3_dequantize_kernel<<<(n_blocks_total + 31)/32, 32, 0, stream>>>(
-                        tq.v, tq_v_buf[g], n_blocks_total);
+                        tq_v_slot, tq_v_buf[g], n_blocks_total);
                     attn_value_kernel_h<<<num_q, min(hd, 256), 0, stream>>>(
                         ab.attn_scores, tq_v_buf[g], q_buf, num_q, num_kv, hd, seq_len);
                 }
             } else {
                 auto& kv = kv_caches[layer];
                 attn_value_kernel_h<<<num_q, min(hd, 256), 0, stream>>>(
-                    ab.attn_scores, kv.v, q_buf, num_q, num_kv, hd, seq_len);
+                    ab.attn_scores, kv.v + slot_kv_off, q_buf, num_q, num_kv, hd, seq_len);
             }
             apply_gate_sigmoid<<<(total_qg+255)/256, 256, 0, stream>>>(
                 q_buf, gate_buf, total_qg);
@@ -2477,7 +3001,7 @@ struct QwenModel {
     // AFTER token A (slot 1 — rollback for "draft1 rejected") and AFTER
     // token B (slot B — rollback for "draft1 ok, draft2 rejected").
     void forward_gdn_n3(int layer, float* hidden_a, float* hidden_b, float* hidden_c,
-                        cudaStream_t stream) {
+                        cudaStream_t stream, int slot = 0) {
         int g = gpu->layer_gpu[layer];
         auto& bA = bufs[g];      auto& bB = bufs2[g];     auto& bC = bufs3[g];
         auto& gA = gdn_bufs[g];  auto& gB = gdn_bufs2[g]; auto& gC = gdn_bufs3[g];
@@ -2488,6 +3012,8 @@ struct QwenModel {
         int v_dim = cfg.linear_v_dim;
         int qkv_dim = 2 * num_k * k_dim + num_v * v_dim;
         int v_total = num_v * v_dim;
+        float* conv_state_slot = gdn_conv_slot(layer, slot);
+        float* rec_state_slot  = gdn_rec_slot(layer, slot);
 
         auto* norm_w  = t(blk(layer, "attn_norm.weight"));
         auto* qkv_w   = t(blk(layer, "attn_qkv.weight"));
@@ -2538,35 +3064,36 @@ struct QwenModel {
 
         // Token A
         conv1d_update_silu<<<blocks_conv, threads_conv, 0, stream>>>(
-            gdn_states[layer].conv_state, bA.attn_out, (float*)conv_w->data,
+            conv_state_slot, bA.attn_out, (float*)conv_w->data,
             gA.conv_out, qkv_dim, kw);
         gdn_recurrent_step<<<num_v, min(v_dim, 128), gdn_smem, stream>>>(
             gA.conv_out, (float*)a_log_t->data, (float*)dt_bias_t->data,
             bA.mlp_up, bA.mlp_down,
-            gdn_states[layer].rec_state, gA.core_out,
+            rec_state_slot, gA.core_out,
             num_k, num_v, k_dim, v_dim);
         rms_norm_gated_kernel<<<num_v, min(v_dim, 128), 128 * sizeof(float), stream>>>(
             gA.core_out, bA.mlp_gate, (float*)ssm_norm_w->data, gA.normed_out,
             num_v, v_dim, 1e-6f);
 
         // Snapshot slot A — state post-token-A, for reject-both rollback.
+        // (snapshots are slot-0 only — MTP serialized to a single slot.)
         if (snapshots_ready && gdn_snapshots[layer].conv_state) {
             size_t conv_sz = qkv_dim * 4 * sizeof(float);
             size_t rec_sz  = (size_t)num_v * k_dim * v_dim * sizeof(float);
-            cudaMemcpyAsync(gdn_snapshots[layer].conv_state, gdn_states[layer].conv_state,
+            cudaMemcpyAsync(gdn_snapshots[layer].conv_state, conv_state_slot,
                             conv_sz, cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(gdn_snapshots[layer].rec_state, gdn_states[layer].rec_state,
+            cudaMemcpyAsync(gdn_snapshots[layer].rec_state, rec_state_slot,
                             rec_sz, cudaMemcpyDeviceToDevice, stream);
         }
 
         // Token B
         conv1d_update_silu<<<blocks_conv, threads_conv, 0, stream>>>(
-            gdn_states[layer].conv_state, bB.attn_out, (float*)conv_w->data,
+            conv_state_slot, bB.attn_out, (float*)conv_w->data,
             gB.conv_out, qkv_dim, kw);
         gdn_recurrent_step<<<num_v, min(v_dim, 128), gdn_smem, stream>>>(
             gB.conv_out, (float*)a_log_t->data, (float*)dt_bias_t->data,
             bB.mlp_up, bB.mlp_down,
-            gdn_states[layer].rec_state, gB.core_out,
+            rec_state_slot, gB.core_out,
             num_k, num_v, k_dim, v_dim);
         rms_norm_gated_kernel<<<num_v, min(v_dim, 128), 128 * sizeof(float), stream>>>(
             gB.core_out, bB.mlp_gate, (float*)ssm_norm_w->data, gB.normed_out,
@@ -2576,20 +3103,20 @@ struct QwenModel {
         if (snapshots_b_ready && gdn_snapshots_b[layer].conv_state) {
             size_t conv_sz = qkv_dim * 4 * sizeof(float);
             size_t rec_sz  = (size_t)num_v * k_dim * v_dim * sizeof(float);
-            cudaMemcpyAsync(gdn_snapshots_b[layer].conv_state, gdn_states[layer].conv_state,
+            cudaMemcpyAsync(gdn_snapshots_b[layer].conv_state, conv_state_slot,
                             conv_sz, cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(gdn_snapshots_b[layer].rec_state, gdn_states[layer].rec_state,
+            cudaMemcpyAsync(gdn_snapshots_b[layer].rec_state, rec_state_slot,
                             rec_sz, cudaMemcpyDeviceToDevice, stream);
         }
 
         // Token C
         conv1d_update_silu<<<blocks_conv, threads_conv, 0, stream>>>(
-            gdn_states[layer].conv_state, bC.attn_out, (float*)conv_w->data,
+            conv_state_slot, bC.attn_out, (float*)conv_w->data,
             gC.conv_out, qkv_dim, kw);
         gdn_recurrent_step<<<num_v, min(v_dim, 128), gdn_smem, stream>>>(
             gC.conv_out, (float*)a_log_t->data, (float*)dt_bias_t->data,
             bC.mlp_up, bC.mlp_down,
-            gdn_states[layer].rec_state, gC.core_out,
+            rec_state_slot, gC.core_out,
             num_k, num_v, k_dim, v_dim);
         rms_norm_gated_kernel<<<num_v, min(v_dim, 128), 128 * sizeof(float), stream>>>(
             gC.core_out, bC.mlp_gate, (float*)ssm_norm_w->data, gC.normed_out,
