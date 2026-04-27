@@ -1145,7 +1145,12 @@ struct QwenModel {
 
     int gdn_qkv_dim() { return 0; } // computed from tensor
 
-    void init_gdn_states() {
+    // num_slots_arg defaults to 1 (legacy single-slot). When >1 the GDN
+    // recurrent state is allocated per-slot. This must be called BEFORE
+    // any forward; it also seeds the model's num_slots member, since
+    // init_kv_cache is normally called after this and would re-set it.
+    void init_gdn_states(int num_slots_arg = 1) {
+        if (num_slots_arg > 0) num_slots = num_slots_arg;
         // Get dimensions from first GDN layer
         auto* qkv = t("blk.0.attn_qkv.weight");
         auto* ssm_out = t("blk.0.ssm_out.weight");
@@ -1956,6 +1961,319 @@ struct QwenModel {
                          /*mask_len=*/n_tokens,
                          /*mask_bits=*/mbits,
                          /*slot=*/slot);
+        }
+    }
+
+    // ============ Batched gen-step forward for attn layers =================
+    // Process one new token from each of N slots in a single forward — the
+    // throughput core of continuous batching. Each slot has its own logical
+    // position (`slot_pos_host[i]`) and KV virtual partition (`slot_ids_host[i]`).
+    // Projections (RMSNorm + Q/K/V + output) are batched across N rows so
+    // weight memory traffic is amortized; the attention compute itself loops
+    // per-slot since each slot has its own KV range. For long-running gen
+    // (the common workload) MLP + projections dominate, so the batched
+    // GEMVs dominate the speedup.
+    //
+    // hidden_batch: [N, H] FP32 in/out, on the layer's GPU.
+    // slot_ids_dev / slot_pos_dev: int32 device arrays length N. The host
+    // also passes the same data so we can issue per-slot kernel launches
+    // without a device→host round-trip.
+    void forward_attn_step_batched(int layer,
+                                   float* hidden_batch,
+                                   int N,
+                                   const int* slot_ids_host,
+                                   const int* slot_pos_host,
+                                   const int* dst_kv_pos_dev,   // [N] = slot*slot_max_seq + pos
+                                   const int* slot_pos_dev,     // [N] (for RoPE)
+                                   cudaStream_t stream) {
+        int g = gpu->layer_gpu[layer];
+        auto& ab = attn_bufs[g];
+        auto& buf = bufs[g];
+        int H = cfg.hidden_size;
+        int num_q  = cfg.num_q_heads;
+        int num_kv = cfg.num_kv_heads;
+        int hd     = cfg.head_dim;
+        int kv_dim = num_kv * hd;
+        int total_qg = num_q * hd;
+        float eps = cfg.rms_norm_eps;
+        float scale = 1.0f / sqrtf((float)hd);
+
+        auto* norm_w   = t(blk(layer, "attn_norm.weight"));
+        auto* q_w      = t(blk(layer, "attn_q.weight"));
+        auto* k_w      = t(blk(layer, "attn_k.weight"));
+        auto* v_w      = t(blk(layer, "attn_v.weight"));
+        auto* q_norm_w = t(blk(layer, "attn_q_norm.weight"));
+        auto* k_norm_w = t(blk(layer, "attn_k_norm.weight"));
+        auto* o_w      = t(blk(layer, "attn_output.weight"));
+
+        // Fallback to per-slot per-token forward if any quant type isn't
+        // Q8_0 (the batched quant_gemv_chunk only supports Q8_0).
+        bool can_batch = (q_w->type == GGML_TYPE_Q8_0)
+                      && (k_w->type == GGML_TYPE_Q8_0)
+                      && (v_w->type == GGML_TYPE_Q8_0)
+                      && (o_w->type == GGML_TYPE_Q8_0);
+        if (!can_batch || N <= 0) {
+            for (int i = 0; i < N; i++) {
+                forward_attn(layer, hidden_batch + (size_t)i * H,
+                             slot_pos_host[i], stream,
+                             /*external_proj=*/false, /*slot_pos=*/-1,
+                             /*mask_start=*/-1, /*mask_len=*/0,
+                             /*mask_bits=*/0xffffffffu,
+                             /*slot=*/slot_ids_host[i]);
+            }
+            return;
+        }
+
+        int q_out_dim = q_w->dims[1];
+
+        // Lazy alloc the chunk buffers if forward_attn_chunk hasn't yet.
+        if (!ab.attn_chunk_q) {
+            cudaMalloc(&ab.attn_chunk_q,        (size_t)CHUNK_SIZE * q_out_dim * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_k,        (size_t)CHUNK_SIZE * kv_dim    * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_v,        (size_t)CHUNK_SIZE * kv_dim    * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_q_post,   (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_gate,     (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_scores,   (size_t)CHUNK_SIZE * num_q * kv_max_seq * sizeof(float));
+            cudaMalloc(&ab.attn_chunk_out,      (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_oproj,    (size_t)CHUNK_SIZE * H         * sizeof(half));
+        }
+
+        // 1. Batched RMSNorm
+        if (norm_w->type == GGML_TYPE_F32) {
+            rms_norm_f32in_f32w(buf.mlp_chunk_norm, hidden_batch, (float*)norm_w->data,
+                                N, H, eps, stream);
+        } else {
+            rms_norm_f32in(buf.mlp_chunk_norm, hidden_batch, (half*)norm_w->data,
+                           N, H, eps, stream);
+        }
+
+        // 2. Quantize all N × H normed values
+        gpu_qi[g].quantize_chunk(buf.mlp_chunk_norm, H, N, stream);
+
+        // 3. Batched Q/K/V projections — 3 GEMV calls instead of 3*N
+        quant_gemv_chunk(q_w->data, q_w->type, gpu_qi[g].q8_buf, ab.attn_chunk_q,
+                         H, q_out_dim, N, stream);
+        quant_gemv_chunk(k_w->data, k_w->type, gpu_qi[g].q8_buf, ab.attn_chunk_k,
+                         H, kv_dim, N, stream);
+        quant_gemv_chunk(v_w->data, v_w->type, gpu_qi[g].q8_buf, ab.attn_chunk_v,
+                         H, kv_dim, N, stream);
+
+        // 4. Batched deinterleave Q/gate, head-RMS, then per-slot RoPE.
+        int rope_dim = rope.rope_dim;
+        int half_rope = rope_dim / 2;
+        int tn = std::min(hd, 128);
+        {
+            dim3 deint_grid((total_qg + 255) / 256, N);
+            deinterleave_qg_kernel_chunk<<<deint_grid, 256, 0, stream>>>(
+                ab.attn_chunk_q, ab.attn_chunk_q_post, ab.attn_chunk_gate,
+                num_q, hd, N);
+
+            static const bool skip_qk_norm_c = getenv("SKIP_QK_NORM") != nullptr;
+            if (!skip_qk_norm_c) {
+                dim3 q_rms_grid(num_q,  N);
+                head_rms_norm_kernel_chunk<<<q_rms_grid, tn, tn * sizeof(float), stream>>>(
+                    ab.attn_chunk_q_post, (float*)q_norm_w->data, num_q, hd, eps, N);
+                dim3 k_rms_grid(num_kv, N);
+                head_rms_norm_kernel_chunk<<<k_rms_grid, tn, tn * sizeof(float), stream>>>(
+                    ab.attn_chunk_k, (float*)k_norm_w->data, num_kv, hd, eps, N);
+            }
+
+            dim3 rope_q_grid((num_q  * half_rope + 255) / 256, N);
+            dim3 rope_k_grid((num_kv * half_rope + 255) / 256, N);
+            apply_rope_kernel_batched<<<rope_q_grid, 256, 0, stream>>>(
+                ab.attn_chunk_q_post, rope.sin_table(g), rope.cos_table(g),
+                slot_pos_dev, num_q,  hd, rope_dim, N);
+            apply_rope_kernel_batched<<<rope_k_grid, 256, 0, stream>>>(
+                ab.attn_chunk_k, rope.sin_table(g), rope.cos_table(g),
+                slot_pos_dev, num_kv, hd, rope_dim, N);
+        }
+
+        // 5. KV scatter — fp16 path. (TQ path: fall back to per-slot loop
+        //    since the per-block quantize/dequant kernel is not yet wired
+        //    for scattered destinations. TQ + batching can be added later.)
+        if (use_turboquant) {
+            // Per-slot fallback for TQ; correctness first.
+            for (int i = 0; i < N; i++) {
+                forward_attn(layer, hidden_batch + (size_t)i * H,
+                             slot_pos_host[i], stream,
+                             /*external_proj=*/false, /*slot_pos=*/-1,
+                             /*mask_start=*/-1, /*mask_len=*/0,
+                             /*mask_bits=*/0xffffffffu,
+                             /*slot=*/slot_ids_host[i]);
+            }
+            return;
+        }
+
+        auto& kv = kv_caches[layer];
+        {
+            dim3 sc_grid((kv_dim + 255) / 256, N);
+            scatter_kv_kernel<<<sc_grid, 256, 0, stream>>>(
+                ab.attn_chunk_k, ab.attn_chunk_v,
+                kv.k, kv.v, dst_kv_pos_dev, kv_dim, N);
+        }
+
+        // 6. Per-slot attention compute. Each slot's Q attends to the slot's
+        //    KV[0..pos] range. Loops here; the GEMVs above are already
+        //    batched, which is where the bulk of the throughput win comes
+        //    from.
+        for (int i = 0; i < N; i++) {
+            int slot_i  = slot_ids_host[i];
+            int pos_i   = slot_pos_host[i];
+            int seq_len = pos_i + 1;
+            half*  q_buf_i = ab.attn_chunk_q_post + (size_t)i * total_qg;
+            float* scores_i = ab.attn_chunk_scores;  // single slot at a time, reuse base
+            half*  out_i   = ab.attn_chunk_out + (size_t)i * total_qg;
+            half*  k_slot  = kv.k + (size_t)slot_i * slot_max_seq * kv_dim;
+            half*  v_slot  = kv.v + (size_t)slot_i * slot_max_seq * kv_dim;
+
+            dim3 score_grid(num_q, seq_len);
+            attn_score_kernel_h<<<score_grid, std::min(hd, 256), 0, stream>>>(
+                q_buf_i, k_slot, scores_i,
+                num_q, num_kv, hd, seq_len, scale);
+            int st = 1; while (st < seq_len && st < 256) st <<= 1;
+            softmax_kernel<<<num_q, st, st * sizeof(float), stream>>>(
+                scores_i, num_q, seq_len);
+            attn_value_kernel_h<<<num_q, std::min(hd, 256), 0, stream>>>(
+                scores_i, v_slot, out_i, num_q, num_kv, hd, seq_len);
+        }
+
+        // 7. Batched output gate (sigmoid)
+        {
+            dim3 gate_grid((total_qg + 255) / 256, N);
+            apply_gate_sigmoid_chunk<<<gate_grid, 256, 0, stream>>>(
+                ab.attn_chunk_out, ab.attn_chunk_gate, total_qg, N);
+        }
+
+        // 8. Batched output projection: quantize attn_chunk_out [N, total_qg]
+        gpu_qi_inter[g].quantize_chunk(ab.attn_chunk_out, total_qg, N, stream);
+        quant_gemv_chunk(o_w->data, o_w->type,
+                         gpu_qi_inter[g].q8_buf,
+                         ab.attn_chunk_oproj,
+                         total_qg, H, N, stream);
+
+        // 9. Residual add: hidden_batch += attn_chunk_oproj (flat N*H length)
+        {
+            int total = N * H;
+            add_kernel_f32<<<(total + 255) / 256, 256, 0, stream>>>(
+                hidden_batch, ab.attn_chunk_oproj, total);
+        }
+    }
+
+    // ============ Batched gen-step forward for GDN layers ==================
+    // Mirror of forward_attn_step_batched for GDN: batched RMSNorm + the four
+    // projections (qkv, gate, alpha, beta), then per-slot conv1d update +
+    // recurrent step + gated norm (since each slot has its own conv_state and
+    // rec_state), then batched output projection + residual.
+    void forward_gdn_step_batched(int layer,
+                                  float* hidden_batch,
+                                  int N,
+                                  const int* slot_ids_host,
+                                  cudaStream_t stream) {
+        int g = gpu->layer_gpu[layer];
+        auto& buf = bufs[g];
+        auto& gb = gdn_bufs[g];
+        int H = cfg.hidden_size;
+        int num_k = cfg.linear_k_heads;
+        int num_v = cfg.linear_v_heads;
+        int k_dim = cfg.linear_k_dim;
+        int v_dim = cfg.linear_v_dim;
+        int qkv_dim = 2 * num_k * k_dim + num_v * v_dim;
+        int v_total = num_v * v_dim;
+
+        auto* norm_w  = t(blk(layer, "attn_norm.weight"));
+        auto* qkv_w   = t(blk(layer, "attn_qkv.weight"));
+        auto* gate_w  = t(blk(layer, "attn_gate.weight"));
+        auto* alpha_w = t(blk(layer, "ssm_alpha.weight"));
+        auto* beta_w  = t(blk(layer, "ssm_beta.weight"));
+        auto* conv_w  = t(blk(layer, "ssm_conv1d.weight"));
+        auto* a_log_t = t(blk(layer, "ssm_a"));
+        auto* dt_bias_t = t(blk(layer, "ssm_dt.bias"));
+        auto* ssm_norm_w = t(blk(layer, "ssm_norm.weight"));
+        auto* out_w   = t(blk(layer, "ssm_out.weight"));
+
+        bool can_batch = (qkv_w->type   == GGML_TYPE_Q8_0)
+                      && (gate_w->type  == GGML_TYPE_Q8_0)
+                      && (alpha_w->type == GGML_TYPE_Q8_0)
+                      && (beta_w->type  == GGML_TYPE_Q8_0)
+                      && (out_w->type   == GGML_TYPE_Q8_0);
+        if (!can_batch || N <= 0) {
+            for (int i = 0; i < N; i++) {
+                forward_gdn(layer, hidden_batch + (size_t)i * H, stream, slot_ids_host[i]);
+            }
+            return;
+        }
+
+        // 1. Batched RMSNorm
+        if (norm_w->type == GGML_TYPE_F32) {
+            rms_norm_f32in_f32w(gb.chunk_norm_out, hidden_batch, (float*)norm_w->data,
+                                N, H, cfg.rms_norm_eps, stream);
+        } else {
+            rms_norm_f32in(gb.chunk_norm_out, hidden_batch, (half*)norm_w->data,
+                           N, H, cfg.rms_norm_eps, stream);
+        }
+        gpu_qi[g].quantize_chunk(gb.chunk_norm_out, H, N, stream);
+
+        // 2. Batched projections — qkv (largest), gate, alpha, beta
+        if (!gb.chunk_qkv_half) {
+            cudaMalloc(&gb.chunk_qkv_half, (size_t)CHUNK_SIZE * qkv_dim * sizeof(half));
+        }
+        quant_gemv_chunk(qkv_w->data, qkv_w->type, gpu_qi[g].q8_buf,
+                         gb.chunk_qkv_half, H, qkv_dim, N, stream);
+        quant_gemv_chunk(gate_w->data, gate_w->type, gpu_qi[g].q8_buf,
+                         gb.chunk_z_out, H, num_v * v_dim, N, stream);
+        quant_gemv_chunk(alpha_w->data, alpha_w->type, gpu_qi[g].q8_buf,
+                         gb.chunk_a_proj, H, num_v, N, stream);
+        quant_gemv_chunk(beta_w->data, beta_w->type, gpu_qi[g].q8_buf,
+                         gb.chunk_b_proj, H, num_v, N, stream);
+
+        // 3. Per-slot conv1d update + recurrent step + gated RMSNorm.
+        //    The state-bound parts must be per-slot since each slot has its
+        //    own conv_state and rec_state — fusing across slots would need
+        //    a new SMEM-resident-state-batched kernel (Phase D).
+        int kw = 4;
+        int threads_conv = std::min(qkv_dim, 256);
+        int blocks_conv  = (qkv_dim + threads_conv - 1) / threads_conv;
+        int gdn_smem = (2 * cfg.linear_k_dim + 1) * sizeof(float);
+        for (int i = 0; i < N; i++) {
+            int slot_i = slot_ids_host[i];
+            // Convert this token's qkv fp16 → fp32 conv input scratch
+            half*  qkv_half_i = gb.chunk_qkv_half + (size_t)i * qkv_dim;
+            float* conv_in_i  = gb.chunk_qkv      + (size_t)i * qkv_dim;
+            // Reinterpret: conv1d_update_silu expects half qkv_in, writes
+            // fp32 conv_out. So we feed qkv_half_i directly.
+            conv1d_update_silu<<<blocks_conv, threads_conv, 0, stream>>>(
+                gdn_conv_slot(layer, slot_i),
+                qkv_half_i,
+                (float*)conv_w->data,
+                conv_in_i,   // overwrite our fp32 slot with conv1d output
+                qkv_dim, kw);
+            half* a_proj_i = gb.chunk_a_proj  + (size_t)i * num_v;
+            half* b_proj_i = gb.chunk_b_proj  + (size_t)i * num_v;
+            half* core_i   = gb.chunk_core_out + (size_t)i * v_total;
+            gdn_recurrent_step<<<num_v, std::min(v_dim, 128), gdn_smem, stream>>>(
+                conv_in_i,
+                (float*)a_log_t->data,
+                (float*)dt_bias_t->data,
+                a_proj_i,
+                b_proj_i,
+                gdn_rec_slot(layer, slot_i),
+                core_i,
+                num_k, num_v, k_dim, v_dim);
+            half* z_i      = gb.chunk_z_out   + (size_t)i * v_total;
+            half* normed_i = gb.chunk_normed  + (size_t)i * v_total;
+            rms_norm_gated_kernel<<<num_v, std::min(v_dim, 128), 128 * sizeof(float), stream>>>(
+                core_i, z_i, (float*)ssm_norm_w->data, normed_i,
+                num_v, v_dim, 1e-6f);
+        }
+
+        // 4. Batched output projection + residual.
+        gpu_qi_inter[g].quantize_chunk(gb.chunk_normed, num_v * v_dim, N, stream);
+        quant_gemv_chunk(out_w->data, out_w->type, gpu_qi_inter[g].q8_buf,
+                         gb.chunk_proj_out, num_v * v_dim, H, N, stream);
+        {
+            int total = N * H;
+            add_kernel_f32<<<(total + 255) / 256, 256, 0, stream>>>(
+                hidden_batch, gb.chunk_proj_out, total);
         }
     }
 

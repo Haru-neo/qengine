@@ -1076,6 +1076,59 @@ __global__ void head_rms_norm_kernel_chunk(
 
 // Batched RoPE: each (tt, head, dim-pair) gets its own sin/cos from the
 // full table (offset by start_pos + tt). Grid.y strides tokens.
+// Per-slot RoPE for the batched gen-step path. Each row of `x` belongs to
+// a different slot at its own logical position; positions[tt] supplies the
+// pos used for this slot's RoPE table lookup.
+__global__ void apply_rope_kernel_batched(
+    half* __restrict__ x,
+    const float* __restrict__ sin_table,
+    const float* __restrict__ cos_table,
+    const int* __restrict__ positions,  // [n_tokens] per-slot pos
+    int num_heads, int head_dim, int rope_dim,
+    int n_tokens
+) {
+    int tt = blockIdx.y;
+    if (tt >= n_tokens) return;
+    int pos = positions[tt];
+    int half_rope = rope_dim / 2;
+    const float* sin_t = sin_table + pos * half_rope;
+    const float* cos_t = cos_table + pos * half_rope;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_heads * half_rope;
+    if (idx >= total) return;
+
+    int head = idx / half_rope;
+    int i    = idx - head * half_rope;
+    half* xh = x + (size_t)tt * num_heads * head_dim + head * head_dim;
+
+    float x0 = __half2float(xh[i]);
+    float x1 = __half2float(xh[i + half_rope]);
+    float c = cos_t[i], s = sin_t[i];
+    xh[i]             = __float2half(x0 * c - x1 * s);
+    xh[i + half_rope] = __float2half(x0 * s + x1 * c);
+}
+
+// Scatter-write of K/V for a batched gen step. n_tokens rows of K and V come
+// from the batched projection; each row is destined for slot s_i at logical
+// position p_i — i.e. physical KV index `dst_kv_pos[tt] = s_i * slot_max_seq + p_i`.
+__global__ void scatter_kv_kernel(
+    const half* __restrict__ k_in,   // [n_tokens, kv_dim]
+    const half* __restrict__ v_in,   // [n_tokens, kv_dim]
+    half* __restrict__       k_cache, // physical [num_slots * slot_max_seq, kv_dim]
+    half* __restrict__       v_cache,
+    const int* __restrict__  dst_kv_pos,  // [n_tokens]
+    int kv_dim, int n_tokens
+) {
+    int tt = blockIdx.y;
+    if (tt >= n_tokens) return;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= kv_dim) return;
+    size_t dst = (size_t)dst_kv_pos[tt] * kv_dim + idx;
+    k_cache[dst] = k_in[(size_t)tt * kv_dim + idx];
+    v_cache[dst] = v_in[(size_t)tt * kv_dim + idx];
+}
+
 __global__ void apply_rope_kernel_chunk(
     half* __restrict__ x,
     const float* __restrict__ sin_table,  // [max_seq, rope_dim/2]
