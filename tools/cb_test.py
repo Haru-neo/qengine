@@ -48,19 +48,39 @@ def call_once(port, prompt, max_tokens, idx):
     }
 
 
+DIFFERENT_PROMPTS = [
+    "한 문장으로 자기소개 해줘.",
+    "파이썬에서 리스트와 튜플의 차이를 한 줄로.",
+    "지구에서 가장 높은 산은?",
+    "1부터 10까지의 합을 계산해줘.",
+    "오늘 점심 메뉴 하나만 추천.",
+    "별의 일생을 세 단계로 요약.",
+    "재귀함수란 무엇인가 한 문장.",
+    "고양이가 우는 이유 두 가지만.",
+]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8082)
     ap.add_argument("--concurrency", type=int, default=2)
     ap.add_argument("--max-tokens", type=int, default=64)
     ap.add_argument("--prompt", type=str, default=DEFAULT_PROMPT)
+    ap.add_argument("--different-prompts", action="store_true",
+                    help="Send a different prompt to each slot (round-robin from a fixed list)")
     args = ap.parse_args()
+
+    if args.different_prompts:
+        prompts = [DIFFERENT_PROMPTS[i % len(DIFFERENT_PROMPTS)]
+                   for i in range(args.concurrency)]
+    else:
+        prompts = [args.prompt] * args.concurrency
 
     print(f"=== continuous batching test: {args.concurrency} concurrent ===")
     t0 = time.time()
     with cf.ThreadPoolExecutor(max_workers=args.concurrency) as ex:
         futures = [
-            ex.submit(call_once, args.port, args.prompt, args.max_tokens, i)
+            ex.submit(call_once, args.port, prompts[i], args.max_tokens, i)
             for i in range(args.concurrency)
         ]
         results = [f.result() for f in cf.as_completed(futures)]
