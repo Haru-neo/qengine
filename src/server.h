@@ -506,6 +506,9 @@ struct HttpServer {
     // delta (streaming) and by prepending it before strip_think_block runs
     // (non-streaming) so the strip can find a balanced pair.
     bool prefills_think_tag = false;
+    // Optional stats hook: returns "queue=N active=M slots=K" so /stats can
+    // surface scheduler health without exposing the whole scheduler.
+    std::function<std::string()> stats_fn;
 
     void send_response(int client_fd, int status, const std::string& content_type, const std::string& body) {
         std::string status_text = (status == 200) ? "OK" : "Bad Request";
@@ -839,6 +842,11 @@ struct HttpServer {
         else if (method == "GET" && (path == "/" || path == "/health")) {
             send_response(client_fd, 200, "application/json",
                 "{\"status\":\"ok\",\"model\":\"" + model_name + "\"}");
+        }
+        // Operator stats: scheduler queue depth + active slot count.
+        else if (method == "GET" && path == "/stats") {
+            std::string stats = stats_fn ? stats_fn() : std::string("{}");
+            send_response(client_fd, 200, "application/json", stats);
         }
         else {
             send_response(client_fd, 404, "application/json",

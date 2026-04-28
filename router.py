@@ -457,6 +457,18 @@ class Handler(BaseHTTPRequestHandler):
                 "aliases": list(self.registry.aliases.keys()),
                 "upstream_ids": list(self.registry.upstream_ids.keys()),
             })
+        elif self.path == "/stats":
+            # Aggregate scheduler stats (queue depth, active slots) from
+            # every backend so operators can see at a glance whether any
+            # upstream is overloaded. Tolerates missing /stats gracefully.
+            out = {"backends": {}}
+            for alias, url in self.registry.aliases.items():
+                try:
+                    r = self.registry.client.get(f"{url}/stats", timeout=2.0)
+                    out["backends"][alias] = r.json() if r.status_code == 200 else {"error": r.status_code}
+                except Exception as e:
+                    out["backends"][alias] = {"error": str(e)}
+            self._send_json(200, out)
         else:
             self._send_json(404, {"error": {"message": "Not found"}})
 

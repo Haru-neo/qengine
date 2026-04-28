@@ -2742,6 +2742,22 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     server.port = port;
     server.model_name = model_name;
     server.api_key = api_key;
+    server.stats_fn = [&]() {
+        int active = 0;
+        if (num_slots > 1) {
+            std::lock_guard<std::mutex> lk(gen_loop_mu);
+            for (int s = 0; s < num_slots; s++)
+                if (slot_gen_state[s]->active) active++;
+        }
+        std::ostringstream os;
+        os << "{\"model\":\"" << model_name << "\""
+           << ",\"slots\":" << num_slots
+           << ",\"active\":" << active
+           << ",\"queued\":" << sched.queued_count()
+           << ",\"queue_cap\":" << max_queue
+           << "}";
+        return os.str();
+    };
 
     // Non-streaming: submit a Sequence, wait on a future for the result.
     server.generate_fn = [&](const std::vector<int>& prompt_ids, int max_tokens,
