@@ -488,6 +488,8 @@ class Handler(BaseHTTPRequestHandler):
         auth = self.headers.get("Authorization")
         if auth:
             headers["Authorization"] = auth
+        elif getattr(self, "upstream_api_key", None):
+            headers["Authorization"] = f"Bearer {self.upstream_api_key}"
 
         # PocketPal (and some other Ollama-ish clients) prefix OpenAI routes
         # with /api/. Upstream qwen-engine only knows /v1/... so strip the
@@ -517,6 +519,13 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def _proxy_stream(self, target, headers, body):
+        # Background-fed queue so the main thread can interleave SSE comment
+        # heartbeats while the upstream is silent (long prefill, model
+        # thinking). Without heartbeats, Tailscale / corporate proxies drop
+        # idle TCP after 15-60s and the client gets a "network error".
+        import queue, threading
+        q: "queue.Queue[bytes | None]" = queue.Queue(maxsize=64)
+
         with self.registry.client.stream("POST", target, headers=headers,
                                          content=body,
                                          timeout=httpx.Timeout(10.0, read=None)) as r:
@@ -528,9 +537,33 @@ class Handler(BaseHTTPRequestHandler):
             for k, v in CORS.items():
                 self.send_header(k, v)
             self.end_headers()
-            for chunk in r.iter_raw():
-                if not chunk:
+
+            def feeder():
+                try:
+                    for chunk in r.iter_raw():
+                        if chunk:
+                            q.put(chunk)
+                finally:
+                    q.put(None)  # sentinel: upstream done
+
+            t = threading.Thread(target=feeder, daemon=True)
+            t.start()
+
+            heartbeat_interval = 10.0  # seconds
+            while True:
+                try:
+                    chunk = q.get(timeout=heartbeat_interval)
+                except queue.Empty:
+                    # Idle: send SSE comment as keepalive. Spec: lines
+                    # starting with ":" are comments, ignored by clients.
+                    try:
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
                     continue
+                if chunk is None:
+                    return  # upstream done
                 try:
                     self.wfile.write(chunk)
                     self.wfile.flush()
@@ -555,7 +588,12 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--backend", action="append", type=parse_backend, default=[],
                     help="alias=url, repeatable")
+    ap.add_argument("--upstream-api-key", default=None,
+                    help="API key to inject as Authorization: Bearer <key> when "
+                         "the inbound request has no Authorization header. "
+                         "Lets clients hit the router without knowing the upstream key.")
     args = ap.parse_args()
+    Handler.upstream_api_key = args.upstream_api_key
 
     if not args.backend:
         args.backend = [
