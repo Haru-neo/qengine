@@ -21,6 +21,17 @@ static half* g_vision_embeds = nullptr;
 static int g_vision_n_tokens = 0;
 static int g_vision_H = 0;
 static int g_image_pad_id = -1;
+// Qwen3-VL multimodal RoPE (M-RoPE) per-token position arrays. One device
+// buffer per GPU because the layers are spread across 4 cards with no P2P
+// (Volta CMP). forward_attn_chunk in model.cuh dereferences
+// g_mrope_pos_*[g] for whichever GPU it's running on. nullptr → 1D fallback.
+int* g_mrope_pos_t[4] = {nullptr, nullptr, nullptr, nullptr};
+int* g_mrope_pos_h[4] = {nullptr, nullptr, nullptr, nullptr};
+int* g_mrope_pos_w[4] = {nullptr, nullptr, nullptr, nullptr};
+int g_mrope_sec_t = 0;
+int g_mrope_sec_h = 0;
+int g_mrope_sec_w = 0;
+int g_mrope_len = 0;   // valid range [0, g_mrope_len) of g_mrope_pos_*[g]
 #include <chrono>
 #include <vector>
 #include <algorithm>
@@ -567,17 +578,30 @@ int run_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, const SamplingPara
     printf("\n=== Qwen Generation (%zu prompt tokens) ===\n", prompt_ids.size());
     auto total_start = std::chrono::high_resolution_clock::now();
 
+    int s_vision_idx = 0;  // running index over g_vision_embeds rows
     for (int step = 0; step < (int)(prompt_ids.size() + max_gen); step++) {
         int token_id = step < (int)prompt_ids.size() ? prompt_ids[step] : generated.back();
         auto step_start = std::chrono::high_resolution_clock::now();
 
         cudaSetDevice(0);
-        if (embd_t->type == GGML_TYPE_Q8_0)
-            dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
-        else if (embd_t->type == GGML_TYPE_Q5_K)
-            dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
-        else if (embd_t->type == GGML_TYPE_Q6_K)
-            dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+        bool vision_hit = false;
+        if (g_vision_embeds && g_image_pad_id >= 0 && token_id == g_image_pad_id
+            && s_vision_idx < g_vision_n_tokens && H == g_vision_H) {
+            cudaMemcpyAsync(gpu_hidden_half[0],
+                            g_vision_embeds + (size_t)s_vision_idx * H,
+                            (size_t)H * sizeof(half),
+                            cudaMemcpyDeviceToDevice);
+            s_vision_idx++;
+            vision_hit = true;
+        }
+        if (!vision_hit) {
+            if (embd_t->type == GGML_TYPE_Q8_0)
+                dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+            else if (embd_t->type == GGML_TYPE_Q5_K)
+                dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+            else if (embd_t->type == GGML_TYPE_Q6_K)
+                dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+        }
         half_to_float_kernel<<<(H+255)/256, 256>>>(gpu_hidden_half[0], gpu_hidden[0], H);
 
         float* h = gpu_hidden[0];
@@ -3182,6 +3206,26 @@ int main(int argc, char** argv) {
         }
         printf("[vision] NaN: %d / %zu, Inf: %d / %zu\n",
                nan_count, host_out.size(), inf_count, host_out.size());
+        // Per-token magnitude — useful to compare runs across different images.
+        double s_abs = 0.0;
+        float t0_max = 0.0f, t0_mean = 0.0f, t288_max = 0.0f, t288_mean = 0.0f;
+        for (int i = 0; i < P; i++) {
+            float v = __half2float(host_out[i]);
+            t0_mean += v / P; if (fabsf(v) > t0_max) t0_max = fabsf(v);
+            v = __half2float(host_out[288*P + i]);
+            t288_mean += v / P; if (fabsf(v) > t288_max) t288_max = fabsf(v);
+        }
+        for (size_t i = 0; i < host_out.size(); i++) s_abs += fabsf(__half2float(host_out[i]));
+        printf("[vision] stats: tot_abs=%.1f tot_mean_abs=%.4f  t0_mean=%.4f t0_maxabs=%.4f  t288_mean=%.4f t288_maxabs=%.4f\n",
+               s_abs, s_abs / host_out.size(), t0_mean, t0_max, t288_mean, t288_max);
+        // Print a wide channel slice from token 0 — useful to A/B color encoding.
+        printf("[vision] tok0 ch[1000..1011]: ");
+        for (int i = 1000; i < 1012; i++) printf("%.4f ", __half2float(host_out[i]));
+        printf("\n[vision] tok0 ch[3000..3011]: ");
+        for (int i = 3000; i < 3012; i++) printf("%.4f ", __half2float(host_out[i]));
+        printf("\n[vision] tok0 ch[4990..5001]: ");
+        for (int i = 4990; i < 5002; i++) printf("%.4f ", __half2float(host_out[i]));
+        printf("\n");
         cudaFree(d_img); cudaFree(d_out);
         return 0;
     }
@@ -3268,6 +3312,89 @@ int main(int argc, char** argv) {
         printf("Prompt: %zu tokens total [", prompt_ids.size());
         for (size_t i = 0; i < std::min(prompt_ids.size(), (size_t)20); i++) printf("%d ", prompt_ids[i]);
         printf("...]\n");
+
+        // Build M-RoPE per-token position arrays for Qwen3-VL multimodal prompts.
+        // Text tokens get pos_t = pos_h = pos_w = sequential (recovers 1D RoPE);
+        // each contiguous run of <|image_pad|> tokens gets (vision_base,
+        // vision_base+y, vision_base+x) on the (t, h, w) axes, then logical
+        // position advances by max(nx, ny) per llama.cpp's mtmd convention.
+        if (g_vision_embeds && g_image_pad_id >= 0) {
+            auto sec_it = gguf.meta_i32_arr.find("qwen35.rope.dimension_sections");
+            if (sec_it == gguf.meta_i32_arr.end() || sec_it->second.size() < 3) {
+                fprintf(stderr, "[mrope] missing qwen35.rope.dimension_sections — cannot enable M-RoPE\n");
+            } else {
+                g_mrope_sec_t = sec_it->second[0];
+                g_mrope_sec_h = sec_it->second[1];
+                g_mrope_sec_w = sec_it->second[2];
+                int n_merged_per_side = (int)std::sqrt((double)g_vision_n_tokens);
+                int nx = n_merged_per_side, ny = n_merged_per_side;
+                // Reserve space for prompt + an over-allocation for the gen
+                // tokens to come. forward_attn for gen looks up
+                // g_mrope_pos_*[g][step]; if we don't extend the array, gen
+                // falls back to physical-index 1D RoPE which sees vision K
+                // (logical pos ~4) as ~580 positions away — attention vanishes.
+                int gen_reserve = 4096;
+                size_t total_len = prompt_ids.size() + gen_reserve;
+                std::vector<int> h_pos_t(total_len);
+                std::vector<int> h_pos_h(total_len);
+                std::vector<int> h_pos_w(total_len);
+                int logical = 0;
+                size_t i = 0;
+                bool sanity_seq = getenv("VL_MROPE_SANITY") != nullptr;
+                while (i < prompt_ids.size()) {
+                    if (!sanity_seq && prompt_ids[i] == g_image_pad_id) {
+                        size_t run_start = i;
+                        while (i < prompt_ids.size() && prompt_ids[i] == g_image_pad_id) i++;
+                        size_t run_len = i - run_start;
+                        int vision_base = logical;
+                        // axis1=h=y, axis2=w=x (matches llama.cpp set_position_mrope_2d).
+                        // VL_AXIS_HW_SWAP=1 swaps to axis1=w, axis2=h for ablation.
+                        bool axis_swap = getenv("VL_AXIS_HW_SWAP") != nullptr;
+                        bool t_zero = getenv("VL_T_ZERO") != nullptr;
+                        for (size_t k = 0; k < run_len; k++) {
+                            int y = (int)k / nx;
+                            int x = (int)k % nx;
+                            int hv = axis_swap ? x : y;
+                            int wv = axis_swap ? y : x;
+                            h_pos_t[run_start + k] = t_zero ? 0 : vision_base;
+                            h_pos_h[run_start + k] = vision_base + hv;
+                            h_pos_w[run_start + k] = vision_base + wv;
+                        }
+                        logical += std::max(nx, ny);
+                    } else {
+                        h_pos_t[i] = logical;
+                        h_pos_h[i] = logical;
+                        h_pos_w[i] = logical;
+                        logical++;
+                        i++;
+                    }
+                }
+                // Extend logical positions into the gen region so forward_attn
+                // gets vision-aware (small) positions for generated tokens too.
+                for (size_t k = prompt_ids.size(); k < total_len; k++) {
+                    h_pos_t[k] = logical;
+                    h_pos_h[k] = logical;
+                    h_pos_w[k] = logical;
+                    logical++;
+                }
+                size_t bytes = total_len * sizeof(int);
+                int ng_local = std::min(n_gpus, 4);
+                for (int g = 0; g < ng_local; g++) {
+                    cudaSetDevice(g);
+                    cudaMalloc(&g_mrope_pos_t[g], bytes);
+                    cudaMalloc(&g_mrope_pos_h[g], bytes);
+                    cudaMalloc(&g_mrope_pos_w[g], bytes);
+                    cudaMemcpy(g_mrope_pos_t[g], h_pos_t.data(), bytes, cudaMemcpyHostToDevice);
+                    cudaMemcpy(g_mrope_pos_h[g], h_pos_h.data(), bytes, cudaMemcpyHostToDevice);
+                    cudaMemcpy(g_mrope_pos_w[g], h_pos_w.data(), bytes, cudaMemcpyHostToDevice);
+                }
+                cudaSetDevice(0);
+                g_mrope_len = (int)total_len;
+                printf("[mrope] sections=[%d,%d,%d] logical_len=%d, %zu image tokens, mirrored to %d GPUs\n",
+                       g_mrope_sec_t, g_mrope_sec_h, g_mrope_sec_w, logical,
+                       (size_t)g_vision_n_tokens, ng_local);
+            }
+        }
     } else {
         // Raw token IDs from CLI
         for (int i = tok_start; i < argc; i++) {

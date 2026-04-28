@@ -996,15 +996,39 @@ struct QwenModel {
         attn_dump_h("q_after_qnorm", q_buf);
         attn_dump_h("k_after_qnorm", ab.k_proj);
 
-        // 5. RoPE
+        // 5. RoPE — Qwen3-VL multimodal M-RoPE if enabled (vision prompt),
+        // standard 1D RoPE otherwise. The single-token forward_attn is used
+        // here both for legacy prefill (run_qwen path) and for gen step,
+        // so we gate on `pos < g_mrope_len` so generated tokens fall back
+        // safely to the standard kernel.
         int rope_dim = rope.rope_dim;
         int half_rope = rope_dim / 2;
-        float* sin_pos = rope.sin_table(g) + pos * half_rope;
-        float* cos_pos = rope.cos_table(g) + pos * half_rope;
-        apply_rope_kernel<<<(num_q * half_rope + 255)/256, 256, 0, stream>>>(
-            q_buf, sin_pos, cos_pos, num_q, hd, rope_dim);
-        apply_rope_kernel<<<(num_kv * half_rope + 255)/256, 256, 0, stream>>>(
-            ab.k_proj, sin_pos, cos_pos, num_kv, hd, rope_dim);
+        extern int* g_mrope_pos_t[4];
+        extern int* g_mrope_pos_h[4];
+        extern int* g_mrope_pos_w[4];
+        extern int g_mrope_sec_t, g_mrope_sec_h, g_mrope_sec_w, g_mrope_len;
+        if (g_mrope_pos_t[g] && pos < g_mrope_len) {
+            const int* pt = g_mrope_pos_t[g] + pos;
+            const int* ph = g_mrope_pos_h[g] + pos;
+            const int* pw = g_mrope_pos_w[g] + pos;
+            dim3 rope_q_grid((num_q  * half_rope + 255) / 256, 1);
+            dim3 rope_k_grid((num_kv * half_rope + 255) / 256, 1);
+            apply_rope_kernel_mrope_chunk<<<rope_q_grid, 256, 0, stream>>>(
+                q_buf, rope.sin_table(g), rope.cos_table(g),
+                pt, ph, pw, g_mrope_sec_t, g_mrope_sec_h, g_mrope_sec_w,
+                num_q,  hd, rope_dim, 1);
+            apply_rope_kernel_mrope_chunk<<<rope_k_grid, 256, 0, stream>>>(
+                ab.k_proj, rope.sin_table(g), rope.cos_table(g),
+                pt, ph, pw, g_mrope_sec_t, g_mrope_sec_h, g_mrope_sec_w,
+                num_kv, hd, rope_dim, 1);
+        } else {
+            float* sin_pos = rope.sin_table(g) + pos * half_rope;
+            float* cos_pos = rope.cos_table(g) + pos * half_rope;
+            apply_rope_kernel<<<(num_q * half_rope + 255)/256, 256, 0, stream>>>(
+                q_buf, sin_pos, cos_pos, num_q, hd, rope_dim);
+            apply_rope_kernel<<<(num_kv * half_rope + 255)/256, 256, 0, stream>>>(
+                ab.k_proj, sin_pos, cos_pos, num_kv, hd, rope_dim);
+        }
         attn_dump_h("q_after_rope", q_buf);
         attn_dump_h("k_after_rope", ab.k_proj);
 
@@ -2440,12 +2464,34 @@ struct QwenModel {
 
             dim3 rope_q_grid((num_q  * half_rope + 255) / 256, n_tokens);
             dim3 rope_k_grid((num_kv * half_rope + 255) / 256, n_tokens);
-            apply_rope_kernel_chunk<<<rope_q_grid, 256, 0, stream>>>(
-                ab.attn_chunk_q_post, rope.sin_table(g), rope.cos_table(g),
-                start_pos, num_q,  hd, rope_dim, n_tokens);
-            apply_rope_kernel_chunk<<<rope_k_grid, 256, 0, stream>>>(
-                ab.attn_chunk_k, rope.sin_table(g), rope.cos_table(g),
-                start_pos, num_kv, hd, rope_dim, n_tokens);
+            // M-RoPE path is engaged when main() set up the per-token
+            // (pos_t, pos_h, pos_w) arrays for vision prompts. For text-only
+            // chunks all three axes carry the same value, so the result is
+            // bit-identical to the legacy 1D path.
+            extern int* g_mrope_pos_t[4];
+            extern int* g_mrope_pos_h[4];
+            extern int* g_mrope_pos_w[4];
+            extern int g_mrope_sec_t, g_mrope_sec_h, g_mrope_sec_w;
+            if (g_mrope_pos_t[g] && g_mrope_pos_h[g] && g_mrope_pos_w[g]) {
+                const int* pt = g_mrope_pos_t[g] + start_pos;
+                const int* ph = g_mrope_pos_h[g] + start_pos;
+                const int* pw = g_mrope_pos_w[g] + start_pos;
+                apply_rope_kernel_mrope_chunk<<<rope_q_grid, 256, 0, stream>>>(
+                    ab.attn_chunk_q_post, rope.sin_table(g), rope.cos_table(g),
+                    pt, ph, pw, g_mrope_sec_t, g_mrope_sec_h, g_mrope_sec_w,
+                    num_q,  hd, rope_dim, n_tokens);
+                apply_rope_kernel_mrope_chunk<<<rope_k_grid, 256, 0, stream>>>(
+                    ab.attn_chunk_k, rope.sin_table(g), rope.cos_table(g),
+                    pt, ph, pw, g_mrope_sec_t, g_mrope_sec_h, g_mrope_sec_w,
+                    num_kv, hd, rope_dim, n_tokens);
+            } else {
+                apply_rope_kernel_chunk<<<rope_q_grid, 256, 0, stream>>>(
+                    ab.attn_chunk_q_post, rope.sin_table(g), rope.cos_table(g),
+                    start_pos, num_q,  hd, rope_dim, n_tokens);
+                apply_rope_kernel_chunk<<<rope_k_grid, 256, 0, stream>>>(
+                    ab.attn_chunk_k, rope.sin_table(g), rope.cos_table(g),
+                    start_pos, num_kv, hd, rope_dim, n_tokens);
+            }
             attn_dump_h("q_after_rope", ab.attn_chunk_q_post + (size_t)target_t * total_qg);
             attn_dump_h("k_after_rope", ab.attn_chunk_k + (size_t)target_t * kv_dim);
         }

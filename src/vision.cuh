@@ -23,6 +23,7 @@
 #include <vector>
 #include <string>
 #include <cstring>
+#include <cublas_v2.h>
 
 namespace vision {
 
@@ -47,6 +48,21 @@ struct VisionConfig {
     int num_merged() const { return num_merged_per_side() * num_merged_per_side(); }     // 576
     int merge_flat_dim() const { return merge_size * merge_size * embed_dim; }           // 4608
 };
+
+// BF16 → fp16 conversion. mmproj weights are tiny (max_abs ~0.5) so the cast
+// is essentially lossless and avoids the Q8_0 quantization noise that — across
+// 27 ViT blocks — was drowning out the color signal in the projector output.
+__global__ void bf16_to_fp16_kernel(
+    const uint16_t* __restrict__ bf16,
+    half* __restrict__ out,
+    size_t n
+) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    uint32_t u = ((uint32_t)bf16[i]) << 16;
+    float f = __int_as_float(u);
+    out[i] = __float2half(f);
+}
 
 // BF16 → Q8_0 (aligned) conversion. mmproj weight matrices are stored as BF16
 // (ggml type 30); our GEMM kernels expect Q8_0. One thread per 32-element
@@ -143,10 +159,38 @@ __global__ void layer_norm_kernel(
     }
 }
 
+// Map (py, px) patch coords to the zig-zag spatial-merge-friendly token
+// index that llama.cpp's qwen3vl graph produces via its reshape/permute
+// chain. Adjacent 2×2 patches end up as four contiguous tokens, so the
+// later `spatial_merge` is just a 4-row concat.
+//
+// llama.cpp reshape (n_patches_x = pps along width, n_patches_y = pps along height):
+//   conv  : [w, h, c]
+//   permute(1,2,0,3)         → [c, w, h]
+//   cont_4d(c*2, w/2, h)     → groups (col_pair, sub_col) into d0
+//   reshape_4d(c*2, w/2, 2, h/2)
+//   permute(0,2,1,3)         → [c*2, sub_row(2), w/2, h/2]
+//   cont_3d(c, w*h, 1)       → token index i = ((h_pair*pps/2 + col_pair)*2 + sub_row)*2 + sub_col
+__device__ __forceinline__ int spatial_zigzag_idx(int py, int px, int pps) {
+    int h_pair   = py >> 1;
+    int sub_row  = py & 1;
+    int col_pair = px >> 1;
+    int sub_col  = px & 1;
+    int mps      = pps >> 1;
+    return ((h_pair * mps + col_pair) << 2) + (sub_row << 1) + sub_col;
+}
+
+// VL_NO_ZIGZAG=1 disables the spatial zig-zag patch reorder — useful for
+// A/B-ing accuracy against the row-major Stage-3 baseline.
+__device__ __forceinline__ int spatial_zigzag_or_rowmajor(int py, int px, int pps, bool zigzag) {
+    return zigzag ? spatial_zigzag_idx(py, px, pps) : (py * pps + px);
+}
+
 // Patch embedding: conv 3×kh×kw stride kh/kw → dense patch tokens.
 // input : [3, H, W] fp32 pre-normalized
 // weight: [out_ch, in_ch, kh, kw] (dims[0]=kh, dims[1]=kw, dims[2]=in_ch, dims[3]=out_ch in ggml order → out_ch * (kh*kw*in_ch) + ky*(kw*in_ch)… wait, actually check below)
-// output: [n_patches, out_ch] in fp16
+// output: [n_patches, out_ch] in fp16, with tokens reordered into the
+//         zig-zag spatial layout (see spatial_zigzag_idx).
 // Each block handles ONE patch (py, px) and cooperatively computes all
 // `embed_dim` output channels. Threads share the 768-value image patch via
 // shared memory.
@@ -187,7 +231,7 @@ __global__ void patch_embd_conv_kernel(
     }
     __syncthreads();
 
-    int patch_idx = py * pps + px;
+    int patch_idx = spatial_zigzag_idx(py, px, pps);
     // Each thread handles a stripe of out channels.
     for (int oc = threadIdx.x; oc < out_ch; oc += blockDim.x) {
         const float* wrow  = w  + (size_t)oc * k_total;
@@ -201,11 +245,14 @@ __global__ void patch_embd_conv_kernel(
         // Qwen3-VL mmproj has BOTH patch_embd.weight and patch_embd.weight.1;
         // the build graph adds their outputs element-wise. When w1==nullptr
         // this term contributes 0.
+        // ggml memory layout for patch_embd.weight: dims=[d0=kw, d1=kh, d2=ic, d3=oc]
+        // d0 innermost → flat = oc*(ic*kh*kw) + ic*(kh*kw) + kh*kw + kw_idx
+        // patch_shmem packs the cropped patch as [ic, ipy(kh), ipx(kw)] row-major.
         for (int ic = 0; ic < in_ch; ic++) {
-            for (int ipx = 0; ipx < patch_sz; ipx++) {
-                for (int ipy = 0; ipy < patch_sz; ipy++) {
+            for (int ipy = 0; ipy < patch_sz; ipy++) {           // kh
+                for (int ipx = 0; ipx < patch_sz; ipx++) {       // kw
                     int pi = ic * (patch_sz * patch_sz) + ipy * patch_sz + ipx;
-                    int wi = ic * (patch_sz * patch_sz) + ipx * patch_sz + ipy;
+                    int wi = ic * (patch_sz * patch_sz) + ipy * patch_sz + ipx;
                     float px = patch_shmem[pi];
                     acc += px * wrow[wi];
                     if (wrow1) acc += px * wrow1[wi];
@@ -217,18 +264,30 @@ __global__ void patch_embd_conv_kernel(
 }
 
 // Add learned position embedding (fp32) to hidden (fp16) in place.
-// hidden [n_tokens, dim], pos [n_tokens, dim]
+// hidden [n_tokens, dim] is in zig-zag spatial-merge token order, while
+// pos_embd in the GGUF is stored in raw row-major (py*pps+px) patch order.
+// Map each output token back to its (py, px) so we sample the right pos row.
 __global__ void add_pos_embd_kernel(
-    half* __restrict__ hidden,
-    const float* __restrict__ pos,
-    int n_tokens, int dim
+    half* __restrict__ hidden,            // [n_tokens, dim] zig-zag layout
+    const float* __restrict__ pos,        // [pps*pps, dim] row-major (py, px)
+    int pps, int dim
 ) {
-    int row = blockIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= n_tokens || col >= dim) return;
-    size_t idx = (size_t)row * dim + col;
-    float v = __half2float(hidden[idx]) + pos[idx];
-    hidden[idx] = __float2half(v);
+    int mps      = pps >> 1;
+    int h_pair   = blockIdx.z;
+    int col_pair = blockIdx.y;
+    int sub      = blockIdx.x;            // 0..3 = sub_row*2 + sub_col
+    int sub_row  = sub >> 1;
+    int sub_col  = sub & 1;
+    int py       = h_pair * 2 + sub_row;
+    int px       = col_pair * 2 + sub_col;
+    int tok_idx  = ((h_pair * mps + col_pair) << 2) + sub;
+    int pos_row  = py * pps + px;
+    for (int c = threadIdx.x; c < dim; c += blockDim.x) {
+        size_t hidx = (size_t)tok_idx * dim + c;
+        size_t pidx = (size_t)pos_row * dim + c;
+        float v = __half2float(hidden[hidx]) + pos[pidx];
+        hidden[hidx] = __float2half(v);
+    }
 }
 
 // Add broadcasted bias (fp32) to [n_tokens, dim] fp16 in place.
@@ -294,6 +353,47 @@ __global__ void split_qkv_kernel(
     q[(size_t)row * embed_dim + col] = src[col];
     k[(size_t)row * embed_dim + col] = src[embed_dim + col];
     v[(size_t)row * embed_dim + col] = src[2 * embed_dim + col];
+}
+
+// Vision M-RoPE (matches ggml's rope_vision kernel for GGML_ROPE_TYPE_VISION).
+// Q/K layout: [n_tokens, num_heads, head_dim]. NeoX-style pairing (k, k+n_dims/2)
+// across the *full* head_dim. n_dims here = head_dim/2; sect_dims = sec_h + sec_w
+// = head_dim/4 + head_dim/4 = head_dim/2. For k in [0..head_dim/2):
+//   sector = k % sect_dims          // = k since k < sect_dims
+//   if sector < sec_h:   theta = pos_h * theta_scale^k
+//   else:                theta = pos_w * theta_scale^(k - sec_h)
+//   x_low' = x_low*cos - x_high*sin    (low = idx k, high = idx k + head_dim/2)
+//   x_high' = x_low*sin + x_high*cos
+__global__ void vit_mrope_kernel(
+    half* __restrict__ qk,                 // [n_tokens, num_heads, head_dim]
+    const int* __restrict__ pos_h,         // [n_tokens]
+    const int* __restrict__ pos_w,         // [n_tokens]
+    int n_tokens, int num_heads, int head_dim,
+    int sec_h, int sec_w, float theta_scale
+) {
+    int tok  = blockIdx.x;
+    int head = blockIdx.y;
+    if (tok >= n_tokens || head >= num_heads) return;
+    int n_pairs = head_dim >> 1;            // = head_dim/2
+    int ph = pos_h[tok];
+    int pw = pos_w[tok];
+    half* base = qk + ((size_t)tok * num_heads + head) * head_dim;
+    int sect_dims = sec_h + sec_w;
+    for (int k = threadIdx.x; k < n_pairs; k += blockDim.x) {
+        int sector = k % sect_dims;         // = k for vision (k < sect_dims)
+        float theta;
+        if (sector < sec_h) {
+            theta = (float)ph * powf(theta_scale, (float)sector);
+        } else {
+            theta = (float)pw * powf(theta_scale, (float)(sector - sec_h));
+        }
+        float c = cosf(theta);
+        float s = sinf(theta);
+        float x0 = __half2float(base[k]);
+        float x1 = __half2float(base[k + n_pairs]);
+        base[k]           = __float2half(x0 * c - x1 * s);
+        base[k + n_pairs] = __float2half(x0 * s + x1 * c);
+    }
 }
 
 // Non-causal attention score.
@@ -381,41 +481,33 @@ __global__ void vit_attn_value_kernel(
     }
 }
 
-// Spatial merge: reshape (pps, pps, embed_dim) patches into (mps, mps, merge²·embed_dim)
-// pps = patches per side (48), ms = 2, mps = 24. Each merged token aggregates
-// a 2×2 patch block by concatenation along the feature dim.
-// Input order [row, col, ch]; output order [mrow, mcol, sub_row, sub_col, ch]
-// where (sub_row, sub_col) ∈ {0,1}² flattens into the 4× feature block.
+// Spatial merge: in zig-zag layout each merged-token's 4 sub-tokens are
+// already consecutive, so this is a straight 4-row concat. Input
+// `in` rows are ordered ((h_pair, col_pair, sub_row, sub_col), embed_dim);
+// output rows pack 4 consecutive input rows along the feature dim.
 __global__ void spatial_merge_kernel(
-    const half* __restrict__ in,  // [pps, pps, embed_dim]
-    half* __restrict__ out,       // [mps, mps, merge*merge*embed_dim]
-    int pps, int ms, int embed_dim
+    const half* __restrict__ in,   // [Nm * 4, embed_dim]
+    half* __restrict__ out,        // [Nm, 4*embed_dim]
+    int Nm, int embed_dim
 ) {
-    int mps = pps / ms;
-    int mrow = blockIdx.y;
-    int mcol = blockIdx.x;
-    if (mrow >= mps || mcol >= mps) return;
-    int merge_dim = ms * ms * embed_dim;
-    half* orow = out + ((size_t)mrow * mps + mcol) * merge_dim;
+    int m = blockIdx.x;
+    if (m >= Nm) return;
+    int merge_dim = 4 * embed_dim;
+    const half* in_base = in + (size_t)m * merge_dim;       // 4 rows, contiguous
+    half* orow = out + (size_t)m * merge_dim;
     for (int i = threadIdx.x; i < merge_dim; i += blockDim.x) {
-        int sub_flat = i / embed_dim;
-        int ch = i % embed_dim;
-        int sr = sub_flat / ms;
-        int sc = sub_flat % ms;
-        int pr = mrow * ms + sr;
-        int pc = mcol * ms + sc;
-        orow[i] = in[((size_t)pr * pps + pc) * embed_dim + ch];
+        orow[i] = in_base[i];
     }
 }
 
 // ============ Weights ============
 struct Block {
     float* ln1_w;   float* ln1_b;
-    void* qkv_w;    ggml_type qkv_type; float* qkv_b;
-    void* out_w;    ggml_type out_type; float* out_b;
+    half* qkv_w;    float* qkv_b;
+    half* out_w;    float* out_b;
     float* ln2_w;   float* ln2_b;
-    void* up_w;     ggml_type up_type;  float* up_b;
-    void* down_w;   ggml_type down_type; float* down_b;
+    half* up_w;     float* up_b;
+    half* down_w;   float* down_b;
 };
 
 struct VisionModel {
@@ -428,8 +520,9 @@ struct VisionModel {
     float* position_embd = nullptr;
     std::vector<Block> blocks;
     float* post_ln_w = nullptr; float* post_ln_b = nullptr;
-    void* mm0_w = nullptr; ggml_type mm0_type; float* mm0_b = nullptr;
-    void* mm2_w = nullptr; ggml_type mm2_type; float* mm2_b = nullptr;
+    half* mm0_w = nullptr; float* mm0_b = nullptr;
+    half* mm2_w = nullptr; float* mm2_b = nullptr;
+    cublasHandle_t cublas = nullptr;
 
     // Scratch buffers
     half* buf_hidden = nullptr;      // [2304, 1152]
@@ -445,8 +538,9 @@ struct VisionModel {
     half* buf_merged = nullptr;      // [576, 4608]
     half* buf_mm0_out = nullptr;     // [576, 4608]
     half* buf_mm2_out = nullptr;     // [576, 5120]
+    int* d_pos_h = nullptr;          // [n_patches] zig-zag-ordered py
+    int* d_pos_w = nullptr;          // [n_patches] zig-zag-ordered px
     QuantInput qi;
-    QuantInput qi_merged;
 
     bool load(GGUFFile& gguf, int gpu) {
         gpu_id = gpu;
@@ -476,39 +570,37 @@ struct VisionModel {
             cudaMemcpy(dev, t->data, bytes, cudaMemcpyHostToDevice);
             return dev;
         };
-        // Quantized weights in mmproj are BF16 (ggml type 30). Convert to
-        // Q8_0-aligned on-device so the existing GEMV/GEMM kernels work.
-        // Sets out_type=GGML_TYPE_Q8_0 and returns a device pointer to
-        // block_q8_0_aligned. Non-BF16 inputs passthrough unchanged.
-        auto copy_weight_to_gpu = [&](const TensorInfo* t, ggml_type* out_type) -> void* {
-            if (!t) { *out_type = GGML_TYPE_F32; return nullptr; }
-            if (t->type != GGML_TYPE_BF16) {
-                *out_type = t->type;
-                return copy_to_gpu(t);
+        // mmproj BF16 weights → fp16 (lossless cast — max_abs ~0.5 well within
+        // fp16 normal range). Used by cuBLAS Hgemm in forward(). Earlier we
+        // round-tripped through Q8_0 but the per-block scale quantization noise
+        // accumulated across 27 ViT blocks and washed out the color signal in
+        // the projector output (verified vs llama.cpp reference).
+        auto copy_weight_to_gpu = [&](const TensorInfo* t) -> half* {
+            if (!t) return nullptr;
+            if (t->type == GGML_TYPE_F16) {
+                half* dev;
+                cudaMalloc(&dev, t->byte_size());
+                cudaMemcpy(dev, t->data, t->byte_size(), cudaMemcpyHostToDevice);
+                return dev;
             }
-            size_t n = t->num_elements();
-            if (n % 32 != 0) {
-                fprintf(stderr, "[vision] BF16 tensor %s n=%zu not 32-aligned\n",
-                        t->name.c_str(), n);
-                *out_type = GGML_TYPE_F32;
+            if (t->type != GGML_TYPE_BF16) {
+                fprintf(stderr, "[vision] unexpected weight type %d for %s\n",
+                        (int)t->type, t->name.c_str());
                 return nullptr;
             }
-            // Upload BF16 to temp device buffer, convert to aligned Q8_0.
+            size_t n = t->num_elements();
             void* bf16_dev;
             cudaMalloc(&bf16_dev, n * 2);
             cudaMemcpy(bf16_dev, t->data, n * 2, cudaMemcpyHostToDevice);
-            size_t n_blocks = n / 32;
-            size_t q8_bytes = n_blocks * sizeof(block_q8_0_aligned);
-            void* q8_dev;
-            cudaMalloc(&q8_dev, q8_bytes);
-            int bt = 128;
-            int bg = (int)((n_blocks + bt - 1) / bt);
-            bf16_to_q8_0_aligned_kernel<<<bg, bt>>>(
-                (const uint16_t*)bf16_dev, (block_q8_0_aligned*)q8_dev, (int)n_blocks);
+            half* fp16_dev;
+            cudaMalloc(&fp16_dev, n * sizeof(half));
+            int bt = 256;
+            int bg = (int)((n + bt - 1) / bt);
+            bf16_to_fp16_kernel<<<bg, bt>>>(
+                (const uint16_t*)bf16_dev, fp16_dev, n);
             cudaDeviceSynchronize();
             cudaFree(bf16_dev);
-            *out_type = GGML_TYPE_Q8_0;
-            return q8_dev;
+            return fp16_dev;
         };
 
         // --- Global tensors ---
@@ -549,15 +641,15 @@ struct VisionModel {
             Block& b = blocks[i];
             b.ln1_w = (float*)copy_to_gpu(ln1w);
             b.ln1_b = (float*)copy_to_gpu(ln1b);
-            b.qkv_w = copy_weight_to_gpu(qkvw, &b.qkv_type);
+            b.qkv_w = copy_weight_to_gpu(qkvw);
             b.qkv_b = (float*)copy_to_gpu(qkvb);
-            b.out_w = copy_weight_to_gpu(outw, &b.out_type);
+            b.out_w = copy_weight_to_gpu(outw);
             b.out_b = (float*)copy_to_gpu(outb);
             b.ln2_w = (float*)copy_to_gpu(ln2w);
             b.ln2_b = (float*)copy_to_gpu(ln2b);
-            b.up_w  = copy_weight_to_gpu(upw, &b.up_type);
+            b.up_w  = copy_weight_to_gpu(upw);
             b.up_b  = (float*)copy_to_gpu(upb);
-            b.down_w= copy_weight_to_gpu(dw,  &b.down_type);
+            b.down_w= copy_weight_to_gpu(dw);
             b.down_b= (float*)copy_to_gpu(db);
         }
 
@@ -567,10 +659,16 @@ struct VisionModel {
         auto* mm2w = gguf.get_tensor("mm.2.weight");
         auto* mm2b = gguf.get_tensor("mm.2.bias");
         if (!mm0w || !mm2w) { fprintf(stderr, "[vision] missing projector\n"); return false; }
-        mm0_w = copy_weight_to_gpu(mm0w, &mm0_type);
+        mm0_w = copy_weight_to_gpu(mm0w);
         mm0_b = (float*)copy_to_gpu(mm0b);
-        mm2_w = copy_weight_to_gpu(mm2w, &mm2_type);
+        mm2_w = copy_weight_to_gpu(mm2w);
         mm2_b = (float*)copy_to_gpu(mm2b);
+
+        // cuBLAS handle for fp16 GEMM
+        if (cublasCreate(&cublas) != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "[vision] cublasCreate failed\n");
+            return false;
+        }
 
         // --- Scratch buffers ---
         int Np = cfg.num_patches();        // 2304
@@ -600,6 +698,26 @@ struct VisionModel {
                              + (size_t)Nm * (M * 2 + P) * 2;
         printf("[vision] scratch buffers allocated (~%.1f MB on GPU %d)\n",
                scratch_bytes / (1024.0 * 1024.0), gpu_id);
+
+        // Build M-RoPE position id buffers in zig-zag token order.
+        int pps = cfg.num_patches_per_side();
+        int mps = pps / 2;
+        std::vector<int> h_ids(Np), w_ids(Np);
+        for (int py = 0; py < pps; py++) {
+            for (int px = 0; px < pps; px++) {
+                int h_pair  = py >> 1;
+                int sub_row = py & 1;
+                int col_pair = px >> 1;
+                int sub_col  = px & 1;
+                int tok = ((h_pair * mps + col_pair) << 2) + (sub_row << 1) + sub_col;
+                h_ids[tok] = py;
+                w_ids[tok] = px;
+            }
+        }
+        cudaMalloc(&d_pos_h, Np * sizeof(int));
+        cudaMalloc(&d_pos_w, Np * sizeof(int));
+        cudaMemcpy(d_pos_h, h_ids.data(), Np * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_pos_w, w_ids.data(), Np * sizeof(int), cudaMemcpyHostToDevice);
         return true;
     }
 
@@ -644,10 +762,12 @@ struct VisionModel {
             dbg_print("patch row=2000", buf_hidden, 2000, E);
         }
 
-        // 2. + position embedding
+        // 2. + position embedding (pos_embd in raw row-major patch order →
+        //    re-mapped to zig-zag tokens via spatial_zigzag_idx).
         {
-            dim3 grid((E + 255)/256, Np);
-            add_pos_embd_kernel<<<grid, 256, 0, stream>>>(buf_hidden, position_embd, Np, E);
+            int mps = pps >> 1;
+            dim3 grid(4, mps, mps);   // (sub, col_pair, h_pair)
+            add_pos_embd_kernel<<<grid, 256, 0, stream>>>(buf_hidden, position_embd, pps, E);
         }
         if (dbg) {
             cudaStreamSynchronize(stream);
@@ -668,8 +788,7 @@ struct VisionModel {
                 buf_proj_in, buf_hidden, b.ln1_w, b.ln1_b, E, cfg.ln_eps);
             if (deep) { cudaStreamSynchronize(stream); dbg_print("L0 ln1 row=0", buf_proj_in, 0, E); }
             // QKV = proj_in @ qkv_w + qkv_b
-            qi.quantize_chunk(buf_proj_in, E, Np, stream);
-            quant_gemv_chunk(b.qkv_w, b.qkv_type, qi.q8_buf, buf_qkv, E, 3*E, Np, stream);
+            gemm_fp16(cublas, buf_qkv, buf_proj_in, b.qkv_w, Np, 3*E, E, stream);
             if (deep) { cudaStreamSynchronize(stream); dbg_print("L0 qkv pre-bias row=0", buf_qkv, 0, 3*E); }
             {
                 dim3 grid((3*E + 255)/256, Np);
@@ -680,6 +799,24 @@ struct VisionModel {
             {
                 dim3 grid((E + 255)/256, Np);
                 split_qkv_kernel<<<grid, 256, 0, stream>>>(buf_qkv, buf_q, buf_k, buf_v, Np, Nh, Hd);
+            }
+            // Vision M-RoPE on Q and K (matches ggml_rope_multi w/ TYPE_VISION).
+            // n_dims = head_dim/2; sec_h = sec_w = head_dim/4. Bypass with
+            // VL_NO_MROPE=1 for ablation against pre-rope baseline.
+            if (!getenv("VL_NO_MROPE")) {
+                int sec_h = Hd >> 2;             // head_dim/4
+                int sec_w = Hd >> 2;
+                int n_dims_rope = Hd >> 1;       // head_dim/2 = pair count (=36)
+                // ggml convention: theta_scale = freq_base^(-2/n_dims). For
+                // n_dims=36 this is 10000^(-1/18) — sec_h=18 covers freq exponents
+                // 0..17, sec_w=18 covers 0..17 of the second axis.
+                float theta_scale = powf(10000.0f, -2.0f / (float)n_dims_rope);
+                dim3 grid(Np, Nh);
+                int tx = (n_dims_rope < 64) ? n_dims_rope : 64;
+                vit_mrope_kernel<<<grid, tx, 0, stream>>>(
+                    buf_q, d_pos_h, d_pos_w, Np, Nh, Hd, sec_h, sec_w, theta_scale);
+                vit_mrope_kernel<<<grid, tx, 0, stream>>>(
+                    buf_k, d_pos_h, d_pos_w, Np, Nh, Hd, sec_h, sec_w, theta_scale);
             }
             if (deep) {
                 cudaStreamSynchronize(stream);
@@ -710,8 +847,7 @@ struct VisionModel {
             }
             if (deep) { cudaStreamSynchronize(stream); dbg_print("L0 attn_out row=0", buf_attn_out, 0, E); }
             // Output projection + bias
-            qi.quantize_chunk(buf_attn_out, E, Np, stream);
-            quant_gemv_chunk(b.out_w, b.out_type, qi.q8_buf, buf_proj_in, E, E, Np, stream);
+            gemm_fp16(cublas, buf_proj_in, buf_attn_out, b.out_w, Np, E, E, stream);
             {
                 dim3 grid((E + 255)/256, Np);
                 add_bias_kernel<<<grid, 256, 0, stream>>>(buf_proj_in, b.out_b, Np, E);
@@ -727,14 +863,12 @@ struct VisionModel {
                             cudaMemcpyDeviceToDevice, stream);
             layer_norm_kernel<<<Np, 256, 0, stream>>>(
                 buf_proj_in, buf_hidden, b.ln2_w, b.ln2_b, E, cfg.ln_eps);
-            qi.quantize_chunk(buf_proj_in, E, Np, stream);
-            quant_gemv_chunk(b.up_w, b.up_type, qi.q8_buf, buf_ffn_in, E, I, Np, stream);
+            gemm_fp16(cublas, buf_ffn_in, buf_proj_in, b.up_w, Np, I, E, stream);
             {
                 dim3 grid((I + 255)/256, Np);
                 add_bias_gelu_kernel<<<grid, 256, 0, stream>>>(buf_ffn_in, b.up_b, Np, I);
             }
-            qi.quantize_chunk(buf_ffn_in, I, Np, stream);
-            quant_gemv_chunk(b.down_w, b.down_type, qi.q8_buf, buf_proj_in, I, E, Np, stream);
+            gemm_fp16(cublas, buf_proj_in, buf_ffn_in, b.down_w, Np, E, I, stream);
             {
                 dim3 grid((E + 255)/256, Np);
                 add_bias_kernel<<<grid, 256, 0, stream>>>(buf_proj_in, b.down_b, Np, E);
@@ -743,12 +877,15 @@ struct VisionModel {
                 buf_proj_in, buf_hidden_res, Np*E);
             cudaMemcpyAsync(buf_hidden, buf_proj_in, (size_t)Np*E*sizeof(half),
                             cudaMemcpyDeviceToDevice, stream);
-            if (dbg && (l == 0 || l == 13 || l == 26)) {
+            if (dbg) {
                 cudaStreamSynchronize(stream);
-                printf("[vl-dbg] after block %d:\n", l);
-                dbg_print("  row=0   ", buf_hidden, 0, E);
-                dbg_print("  row=1152", buf_hidden, 1152, E);
-                dbg_print("  row=2000", buf_hidden, 2000, E);
+                // Compact magnitude probe per block — track explosion/saturation.
+                std::vector<half> hb(64);
+                cudaMemcpy(hb.data(), buf_hidden, 64*sizeof(half), cudaMemcpyDeviceToHost);
+                float mx = 0; for (auto h : hb) { float v = fabsf(__half2float(h)); if (v>mx) mx=v; }
+                printf("[vl-dbg] block %2d row=0 maxabs(0..63)=%.3f sample=", l, mx);
+                for (int i = 0; i < 5; i++) printf("%.3f ", __half2float(hb[i]));
+                printf("\n");
             }
         }
 
@@ -756,23 +893,19 @@ struct VisionModel {
         layer_norm_kernel<<<Np, 256, 0, stream>>>(
             buf_proj_in, buf_hidden, post_ln_w, post_ln_b, E, cfg.ln_eps);
 
-        // 5. Spatial merge
+        // 5. Spatial merge (zig-zag tokens → 4-row concat per merged token)
         {
-            int mps = cfg.num_merged_per_side();
-            dim3 grid(mps, mps);
-            spatial_merge_kernel<<<grid, 256, 0, stream>>>(
-                buf_proj_in, buf_merged, pps, cfg.merge_size, E);
+            spatial_merge_kernel<<<Nm, 256, 0, stream>>>(
+                buf_proj_in, buf_merged, Nm, E);
         }
 
         // 6. Projector: mm.0 (linear 4608→4608) + GELU + mm.2 (linear 4608→5120)
-        qi_merged.quantize_chunk(buf_merged, M, Nm, stream);
-        quant_gemv_chunk(mm0_w, mm0_type, qi_merged.q8_buf, buf_mm0_out, M, M, Nm, stream);
+        gemm_fp16(cublas, buf_mm0_out, buf_merged, mm0_w, Nm, M, M, stream);
         {
             dim3 grid((M + 255)/256, Nm);
             add_bias_gelu_kernel<<<grid, 256, 0, stream>>>(buf_mm0_out, mm0_b, Nm, M);
         }
-        qi_merged.quantize_chunk(buf_mm0_out, M, Nm, stream);
-        quant_gemv_chunk(mm2_w, mm2_type, qi_merged.q8_buf, buf_mm2_out, M, P, Nm, stream);
+        gemm_fp16(cublas, buf_mm2_out, buf_mm0_out, mm2_w, Nm, P, M, stream);
         {
             dim3 grid((P + 255)/256, Nm);
             add_bias_kernel<<<grid, 256, 0, stream>>>(buf_mm2_out, mm2_b, Nm, P);

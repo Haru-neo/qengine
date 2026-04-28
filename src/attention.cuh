@@ -1129,6 +1129,59 @@ __global__ void scatter_kv_kernel(
     v_cache[dst] = v_in[(size_t)tt * kv_dim + idx];
 }
 
+// M-RoPE for the LLM: per-token (pos_t, pos_h, pos_w) drawn from separate
+// arrays, with sections={sec_t, sec_h, sec_w, sec_extra} (sec_extra ignored
+// here — Qwen3-VL fills it with zeros). Each rotary pair k in [0..rope_dim/2)
+// picks its position from one of the three axis arrays based on the section
+// boundary it falls into. For text-only callers all three arrays carry the
+// same value, recovering standard 1D RoPE bit-for-bit.
+__global__ void apply_rope_kernel_mrope_chunk(
+    half* __restrict__ x,
+    const float* __restrict__ sin_table,
+    const float* __restrict__ cos_table,
+    const int* __restrict__ pos_t,
+    const int* __restrict__ pos_h,
+    const int* __restrict__ pos_w,
+    int sec_t, int sec_h, int sec_w,
+    int num_heads, int head_dim, int rope_dim,
+    int n_tokens
+) {
+    int tt = blockIdx.y;
+    if (tt >= n_tokens) return;
+    int half_rope = rope_dim / 2;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_heads * half_rope;
+    if (idx >= total) return;
+
+    int head = idx / half_rope;
+    int i    = idx - head * half_rope;       // pair index in [0..half_rope)
+    // Qwen3.5 / Qwen3-VL: ggml_rope_multi(GGML_ROPE_TYPE_IMROPE) → interleaved
+    // M-RoPE — pairs cycle through T,H,W,... in mod-3 buckets, capped at
+    // 3*sec_axis. Matches transformers' apply_interleaved_mrope.
+    // VL_MROPE_CHUNKED=1 reverts to the simpler chunked layout for ablation.
+    int pos;
+    if (false) {  // VL_MROPE_CHUNKED removed branch — toggle via host #define
+        if (i < sec_t)            pos = pos_t[tt];
+        else if (i < sec_t+sec_h) pos = pos_h[tt];
+        else                       pos = pos_w[tt];
+    } else {
+        int rem = i % 3;
+        if (rem == 0 && i < 3 * sec_t)      pos = pos_t[tt];
+        else if (rem == 1 && i < 3 * sec_h) pos = pos_h[tt];
+        else if (rem == 2 && i < 3 * sec_w) pos = pos_w[tt];
+        else                                 pos = 0;
+    }
+
+    const float* sin_t = sin_table + (size_t)pos * half_rope;
+    const float* cos_t = cos_table + (size_t)pos * half_rope;
+    half* xh = x + (size_t)tt * num_heads * head_dim + head * head_dim;
+    float x0 = __half2float(xh[i]);
+    float x1 = __half2float(xh[i + half_rope]);
+    float c = cos_t[i], s = sin_t[i];
+    xh[i]             = __float2half(x0 * c - x1 * s);
+    xh[i + half_rope] = __float2half(x0 * s + x1 * c);
+}
+
 __global__ void apply_rope_kernel_chunk(
     half* __restrict__ x,
     const float* __restrict__ sin_table,  // [max_seq, rope_dim/2]
