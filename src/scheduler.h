@@ -64,6 +64,11 @@ struct Sequence {
     // Set true when run_fn finishes — observers can poll without the
     // scheduler's mutex.
     std::atomic<bool> finished{false};
+    // Set true when the client has disconnected (e.g. SSE send returned
+    // EPIPE). generate_impl + the batched gen loop poll this in their
+    // per-token loops and break early so we don't waste GPU cycles
+    // generating tokens nobody will receive.
+    std::atomic<bool> cancelled{false};
 };
 
 class SlotManager {
@@ -132,12 +137,25 @@ public:
 
     // Submit a sequence for execution. Non-blocking; the caller usually owns
     // the Sequence via shared_ptr and waits on `finished` or `on_done`.
-    void submit(std::shared_ptr<Sequence> seq) {
+    // Returns false if the queue is at its configured cap (QWEN_MAX_QUEUE
+    // env), in which case the caller should reject the request (HTTP 503).
+    bool submit(std::shared_ptr<Sequence> seq) {
         {
             std::lock_guard<std::mutex> lk(queue_mu_);
+            if (max_queue_ > 0 && (int)queue_.size() >= max_queue_) return false;
             queue_.emplace_back(std::move(seq));
         }
         queue_cv_.notify_one();
+        return true;
+    }
+
+    // Configure max queued (pending, not in-flight) sequences. 0 = unbounded.
+    // Use to apply backpressure under bursty load instead of letting the
+    // queue grow without bound.
+    void set_max_queue(int max_queue) { max_queue_ = max_queue; }
+    int  queued_count() {
+        std::lock_guard<std::mutex> lk(queue_mu_);
+        return (int)queue_.size();
     }
 
     // Mutex held by run_fn around GPU forward execution. Phase A serializes
@@ -158,6 +176,12 @@ private:
                 seq = std::move(queue_.front());
                 queue_.pop_front();
             }
+            // Drop already-cancelled sequences (client gave up while
+            // waiting in the queue) without burning a slot on them.
+            if (seq->cancelled.load(std::memory_order_acquire)) {
+                seq->finished.store(true, std::memory_order_release);
+                continue;
+            }
             int slot = slots_.allocate();
             seq->slot_id = slot;
             try {
@@ -175,6 +199,7 @@ private:
     SlotManager   slots_;
     RunFn         run_fn_;
     std::mutex    forward_mu_;
+    int           max_queue_ = 0;  // 0 = unbounded
 
     std::mutex                              queue_mu_;
     std::condition_variable                 queue_cv_;

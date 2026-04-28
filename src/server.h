@@ -484,7 +484,10 @@ static std::vector<ChatMessage> json_get_messages(const std::string& json) {
 // ============ HTTP Server ============
 
 using GenerateFunc = std::function<std::string(const std::vector<int>& prompt_ids, int max_tokens, int cached_prompt_tokens, int* out_completion_tokens)>;
-using StreamCallback = std::function<void(const std::string& token_text, bool is_done)>;
+// StreamCallback returns true while the client is still receiving and false
+// once delivery has failed (EPIPE / closed connection). Producers should
+// stop generating as soon as it returns false.
+using StreamCallback = std::function<bool(const std::string& token_text, bool is_done)>;
 using StreamGenerateFunc = std::function<void(const std::vector<int>& prompt_ids, int max_tokens, int cached_prompt_tokens, StreamCallback cb)>;
 
 struct HttpServer {
@@ -527,9 +530,14 @@ struct HttpServer {
         send_response(client_fd, 200, "application/json", json.str());
     }
 
-    void send_sse(int fd, const std::string& data) {
+    // Returns true if the chunk was delivered (or at least kernel accepted
+    // it), false if the client connection is dead (EPIPE / ECONNRESET / fd
+    // closed). Callers use the false return to abort the in-flight request
+    // so we don't keep generating tokens for a disconnected client.
+    bool send_sse(int fd, const std::string& data) {
         std::string chunk = "data: " + data + "\n\n";
-        ::send(fd, chunk.c_str(), chunk.size(), MSG_NOSIGNAL);
+        ssize_t sent = ::send(fd, chunk.c_str(), chunk.size(), MSG_NOSIGNAL);
+        return sent == (ssize_t)chunk.size();
     }
 
     void handle_completions(int client_fd, const std::string& body) {
@@ -683,32 +691,34 @@ struct HttpServer {
                 send_sse(client_fd, "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\""
                     + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<think>\\n\"},\"finish_reason\":null}]}");
             }
-            stream_generate_fn(prompt_ids, max_tokens, cached_prompt_tokens, [&](const std::string& token, bool done) {
+            bool client_alive = true;
+            stream_generate_fn(prompt_ids, max_tokens, cached_prompt_tokens, [&](const std::string& token, bool done) -> bool {
+                if (!client_alive) return false;  // already dead, stop calling
                 if (done) {
-                    // Parse accumulated output for tool calls
                     auto parsed_calls = parse_tool_calls(stream_accum);
                     if (!parsed_calls.empty()) {
                         for (size_t ci = 0; ci < parsed_calls.size(); ci++) {
                             auto& c = parsed_calls[ci];
-                            send_sse(client_fd, "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\""
+                            client_alive &= send_sse(client_fd, "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\""
                                 + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
                                 "\"index\":" + std::to_string(ci) + ",\"id\":\"call_" + std::to_string(ci) + "\","
                                 "\"type\":\"function\",\"function\":{\"name\":\"" + json_escape(c.name) + "\","
                                 "\"arguments\":\"" + json_escape(c.arguments) + "\"}}]},\"finish_reason\":null}]}");
                         }
-                        send_sse(client_fd, "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\""
+                        client_alive &= send_sse(client_fd, "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\""
                             + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}");
                     } else {
-                        send_sse(client_fd, "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\""
+                        client_alive &= send_sse(client_fd, "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\""
                             + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}");
                     }
-                    send_sse(client_fd, "[DONE]");
+                    client_alive &= send_sse(client_fd, "[DONE]");
                 } else {
                     stream_accum += token;
-                    send_sse(client_fd, "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\""
+                    client_alive &= send_sse(client_fd, "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\""
                         + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\""
                         + json_escape(token) + "\"},\"finish_reason\":null}]}");
                 }
+                return client_alive;
             });
         } else {
             // Non-streaming response

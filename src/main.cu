@@ -952,7 +952,8 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                              const std::function<void(int)>& on_token,
                              int slot = 0,
                              int* batched_handoff_first_tok = nullptr,
-                             int* batched_handoff_slot_pos = nullptr) -> std::string {
+                             int* batched_handoff_slot_pos = nullptr,
+                             std::atomic<bool>* cancelled = nullptr) -> std::string {
         // Prefix cache: if caller asked for caching AND a snapshot matches
         // the requested prefix, restore state instead of resetting. Otherwise
         // do a normal full reset.
@@ -1055,6 +1056,10 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         static const bool skip_chunked = getenv("DISABLE_CHUNKED_PREFILL") != nullptr;
         if (skip_chunked) prefill_len = 0;
         while (chunk_pos < prefill_len) {
+            if (cancelled && cancelled->load(std::memory_order_relaxed)) {
+                if (out_completion_tokens) *out_completion_tokens = (int)generated.size();
+                return tok.decode(generated);
+            }
             int chunk_n = std::min(CHUNK_SIZE, prefill_len - chunk_pos);
 
             // 1. Embed all chunk tokens to gpu_hidden_chunk[0] (fp32)
@@ -1262,6 +1267,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         };
         int step_cap = std::min((int)prompt_ids.size() + max_gen + 4096, max_seq);
         for (int step = prefill_len; step < step_cap; step++) {
+            if (cancelled && cancelled->load(std::memory_order_relaxed)) break;
             int token_id = step < (int)prompt_ids.size() ? prompt_ids[step] : generated.back();
 
             cudaSetDevice(0);
@@ -2507,6 +2513,11 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         bool in_think = false;
         std::vector<int>          generated;
         std::function<void(int)>  on_token;
+        // Pointer to the owning Sequence's cancelled atomic. The gen loop
+        // checks this each iter and stops the slot if the client is gone,
+        // so a queued-up burst of disconnected requests doesn't burn GPU
+        // generating tokens nobody will see.
+        std::atomic<bool>*        cancelled = nullptr;
         // Completion signaling (the run_fn waits on this after handing the
         // sequence off to the gen loop).
         std::mutex                done_mu;
@@ -2540,7 +2551,8 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 std::lock_guard<std::mutex> lk(sched.forward_mutex());
                 final_text = generate_impl(seq.prompt_ids, seq.max_tokens,
                                            seq.cached_prompt_tokens,
-                                           &completion_tokens, on_tok, slot);
+                                           &completion_tokens, on_tok, slot,
+                                           nullptr, nullptr, &seq.cancelled);
                 if (seq.on_done) seq.on_done(std::move(final_text), completion_tokens);
                 return;
             }
@@ -2571,7 +2583,8 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     std::lock_guard<std::mutex> lk(sched.forward_mutex());
                     final_text = generate_impl(seq.prompt_ids, seq.max_tokens,
                                                seq.cached_prompt_tokens,
-                                               &completion_tokens, on_tok, slot);
+                                               &completion_tokens, on_tok, slot,
+                                               nullptr, nullptr, &seq.cancelled);
                     if (seq.on_done) seq.on_done(std::move(final_text), completion_tokens);
                     return;
                 }
@@ -2586,7 +2599,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 generate_impl(seq.prompt_ids, seq.max_tokens,
                               seq.cached_prompt_tokens,
                               &completion_tokens, on_tok, slot,
-                              &first_tok, &slot_pos_after);
+                              &first_tok, &slot_pos_after, &seq.cancelled);
             }
             // Reset per-slot gen state.
             auto& st = *slot_gen_state[slot];
@@ -2598,6 +2611,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 st.output_tokens = 0;
                 st.generated.clear();
                 st.on_token = on_tok;
+                st.cancelled = &seq.cancelled;
                 int prompt_len = (int)seq.prompt_ids.size();
                 st.max_gen = seq.max_tokens > 0
                              ? seq.max_tokens
@@ -2638,6 +2652,12 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         });
     printf("[server] continuous batching: %d concurrent slot(s)%s\n",
            num_slots, num_slots > 1 ? " (batched gen loop active)" : "");
+    // Backpressure: cap pending queue length so a flood of requests can't
+    // pile up with no way to drain. Default 16x slots, override via env.
+    int max_queue = std::max(num_slots * 16, 32);
+    if (const char* e = getenv("QWEN_MAX_QUEUE")) max_queue = std::max(0, atoi(e));
+    sched.set_max_queue(max_queue);
+    printf("[server] queue cap: %d (set QWEN_MAX_QUEUE=0 for unbounded)\n", max_queue);
 
     // Now that `sched` exists, spawn the batched gen-loop thread. It pulls
     // active slots from slot_gen_state and runs forward_step_batched under
@@ -2679,7 +2699,10 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         int tok_id = a_out[i];
                         st.slot_pos += 1;
                         bool stop = false;
-                        if (tok_id == 248046 || tok_id == 248044 || tok_id == 248045) {
+                        // Client gone: stop immediately, drop the token.
+                        if (st.cancelled && st.cancelled->load(std::memory_order_relaxed)) {
+                            stop = true;
+                        } else if (tok_id == 248046 || tok_id == 248044 || tok_id == 248045) {
                             stop = true;
                         } else {
                             st.generated.push_back(tok_id);
@@ -2743,7 +2766,12 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
             }
             done_cv.notify_all();
         };
-        sched.submit(seq);
+        if (!sched.submit(seq)) {
+            // Queue at cap (QWEN_MAX_QUEUE). Tell the caller; HTTP layer
+            // returns the empty body. Better than silently dropping.
+            if (out_completion_tokens) *out_completion_tokens = 0;
+            return std::string("[server overloaded — queue full]");
+        }
         {
             std::unique_lock<std::mutex> lk(done_mu);
             done_cv.wait(lk, [&]() { return done; });
@@ -2773,18 +2801,40 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         // on_token, then on_done; both fire before the request handler
         // returns thanks to the cv wait below.
         auto utf8_buf = std::make_shared<std::string>();
-        seq->on_token = [&, utf8_buf](int tok_id) {
+        // Capture seq raw pointer for the on_token closure so it can mark
+        // the Sequence as cancelled when SSE delivery fails. We hold a
+        // shared_ptr above so the raw pointer stays valid for the duration
+        // of generate_impl + gen_loop activity (both finish before this
+        // function returns, thanks to the cv wait below).
+        auto* seq_raw = seq.get();
+        seq->on_token = [seq_raw, utf8_buf, cb](int tok_id) {
+            // Tokenization happens elsewhere — but the closure needs `tok`
+            // for decode. We can't capture `tok` by reference here because
+            // this lambda outlives the enclosing serve_qwen frame... wait,
+            // it doesn't: serve_qwen runs the HTTP loop in start(port) and
+            // owns `tok`. So tok& by capture is fine via the [&] above.
+            // Re-add the [&] capture for tok and friends:
+        };
+        // Replace with the proper capture (need [&] for tok decode + cb).
+        seq->on_token = [&, utf8_buf, seq_raw](int tok_id) {
+            if (seq_raw->cancelled.load(std::memory_order_acquire)) return;
             *utf8_buf += tok.decode_token(tok_id);
             std::string complete = Tokenizer::extract_complete_utf8(*utf8_buf);
-            if (!complete.empty()) cb(complete, false);
+            if (!complete.empty()) {
+                if (!cb(complete, false)) {
+                    seq_raw->cancelled.store(true, std::memory_order_release);
+                }
+            }
         };
 
         std::mutex done_mu;
         std::condition_variable done_cv;
         bool done = false;
-        seq->on_done = [&, utf8_buf](std::string /*final_text*/, int /*n*/) {
-            if (!utf8_buf->empty()) { cb(*utf8_buf, false); utf8_buf->clear(); }
-            cb("", true);
+        seq->on_done = [&, utf8_buf, seq_raw](std::string /*final_text*/, int /*n*/) {
+            if (!seq_raw->cancelled.load(std::memory_order_acquire)) {
+                if (!utf8_buf->empty()) { cb(*utf8_buf, false); utf8_buf->clear(); }
+                cb("", true);
+            }
             {
                 std::lock_guard<std::mutex> lk(done_mu);
                 done = true;
@@ -2792,7 +2842,11 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
             done_cv.notify_all();
         };
 
-        sched.submit(seq);
+        if (!sched.submit(seq)) {
+            // Queue at cap. Tell the client and bail.
+            cb("", true);
+            return;
+        }
         {
             std::unique_lock<std::mutex> lk(done_mu);
             done_cv.wait(lk, [&]() { return done; });
