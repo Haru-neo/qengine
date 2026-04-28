@@ -32,11 +32,138 @@ int g_mrope_sec_t = 0;
 int g_mrope_sec_h = 0;
 int g_mrope_sec_w = 0;
 int g_mrope_len = 0;   // valid range [0, g_mrope_len) of g_mrope_pos_*[g]
+// Persistent vision encoder for the server path. Lazily loaded once when
+// `--vision-mmproj` is passed and reused across requests. Lives for the
+// program's lifetime — the GGUF mmap stays open behind it.
+static vision::VisionModel* g_vision_model = nullptr;
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_NO_PSD
+#define STBI_NO_TGA
+#define STBI_NO_HDR
+#define STBI_NO_PIC
+#define STBI_NO_PNM
+#include "stb_image.h"
 #include <chrono>
 #include <vector>
 #include <algorithm>
 #include <cstring>
 #include <iostream>
+
+// Decode an in-memory image (PNG/JPEG/BMP/GIF/...) and bilinear-resize to a
+// fixed 768×768 fp32 tensor with the (3,H,W) channel-first layout the ViT
+// expects, normalised to [-1,1] (mean=std=0.5 per llama.cpp's qwen3vl
+// preprocessor). Returns true on success, false if stb_image rejected the
+// bytes.
+static bool decode_and_preprocess_image(const std::vector<uint8_t>& bytes,
+                                        int target_size,
+                                        std::vector<float>& out_chw) {
+    int w = 0, h = 0, ch = 0;
+    stbi_uc* pix = stbi_load_from_memory(bytes.data(), (int)bytes.size(),
+                                         &w, &h, &ch, 3);
+    if (!pix) {
+        fprintf(stderr, "[vision] stbi_load_from_memory failed: %s\n", stbi_failure_reason());
+        return false;
+    }
+    out_chw.assign((size_t)3 * target_size * target_size, 0.0f);
+    const float scale_x = (float)w / target_size;
+    const float scale_y = (float)h / target_size;
+    for (int dy = 0; dy < target_size; dy++) {
+        float fy = (dy + 0.5f) * scale_y - 0.5f;
+        int y0 = (int)floorf(fy);
+        float ay = fy - y0;
+        int y1 = y0 + 1;
+        if (y0 < 0) y0 = 0; if (y0 >= h) y0 = h - 1;
+        if (y1 < 0) y1 = 0; if (y1 >= h) y1 = h - 1;
+        for (int dx = 0; dx < target_size; dx++) {
+            float fx = (dx + 0.5f) * scale_x - 0.5f;
+            int x0 = (int)floorf(fx);
+            float ax = fx - x0;
+            int x1 = x0 + 1;
+            if (x0 < 0) x0 = 0; if (x0 >= w) x0 = w - 1;
+            if (x1 < 0) x1 = 0; if (x1 >= w) x1 = w - 1;
+            for (int c = 0; c < 3; c++) {
+                float v00 = pix[(y0 * w + x0) * 3 + c];
+                float v01 = pix[(y0 * w + x1) * 3 + c];
+                float v10 = pix[(y1 * w + x0) * 3 + c];
+                float v11 = pix[(y1 * w + x1) * 3 + c];
+                float v0 = v00 * (1 - ax) + v01 * ax;
+                float v1 = v10 * (1 - ax) + v11 * ax;
+                float v  = v0  * (1 - ay) + v1  * ay;
+                // Normalise: pixel/255 → (val - 0.5) / 0.5 = 2*val/255 - 1
+                v = v * (2.0f / 255.0f) - 1.0f;
+                out_chw[((size_t)c * target_size + dy) * target_size + dx] = v;
+            }
+        }
+    }
+    stbi_image_free(pix);
+    return true;
+}
+
+// Build per-token (t,h,w) position arrays from a finalised prompt and upload
+// to all GPUs. Each contiguous run of `image_pad_id` tokens is treated as one
+// image of `n_merged_per_side` × `n_merged_per_side` patches; the remaining
+// tokens get a sequential 1D position so RoPE collapses to its standard
+// behaviour for them. Frees any previous arrays first. `gen_reserve` extra
+// slots are appended past the prompt so generated tokens still hit the
+// vision-aware position table.
+static void setup_mrope_positions(const std::vector<int>& prompt_ids,
+                                  int n_gpus,
+                                  int n_merged_per_side,
+                                  int image_pad_id,
+                                  int gen_reserve = 4096) {
+    if (image_pad_id < 0) return;
+    int ng_local = std::min(n_gpus, 4);
+    for (int g = 0; g < ng_local; g++) {
+        cudaSetDevice(g);
+        if (g_mrope_pos_t[g]) { cudaFree(g_mrope_pos_t[g]); g_mrope_pos_t[g] = nullptr; }
+        if (g_mrope_pos_h[g]) { cudaFree(g_mrope_pos_h[g]); g_mrope_pos_h[g] = nullptr; }
+        if (g_mrope_pos_w[g]) { cudaFree(g_mrope_pos_w[g]); g_mrope_pos_w[g] = nullptr; }
+    }
+    g_mrope_len = 0;
+    int nx = n_merged_per_side, ny = n_merged_per_side;
+    size_t total_len = prompt_ids.size() + (size_t)gen_reserve;
+    std::vector<int> h_pos_t(total_len), h_pos_h(total_len), h_pos_w(total_len);
+    int logical = 0;
+    size_t i = 0;
+    bool sanity_seq = getenv("VL_MROPE_SANITY") != nullptr;
+    bool axis_swap = getenv("VL_AXIS_HW_SWAP") != nullptr;
+    bool t_zero = getenv("VL_T_ZERO") != nullptr;
+    while (i < prompt_ids.size()) {
+        if (!sanity_seq && prompt_ids[i] == image_pad_id) {
+            size_t run_start = i;
+            while (i < prompt_ids.size() && prompt_ids[i] == image_pad_id) i++;
+            size_t run_len = i - run_start;
+            int vision_base = logical;
+            for (size_t k = 0; k < run_len; k++) {
+                int y = (int)k / nx, x = (int)k % nx;
+                int hv = axis_swap ? x : y;
+                int wv = axis_swap ? y : x;
+                h_pos_t[run_start + k] = t_zero ? 0 : vision_base;
+                h_pos_h[run_start + k] = vision_base + hv;
+                h_pos_w[run_start + k] = vision_base + wv;
+            }
+            logical += std::max(nx, ny);
+        } else {
+            h_pos_t[i] = h_pos_h[i] = h_pos_w[i] = logical++;
+            i++;
+        }
+    }
+    for (size_t k = prompt_ids.size(); k < total_len; k++) {
+        h_pos_t[k] = h_pos_h[k] = h_pos_w[k] = logical++;
+    }
+    size_t bytes = total_len * sizeof(int);
+    for (int g = 0; g < ng_local; g++) {
+        cudaSetDevice(g);
+        cudaMalloc(&g_mrope_pos_t[g], bytes);
+        cudaMalloc(&g_mrope_pos_h[g], bytes);
+        cudaMalloc(&g_mrope_pos_w[g], bytes);
+        cudaMemcpy(g_mrope_pos_t[g], h_pos_t.data(), bytes, cudaMemcpyHostToDevice);
+        cudaMemcpy(g_mrope_pos_h[g], h_pos_h.data(), bytes, cudaMemcpyHostToDevice);
+        cudaMemcpy(g_mrope_pos_w[g], h_pos_w.data(), bytes, cudaMemcpyHostToDevice);
+    }
+    cudaSetDevice(0);
+    g_mrope_len = (int)total_len;
+}
 
 // ============ Gemma 4 generation loop ============
 
@@ -2938,6 +3065,91 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         return tok.encode(text);
     };
 
+    // Vision wiring. Only effective if `--vision-mmproj` was passed and the
+    // GGUF carries the M-RoPE dimension_sections. We keep one mutex around
+    // the per-request pipeline because the encoder writes into shared
+    // globals (g_vision_embeds, g_mrope_pos_*) that the gen loop reads.
+    if (g_vision_model && g_image_pad_id >= 0) {
+        // Resolve the M-RoPE sections once, here, so every request gets a
+        // consistent view (the LLM gguf is the source of truth, not the
+        // mmproj). If they're missing, vision still runs but RoPE collapses
+        // to 1D — predictably worse but not catastrophic.
+        auto sec_it = gguf.meta_i32_arr.find("qwen35.rope.dimension_sections");
+        if (sec_it != gguf.meta_i32_arr.end() && sec_it->second.size() >= 3) {
+            g_mrope_sec_t = sec_it->second[0];
+            g_mrope_sec_h = sec_it->second[1];
+            g_mrope_sec_w = sec_it->second[2];
+        }
+        static std::mutex vision_mu;
+
+        server.vision_reset_fn = [&]() {
+            std::lock_guard<std::mutex> lk(vision_mu);
+            if (g_vision_embeds) {
+                cudaSetDevice(0);
+                cudaFree(g_vision_embeds);
+                g_vision_embeds = nullptr;
+            }
+            g_vision_n_tokens = 0;
+            g_mrope_len = 0;
+        };
+        server.vision_encode_fn = [&](const std::vector<uint8_t>& bytes) -> int {
+            std::lock_guard<std::mutex> lk(vision_mu);
+            int target = g_vision_model->cfg.image_size;
+            std::vector<float> chw;
+            if (!decode_and_preprocess_image(bytes, target, chw)) return 0;
+            cudaSetDevice(0);
+            float* d_img = nullptr;
+            size_t img_bytes = chw.size() * sizeof(float);
+            if (cudaMalloc(&d_img, img_bytes) != cudaSuccess) {
+                fprintf(stderr, "[vision] cudaMalloc d_img failed (%zu bytes)\n", img_bytes);
+                return 0;
+            }
+            cudaMemcpy(d_img, chw.data(), img_bytes, cudaMemcpyHostToDevice);
+            int Nm = g_vision_model->cfg.num_merged();
+            int P  = g_vision_model->cfg.proj_dim;
+            // Grow the global embed buffer to hold prior images plus this one.
+            half* d_new = nullptr;
+            size_t new_bytes = (size_t)(g_vision_n_tokens + Nm) * P * sizeof(half);
+            if (cudaMalloc(&d_new, new_bytes) != cudaSuccess) {
+                fprintf(stderr, "[vision] cudaMalloc d_new failed (%zu bytes)\n", new_bytes);
+                cudaFree(d_img);
+                return 0;
+            }
+            if (g_vision_embeds && g_vision_n_tokens > 0) {
+                cudaMemcpy(d_new, g_vision_embeds,
+                           (size_t)g_vision_n_tokens * P * sizeof(half),
+                           cudaMemcpyDeviceToDevice);
+                cudaFree(g_vision_embeds);
+            }
+            half* d_dst = d_new + (size_t)g_vision_n_tokens * P;
+            auto t0 = std::chrono::high_resolution_clock::now();
+            g_vision_model->forward(d_img, d_dst, 0);
+            cudaDeviceSynchronize();
+            auto t1 = std::chrono::high_resolution_clock::now();
+            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            cudaFree(d_img);
+            g_vision_embeds = d_new;
+            g_vision_n_tokens += Nm;
+            printf("[vision] ViT forward: %.1f ms → %d tokens (total %d)\n", ms, Nm, g_vision_n_tokens);
+            return Nm;
+        };
+        server.vision_setup_mrope_fn = [&](const std::vector<int>& prompt_ids) {
+            std::lock_guard<std::mutex> lk(vision_mu);
+            if (g_vision_n_tokens <= 0) return;
+            int n_mps = (int)std::sqrt((double)g_vision_n_tokens);
+            // If we have multiple images, n_vision_n_tokens = K*576, and the
+            // square-root above gives an irrational answer. Each image is
+            // independent in the prompt anyway (separate <|vision_start|>
+            // ... <|vision_end|> blocks), so the merged-per-side is still 24
+            // for our 768x768 fixed input.
+            n_mps = g_vision_model->cfg.num_merged_per_side();
+            setup_mrope_positions(prompt_ids, n_gpus, n_mps, g_image_pad_id);
+            printf("[mrope] sections=[%d,%d,%d] logical_len=%d, %d image tokens (n_mps=%d)\n",
+                   g_mrope_sec_t, g_mrope_sec_h, g_mrope_sec_w, g_mrope_len,
+                   g_vision_n_tokens, n_mps);
+        };
+    }
+
     bool ok = server.start(port);
     // Stop + join the batched gen loop before tearing down captures.
     if (gen_loop_thread.joinable()) {
@@ -3235,21 +3447,33 @@ int main(int argc, char** argv) {
     Tokenizer tokenizer;
     tokenizer.load_from_gguf(gguf);
 
-    // Vision + text inference: --vision-mmproj <mmproj.gguf> --image-raw <fp32.raw> -p "prompt"
-    // Loads mmproj, runs ViT on the preprocessed image, stores embeddings in
-    // g_vision_embeds. Later the prefill loop substitutes these for each
-    // <|image_pad|> token in the prompt.
-    if (!vision_mmproj_path.empty() && !image_raw_path.empty()) {
-        GGUFFile vgg;
+    // Vision encoder: load whenever `--vision-mmproj` is passed, regardless of
+    // whether `--image-raw` is also given. CLI-mode runs ViT on the raw image
+    // up front; server-mode keeps the encoder dormant and runs it per request.
+    static GGUFFile vgg;   // static: lifetime = program (mmap stays open)
+    if (!vision_mmproj_path.empty()) {
         if (!vgg.open(vision_mmproj_path.c_str())) {
             fprintf(stderr, "vision mmproj open failed\n");
             return 1;
         }
-        static vision::VisionModel vm;   // static: lifetime = program
+        static vision::VisionModel vm;
         if (!vm.load(vgg, 0)) {
             fprintf(stderr, "vision load failed\n");
             return 1;
         }
+        g_vision_model = &vm;
+        auto it = tokenizer.token_to_id.find("<|image_pad|>");
+        if (it == tokenizer.token_to_id.end()) {
+            fprintf(stderr, "<|image_pad|> token not found in vocab\n");
+            return 1;
+        }
+        g_image_pad_id = it->second;
+        g_vision_H = vm.cfg.proj_dim;
+        printf("[vision] mmproj loaded (image=%d patch=%d proj=%d), image_pad token id=%d\n",
+               vm.cfg.image_size, vm.cfg.patch_size, vm.cfg.proj_dim, g_image_pad_id);
+    }
+    if (!vision_mmproj_path.empty() && !image_raw_path.empty()) {
+        vision::VisionModel& vm = *g_vision_model;
         int Hv = vm.cfg.image_size;
         size_t need = (size_t)3 * Hv * Hv * sizeof(float);
         FILE* f = fopen(image_raw_path.c_str(), "rb");
@@ -3276,18 +3500,9 @@ int main(int argc, char** argv) {
         double vms = std::chrono::duration<double, std::milli>(vt1 - vt0).count();
         printf("[vision] ViT forward: %.1f ms → %d tokens × %d dim\n", vms, Nm, P);
         cudaFree(d_img);
-        // Publish to global hooks
         g_vision_embeds = d_vis;
         g_vision_n_tokens = Nm;
-        g_vision_H = P;
-        auto it = tokenizer.token_to_id.find("<|image_pad|>");
-        if (it == tokenizer.token_to_id.end()) {
-            fprintf(stderr, "<|image_pad|> token not found in vocab\n");
-            return 1;
-        }
-        g_image_pad_id = it->second;
-        printf("[vision] image_pad token id = %d, %d placeholders needed\n",
-               g_image_pad_id, Nm);
+        printf("[vision] %d placeholders needed\n", Nm);
     }
 
     // Build prompt token IDs
@@ -3327,72 +3542,10 @@ int main(int argc, char** argv) {
                 g_mrope_sec_h = sec_it->second[1];
                 g_mrope_sec_w = sec_it->second[2];
                 int n_merged_per_side = (int)std::sqrt((double)g_vision_n_tokens);
-                int nx = n_merged_per_side, ny = n_merged_per_side;
-                // Reserve space for prompt + an over-allocation for the gen
-                // tokens to come. forward_attn for gen looks up
-                // g_mrope_pos_*[g][step]; if we don't extend the array, gen
-                // falls back to physical-index 1D RoPE which sees vision K
-                // (logical pos ~4) as ~580 positions away — attention vanishes.
-                int gen_reserve = 4096;
-                size_t total_len = prompt_ids.size() + gen_reserve;
-                std::vector<int> h_pos_t(total_len);
-                std::vector<int> h_pos_h(total_len);
-                std::vector<int> h_pos_w(total_len);
-                int logical = 0;
-                size_t i = 0;
-                bool sanity_seq = getenv("VL_MROPE_SANITY") != nullptr;
-                while (i < prompt_ids.size()) {
-                    if (!sanity_seq && prompt_ids[i] == g_image_pad_id) {
-                        size_t run_start = i;
-                        while (i < prompt_ids.size() && prompt_ids[i] == g_image_pad_id) i++;
-                        size_t run_len = i - run_start;
-                        int vision_base = logical;
-                        // axis1=h=y, axis2=w=x (matches llama.cpp set_position_mrope_2d).
-                        // VL_AXIS_HW_SWAP=1 swaps to axis1=w, axis2=h for ablation.
-                        bool axis_swap = getenv("VL_AXIS_HW_SWAP") != nullptr;
-                        bool t_zero = getenv("VL_T_ZERO") != nullptr;
-                        for (size_t k = 0; k < run_len; k++) {
-                            int y = (int)k / nx;
-                            int x = (int)k % nx;
-                            int hv = axis_swap ? x : y;
-                            int wv = axis_swap ? y : x;
-                            h_pos_t[run_start + k] = t_zero ? 0 : vision_base;
-                            h_pos_h[run_start + k] = vision_base + hv;
-                            h_pos_w[run_start + k] = vision_base + wv;
-                        }
-                        logical += std::max(nx, ny);
-                    } else {
-                        h_pos_t[i] = logical;
-                        h_pos_h[i] = logical;
-                        h_pos_w[i] = logical;
-                        logical++;
-                        i++;
-                    }
-                }
-                // Extend logical positions into the gen region so forward_attn
-                // gets vision-aware (small) positions for generated tokens too.
-                for (size_t k = prompt_ids.size(); k < total_len; k++) {
-                    h_pos_t[k] = logical;
-                    h_pos_h[k] = logical;
-                    h_pos_w[k] = logical;
-                    logical++;
-                }
-                size_t bytes = total_len * sizeof(int);
-                int ng_local = std::min(n_gpus, 4);
-                for (int g = 0; g < ng_local; g++) {
-                    cudaSetDevice(g);
-                    cudaMalloc(&g_mrope_pos_t[g], bytes);
-                    cudaMalloc(&g_mrope_pos_h[g], bytes);
-                    cudaMalloc(&g_mrope_pos_w[g], bytes);
-                    cudaMemcpy(g_mrope_pos_t[g], h_pos_t.data(), bytes, cudaMemcpyHostToDevice);
-                    cudaMemcpy(g_mrope_pos_h[g], h_pos_h.data(), bytes, cudaMemcpyHostToDevice);
-                    cudaMemcpy(g_mrope_pos_w[g], h_pos_w.data(), bytes, cudaMemcpyHostToDevice);
-                }
-                cudaSetDevice(0);
-                g_mrope_len = (int)total_len;
+                setup_mrope_positions(prompt_ids, n_gpus, n_merged_per_side, g_image_pad_id);
                 printf("[mrope] sections=[%d,%d,%d] logical_len=%d, %zu image tokens, mirrored to %d GPUs\n",
-                       g_mrope_sec_t, g_mrope_sec_h, g_mrope_sec_w, logical,
-                       (size_t)g_vision_n_tokens, ng_local);
+                       g_mrope_sec_t, g_mrope_sec_h, g_mrope_sec_w, g_mrope_len,
+                       (size_t)g_vision_n_tokens, std::min(n_gpus, 4));
             }
         }
     } else {

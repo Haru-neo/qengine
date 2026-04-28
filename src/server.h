@@ -452,7 +452,78 @@ struct ChatMessage {
     std::string role;
     std::string content;
     std::string tool_calls_json;  // raw JSON array for assistant tool_calls
+    // Decoded raw image bytes from any "image_url" entries inside an OpenAI
+    // content array. data URLs (`data:image/...;base64,...`) are decoded
+    // here. Plain http(s) URLs are not fetched (out of scope for now).
+    std::vector<std::vector<uint8_t>> images;
 };
+
+// Base64 decoder for data URLs.
+static std::vector<uint8_t> base64_decode(const std::string& s) {
+    static int8_t T[256];
+    static bool T_init = false;
+    if (!T_init) {
+        for (int i = 0; i < 256; i++) T[i] = -1;
+        const char* alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int i = 0; i < 64; i++) T[(uint8_t)alpha[i]] = (int8_t)i;
+        T[(uint8_t)'-'] = 62; T[(uint8_t)'_'] = 63;  // url-safe
+        T_init = true;
+    }
+    std::vector<uint8_t> out;
+    out.reserve(s.size() * 3 / 4);
+    int val = 0, bits = 0;
+    for (char c : s) {
+        if (c == '=' || c == ' ' || c == '\n' || c == '\r' || c == '\t') {
+            if (c == '=') break;
+            continue;
+        }
+        int8_t v = T[(uint8_t)c];
+        if (v < 0) continue;
+        val = (val << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back((uint8_t)((val >> bits) & 0xff));
+        }
+    }
+    return out;
+}
+
+// Parse an OpenAI-style content array. Each item is `{"type":"text","text":"..."}`
+// or `{"type":"image_url","image_url":{"url":"data:..."}}`. Concatenates all
+// text into `text_out` (joined with spaces) and pushes any decoded images
+// onto `images_out` in order of appearance.
+static void parse_content_array(const std::string& arr_json,
+                                std::string& text_out,
+                                std::vector<std::vector<uint8_t>>& images_out) {
+    auto items = json_array_objects(arr_json);
+    for (const auto& it : items) {
+        std::string type = json_get_str(it, "type");
+        if (type == "text") {
+            std::string t = json_get_str(it, "text");
+            if (!text_out.empty() && !t.empty()) text_out += "\n";
+            text_out += t;
+        } else if (type == "image_url" || type == "input_image" || type == "image") {
+            // Allow either a string `image_url` value or a nested
+            // `image_url:{url:"..."}` object (per current OpenAI spec).
+            std::string url = json_get_str(it, "url");
+            if (url.empty()) {
+                std::string sub = json_get_raw(it, "image_url");
+                if (!sub.empty() && sub.front() == '{') url = json_get_str(sub, "url");
+                else if (!sub.empty() && sub.front() == '"' && sub.size() >= 2)
+                    url = sub.substr(1, sub.size() - 2);
+            }
+            if (url.empty()) continue;
+            // Only data URLs are supported. Fetching http(s) is intentionally out.
+            size_t comma = url.find(',');
+            if (url.compare(0, 5, "data:") == 0 && comma != std::string::npos) {
+                std::string b64 = url.substr(comma + 1);
+                auto bytes = base64_decode(b64);
+                if (!bytes.empty()) images_out.push_back(std::move(bytes));
+            }
+        }
+    }
+}
 
 static std::vector<ChatMessage> json_get_messages(const std::string& json) {
     std::vector<ChatMessage> msgs;
@@ -470,7 +541,13 @@ static std::vector<ChatMessage> json_get_messages(const std::string& json) {
         std::string obj = json.substr(obj_start, obj_end - obj_start + 1);
         ChatMessage msg;
         msg.role = json_get_str(obj, "role");
-        msg.content = json_get_str(obj, "content");
+        // content may be a string OR an OpenAI-style array of parts.
+        std::string raw_content = json_get_raw(obj, "content");
+        if (!raw_content.empty() && raw_content.front() == '[') {
+            parse_content_array(raw_content, msg.content, msg.images);
+        } else {
+            msg.content = json_get_str(obj, "content");
+        }
         // Parse tool_calls array from assistant messages
         msg.tool_calls_json = json_get_raw(obj, "tool_calls");
         if (!msg.role.empty()) msgs.push_back(msg);
@@ -509,6 +586,17 @@ struct HttpServer {
     // Optional stats hook: returns "queue=N active=M slots=K" so /stats can
     // surface scheduler health without exposing the whole scheduler.
     std::function<std::string()> stats_fn;
+    // Optional vision hooks. When set, the server will route OpenAI image_url
+    // entries (data: URLs only) through `vision_encode_fn` to populate the
+    // per-process vision embed buffer, then prepend the resulting
+    // <|vision_start|>+N×<|image_pad|>+<|vision_end|> text into the user
+    // message before chat encoding. After encoding, `vision_setup_mrope_fn`
+    // gets the final prompt_ids so it can build the per-token (t,h,w)
+    // position arrays. `vision_reset_fn` is called once per request, before
+    // any encoding, so the engine can clear stale state.
+    std::function<int(const std::vector<uint8_t>&)> vision_encode_fn;
+    std::function<void(const std::vector<int>&)> vision_setup_mrope_fn;
+    std::function<void()> vision_reset_fn;
 
     void send_response(int client_fd, int status, const std::string& content_type, const std::string& body) {
         std::string status_text = (status == 200) ? "OK" : "Bad Request";
@@ -579,6 +667,40 @@ struct HttpServer {
             send_response(client_fd, 400, "application/json",
                 "{\"error\":{\"message\":\"No messages provided\"}}");
             return;
+        }
+
+        // Vision inputs: walk all messages, route each decoded image through
+        // the engine's vision_encode_fn, then prepend the vision block text
+        // (`<|vision_start|>` + N×`<|image_pad|>` + `<|vision_end|>`) before
+        // the message's existing text. Any failure (no encoder wired, bad
+        // bytes, OOM) silently drops the image — the model still sees the
+        // text portion of the message so the user can debug client-side.
+        bool has_any_image = false;
+        for (auto& m : messages) if (!m.images.empty()) { has_any_image = true; break; }
+        if (has_any_image) {
+            if (vision_reset_fn) vision_reset_fn();
+            if (!vision_encode_fn) {
+                fprintf(stderr, "[API] image input received but vision is disabled (start with --vision-mmproj)\n");
+            } else {
+                for (auto& m : messages) {
+                    if (m.images.empty()) continue;
+                    std::string vblock;
+                    for (auto& bytes : m.images) {
+                        int n = vision_encode_fn(bytes);
+                        if (n <= 0) {
+                            fprintf(stderr, "[API] vision_encode_fn rejected an image (%zu bytes)\n", bytes.size());
+                            continue;
+                        }
+                        vblock.reserve(vblock.size() + 32 + n * 16);
+                        vblock += "<|vision_start|>";
+                        for (int i = 0; i < n; i++) vblock += "<|image_pad|>";
+                        vblock += "<|vision_end|>";
+                    }
+                    if (!vblock.empty()) {
+                        m.content = vblock + m.content;
+                    }
+                }
+            }
         }
 
         // Extract tools definition and inject into system message
@@ -653,6 +775,10 @@ struct HttpServer {
 
         std::vector<int> prompt_ids;
         if (chat_encode_fn) prompt_ids = chat_encode_fn(msg_pairs);
+
+        // Vision: rebuild M-RoPE per-token position arrays now that we know
+        // exactly where each image_pad token landed in prompt_ids.
+        if (has_any_image && vision_setup_mrope_fn) vision_setup_mrope_fn(prompt_ids);
 
         // Debug: dump prompt details
         { FILE* f = fopen("/tmp/engine_prompt_debug.txt", "w");
@@ -764,29 +890,46 @@ struct HttpServer {
     }
 
     void handle_client(int client_fd) {
-        std::vector<char> buf_vec(131072);  // 128KB heap buffer
+        // Start with 128KB and grow dynamically when Content-Length tells us
+        // we need more (e.g. multimodal requests with base64-encoded images
+        // can easily push past 1 MB). Cap at 64 MB to keep a single bad
+        // request from exhausting RAM.
+        std::vector<char> buf_vec(131072);
         char* buf = buf_vec.data();
-        int buf_size = (int)buf_vec.size();
-        int total = 0;
-        // Read headers + body
-        while (total < buf_size - 1) {
-            int n = recv(client_fd, buf + total, buf_size - 1 - total, 0);
-            if (n <= 0) break;
-            total += n;
-            buf[total] = 0;
-            // Check if we have full request (headers + body)
-            char* body_start = strstr(buf, "\r\n\r\n");
-            if (body_start) {
-                body_start += 4;
-                // Check Content-Length
-                char* cl = strcasestr(buf, "Content-Length:");
-                if (cl) {
-                    int content_len = atoi(cl + 15);
-                    int body_received = total - (body_start - buf);
-                    if (body_received >= content_len) break;
-                } else {
-                    break;
+        size_t buf_size = buf_vec.size();
+        size_t total = 0;
+        long content_len = -1;
+        long header_end = -1;
+        const size_t kMaxBody = 64ull << 20;
+        while (true) {
+            if (total + 1 >= buf_size) {
+                // Grow: 2x, but never beyond what Content-Length needs.
+                size_t want = buf_size * 2;
+                if (content_len > 0 && header_end > 0) {
+                    size_t needed = (size_t)header_end + (size_t)content_len + 1;
+                    if (needed > want) want = needed;
                 }
+                if (want > kMaxBody) want = kMaxBody;
+                if (want <= buf_size) break;  // hard cap reached
+                buf_vec.resize(want);
+                buf = buf_vec.data();
+                buf_size = buf_vec.size();
+            }
+            ssize_t n = recv(client_fd, buf + total, buf_size - 1 - total, 0);
+            if (n <= 0) break;
+            total += (size_t)n;
+            buf[total] = 0;
+            if (header_end < 0) {
+                char* he = strstr(buf, "\r\n\r\n");
+                if (he) {
+                    header_end = (long)(he - buf) + 4;
+                    char* cl = strcasestr(buf, "Content-Length:");
+                    if (cl) content_len = atol(cl + 15);
+                }
+            }
+            if (header_end >= 0) {
+                if (content_len < 0) break;  // no body
+                if ((long)total - header_end >= content_len) break;
             }
         }
         buf[total] = 0;
