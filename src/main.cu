@@ -1029,8 +1029,25 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         // token) hidden hash bisect: 320/320 hashes equal vs DISABLE_CHUNKED).
         // Set FLASH_ATTN=1 to opt back into the FA fused path (faster prefill,
         // accepts the drift).
+        //
+        // Exception — auto-FA when max_seq is too large for the strict path:
+        // attn_chunk_scores allocates CHUNK_SIZE × num_q × kv_max_seq × 4 B,
+        // which exceeds VRAM on 16 GB GPUs once kv_max_seq > ~32 K (e.g.
+        // MTP_TQ=1 + --max-seq 262144 needs 6.4 GB *per GPU* for that one
+        // buffer). cudaMalloc returns null and downstream kernels write
+        // garbage scores → all-zero logits → token-0 spam. FA path skips
+        // attn_chunk_scores entirely, so force it on for big contexts.
         const char* fa_env = getenv("FLASH_ATTN");
-        g_use_flash_attn = (fa_env == nullptr) ? false : (fa_env[0] == '1');
+        bool fa_default = false;
+        if (max_seq > 32768) fa_default = true;  // strict path infeasible
+        g_use_flash_attn = (fa_env == nullptr) ? fa_default : (fa_env[0] == '1');
+        if (fa_default && fa_env == nullptr) {
+            static bool announced = false;
+            if (!announced) {
+                printf("[attn] max_seq=%d > 32768: FLASH_ATTN auto-on (strict score buf would OOM). Set FLASH_ATTN=0 to override.\n", max_seq);
+                announced = true;
+            }
+        }
         g_attn_score_ms = g_attn_softmax_ms = g_attn_value_ms
                        = g_attn_fused_ms  = g_attn_other_ms = 0.0;
         double t_embed = 0, t_xfer = 0, t_attn = 0, t_gdn = 0, t_mlp = 0;
