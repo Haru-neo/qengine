@@ -483,6 +483,18 @@ class Handler(BaseHTTPRequestHandler):
                            f"{list(self.registry.aliases.keys())}"}})
             return
 
+        # Optional default system prompt: prepended only when the request has
+        # NO system message of its own. Lets us inject cutoff/version
+        # corrections at the router level without modifying the model or
+        # client. Use --default-system-prompt or --default-system-prompt-file.
+        default_sys = getattr(self, "default_system_prompt", None)
+        if default_sys:
+            messages = req.get("messages", [])
+            has_system = any(m.get("role") == "system" for m in messages)
+            if not has_system and isinstance(messages, list):
+                req["messages"] = [{"role": "system", "content": default_sys}] + messages
+                raw = json.dumps(req).encode()
+
         stream = bool(req.get("stream", False))
         headers = {"Content-Type": "application/json"}
         auth = self.headers.get("Authorization")
@@ -592,8 +604,23 @@ def main():
                     help="API key to inject as Authorization: Bearer <key> when "
                          "the inbound request has no Authorization header. "
                          "Lets clients hit the router without knowing the upstream key.")
+    ap.add_argument("--default-system-prompt", default=None,
+                    help="System message prepended to requests that don't ship "
+                         "their own system role. Useful for cutoff/version "
+                         "corrections and persona without touching clients.")
+    ap.add_argument("--default-system-prompt-file", default=None,
+                    help="Path to a file whose contents become the default "
+                         "system prompt. Overrides --default-system-prompt.")
     args = ap.parse_args()
     Handler.upstream_api_key = args.upstream_api_key
+    sys_prompt = args.default_system_prompt
+    if args.default_system_prompt_file:
+        with open(args.default_system_prompt_file, "r", encoding="utf-8") as f:
+            sys_prompt = f.read().strip()
+    Handler.default_system_prompt = sys_prompt
+    if sys_prompt:
+        head = sys_prompt[:80].replace("\n", " ")
+        print(f"[router] default-system-prompt active ({len(sys_prompt)} chars): {head!r}")
 
     if not args.backend:
         args.backend = [
