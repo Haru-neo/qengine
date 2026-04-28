@@ -677,8 +677,12 @@ struct HttpServer {
         // text portion of the message so the user can debug client-side.
         bool has_any_image = false;
         for (auto& m : messages) if (!m.images.empty()) { has_any_image = true; break; }
+        // Clear vision/M-RoPE state on EVERY request so a text-only call after
+        // a vision call doesn't inherit stale per-token (t,h,w) positions —
+        // those would be applied to the new prompt's tokens and produce wrong
+        // attention math. Cheap when there's nothing to free.
+        if (vision_reset_fn) vision_reset_fn();
         if (has_any_image) {
-            if (vision_reset_fn) vision_reset_fn();
             if (!vision_encode_fn) {
                 fprintf(stderr, "[API] image input received but vision is disabled (start with --vision-mmproj)\n");
             } else {

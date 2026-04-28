@@ -1161,6 +1161,10 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         int prompt_len = (int)prompt_ids.size();
         int prefill_len = prompt_len > 1 ? prompt_len - 1 : 0;
         int chunk_pos = prefix_skip;
+        // Per-request running index over g_vision_embeds rows. Used by the
+        // image_pad splice below; lives in this scope so it auto-resets to 0
+        // for every new request.
+        int s_vision_idx = 0;
         // If the cache hit covers the entire chunked-prefill range, skip
         // the loop entirely. Last token still goes through per-token loop.
         if (chunk_pos > prefill_len) chunk_pos = prefill_len;
@@ -1241,7 +1245,6 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 // an image placeholder or when vision is disabled.
                 bool vision_hit = false;
                 if (g_vision_embeds && g_image_pad_id >= 0 && token_id == g_image_pad_id) {
-                    static int s_vision_idx = 0;
                     if (s_vision_idx < g_vision_n_tokens && H == g_vision_H) {
                         cudaMemcpyAsync(gpu_hidden_half[0],
                                         g_vision_embeds + (size_t)s_vision_idx * H,
@@ -3090,6 +3093,17 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 g_vision_embeds = nullptr;
             }
             g_vision_n_tokens = 0;
+            // Free per-GPU M-RoPE position arrays so the next request — vision
+            // or text-only — starts from a clean slate. forward_attn falls back
+            // to standard 1D RoPE when g_mrope_pos_t[g] is nullptr.
+            int ng_local = std::min(n_gpus, 4);
+            for (int g = 0; g < ng_local; g++) {
+                cudaSetDevice(g);
+                if (g_mrope_pos_t[g]) { cudaFree(g_mrope_pos_t[g]); g_mrope_pos_t[g] = nullptr; }
+                if (g_mrope_pos_h[g]) { cudaFree(g_mrope_pos_h[g]); g_mrope_pos_h[g] = nullptr; }
+                if (g_mrope_pos_w[g]) { cudaFree(g_mrope_pos_w[g]); g_mrope_pos_w[g] = nullptr; }
+            }
+            cudaSetDevice(0);
             g_mrope_len = 0;
         };
         server.vision_encode_fn = [&](const std::vector<uint8_t>& bytes) -> int {
