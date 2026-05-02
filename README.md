@@ -10,7 +10,7 @@
 
 A custom CUDA inference engine for **Qwen3 hybrid (GDN + Attention) models**, written from scratch and tuned for the cards nobody wants — NVIDIA mining cards (CMP 100-210, ex-mining V100), 16 GB HBM2, PCIe Gen1 x1, no P2P.
 
-> A GPU-poor person's `vLLM`. Not a fork — every kernel was written for sm_70 with mining-card constraints in mind.
+> A GPU-poor person's `vLLM`, **vibe-coded by a Korean high school student**. Not a fork — every kernel was written for sm_70 with mining-card constraints in mind.
 
 📖 **한국어 README → [README.ko.md](README.ko.md)**
 
@@ -242,7 +242,7 @@ Active personal project. APIs and env vars may change. Issues / PRs welcome but 
 
 ## Authorship
 
-This codebase was built via [vibe coding](https://en.wikipedia.org/wiki/Vibe_coding) — code authored primarily by Claude (Anthropic) across many sessions, with direction, debugging, architecture decisions, kernel verification, and hardware reverse-engineering by **HARU-Neo** ([@Haru-neo](https://github.com/Haru-neo)). Bugs are mine; clever kernels are Claude's.
+This codebase was built via [vibe coding](https://en.wikipedia.org/wiki/Vibe_coding) — code authored primarily by Claude (Anthropic) across many sessions, with direction, debugging, architecture decisions, kernel verification, and hardware reverse-engineering by **HARU-Neo** ([@Haru-neo](https://github.com/Haru-neo)) — a Korean high school student. Bugs are mine; clever kernels are Claude's.
 
 ## License
 

@@ -6,6 +6,8 @@
 
 NVIDIA 채굴 카드 (CMP 100-210, V100) 처럼 **아무도 안 사가는 GPU** 에서 굴리려고 처음부터 새로 짠 Qwen3 hybrid (GDN + Attention) 추론 엔진.
 
+> 한국 고등학생이 **vibe coding** 으로 만든 거. 코드는 대부분 Claude 가 작성, 방향 / 디버깅 / 아키텍처 결정은 사람이.
+
 vLLM, llama.cpp MMQ, FlashAttention, bitsandbytes — 전부 cuBLAS Tensor Core 경로라 sm_70 + CMP 환경에선 1/64 속도로 굴러가거나 아예 안 돌아감. 그래서 직접 짰음.
 
 ## 뭐 하는 거냐
@@ -92,7 +94,7 @@ CUDA_VISIBLE_DEVICES=0,1 ./build/qwen-engine ... --serve 8001
 
 ## 만든 사람
 
-이 코드베이스는 [vibe coding](https://en.wikipedia.org/wiki/Vibe_coding) 으로 만들어졌음 — 코드는 대부분 Anthropic Claude 가 여러 세션에 걸쳐 작성. 방향 / 디버깅 / 아키텍처 결정 / 커널 검증 / HW 리버스 엔지니어링은 **HARU-Neo** ([@Haru-neo](https://github.com/Haru-neo)). 버그는 내 탓, 좋은 커널은 Claude.
+이 코드베이스는 [vibe coding](https://en.wikipedia.org/wiki/Vibe_coding) 으로 만들어졌음 — 코드는 대부분 Anthropic Claude 가 여러 세션에 걸쳐 작성. 방향 / 디버깅 / 아키텍처 결정 / 커널 검증 / HW 리버스 엔지니어링은 **HARU-Neo** ([@Haru-neo](https://github.com/Haru-neo)) — 한국 고등학생. 버그는 내 탓, 좋은 커널은 Claude.
 
 ## 라이선스
 
