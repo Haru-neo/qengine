@@ -1130,16 +1130,19 @@ inline void quant_gemv_chunk(void* weight, ggml_type type,
         half* op = output_chunk;
         int remaining = n_tokens;
 
-        // BIT_EXACT_GEMM=1 forces the GEMV-batched peeling path
+        // BIT_EXACT_GEMM_ON=1 forces the GEMV-batched peeling path
         // (`gemv_q8_0_q8_nN<NB>`) instead of the tiled GEMM. The nN GEMV's
         // K-dim reduction (thread-strided + warp/cross-warp shuffle) matches
         // the per-token `gemv_q8_0_q8` order exactly, so each output column
-        // is bit-equal to a per-token call. Pays a prefill throughput cost.
-        // Default ON: nN GEMV peeling matches per-token gemv_q8_0_q8 K-dim
-        // reduction tree column-wise. Pairs with FLASH_ATTN=0 default for
-        // chunked-vs-pertoken bit-exactness. Set BIT_EXACT_GEMM_OFF=1 to
-        // fall back to the GEMM-tile path (faster prefill, drift).
-        static const bool bit_exact = getenv("BIT_EXACT_GEMM_OFF") == nullptr;
+        // is bit-equal to a per-token call — useful for regression testing.
+        //
+        // Default OFF (= GEMM-tile path): the 2026-04-25 chunked-vs-pertoken
+        // drift bisect (project_27b_chunked_drift) traced drift to chunked
+        // GDN/MLP non-GEMM at L8-10, not GEMM reduction order. So the
+        // tile-path drift vs the strict path is a no-op here, and it's 2.4×
+        // faster on 27B prefill (also 2-3× on 9B). Greedy argmax matches
+        // BIT_EXACT_GEMM_ON on real prompts (verified 2026-05-02).
+        static const bool bit_exact = getenv("BIT_EXACT_GEMM_ON") != nullptr;
         if (bit_exact) {
             while (remaining >= 16) {
                 gemv_q8_0_q8_nN<16><<<M, threads, 0, stream>>>(weight, xp, op, K, M, 16);
