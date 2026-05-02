@@ -18,12 +18,12 @@ A custom CUDA inference engine for **Qwen3 hybrid (GDN + Attention) models**, wr
 
 ## What it does
 
-- Serves **Qwen3.5 / Qwen3.6** in **27B** and **9B** sizes (GGUF Q8_0).
+- Serves **Qwen3.5 / Qwen3.6** dense hybrid models in **27B** and **9B** sizes (GGUF Q8_0). MoE variants (Qwen3-Moe etc.) **not supported**.
 - Vision input via **Qwen3-VL mmproj** (ViT + M-RoPE + spatial reshape).
 - **OpenAI-compatible HTTP API** (`/v1/chat/completions`, `/v1/models`, streaming, tool calls).
 - **Continuous batching** across N concurrent slots, with per-slot prefix caching.
-- **Speculative decoding** via MTP draft head (legacy, K=1) + experimental DFlash + DDTree.
-- **3-bit KV cache (MTP_TQ)** — Walsh-Hadamard rotation + Lloyd-Max scalar quant. Similar in spirit to llama.cpp [#21038](https://github.com/ggml-org/llama.cpp/pull/21038); we use 3-bit Lloyd-Max instead of 4-bit RTN, but the rotation idea is shared.
+- **MTP draft speculative decoding (K=1)** — works. DFlash + DDTree code is in the repo but **not currently functional** (drafter mismatch — see Limitations).
+- **3-bit KV cache (MTP_TQ)** — Walsh-Hadamard rotation + Lloyd-Max scalar quant. Same family of idea as llama.cpp [#21038](https://github.com/ggml-org/llama.cpp/pull/21038), but 3-bit Lloyd-Max instead of 4-bit RTN.
 - Multi-GPU layer-parallel split with pinned-host activation bridge (no P2P required).
 
 ## Why this exists
@@ -83,15 +83,16 @@ All measurements on the same 4× CMP 100-210 host, same `Q8_0` GGUF, batch 1, si
 - **Generation (decode): qengine wins by ~30–50% on 9B and ~50% on 27B.** This is what users feel as "the model is responding fast" in chat / agent / coding workflows where the prompt is processed once and the response is streamed token-by-token.
 - **18 K prefill on 27B is brutal (~14 min on qengine).** Heavy room to improve — likely better Q8_0 GEMM tile, batched matmul pipelining.
 
-## Things qengine does that llama.cpp doesn't (or didn't, last we checked)
+## Things qengine does that llama.cpp doesn't (or differs)
 
-These weren't measured head-to-head — feel free to verify and PR a benchmark.
+Honest take: most of the surface-level features overlap. The list below is what actually differs in practice. Not measured head-to-head where not stated — corrections / PRs welcome.
 
-- **OpenAI Chat Completions API** — including streaming, vision (`image_url`), and tool/function calls — built into the engine binary, no separate server process.
-- **Qwen3-VL multimodal** — ViT + M-RoPE + spatial reshape + image splice into the LLM token stream. We checked llama.cpp's mtmd at the time we built this and Qwen3-VL wasn't supported.
-- **DFlash + DDTree experimental speculative decode** — paper claims ~3× over plain MTP draft. Pretrained drafter from `lucebox-hub/dflash` doesn't match Qwen3.6's distill distribution; will require a fine-tune.
-- **MTP_TQ at 256 K context on 27B** — Walsh-Hadamard rotation + Lloyd-Max 3-bit on the KV cache. The 27B at 256 K runs comfortably on 4× CMP. llama.cpp's `#21038` (rotation + RTN scalar quant) lands the same idea earlier but uses 4-bit RTN. We haven't run a head-to-head perplexity comparison.
-- **Continuous batching with per-slot prefix snapshots** — not unique, but the integration with our scheduler is tight.
+- **Generation throughput at sm_70 + CMP** — measured +30–50% over llama.cpp on this exact hardware. See benchmarks above.
+- **OpenAI Chat Completions API built into the engine binary** — streaming, `image_url`, tool/function calls, no separate server process. llama.cpp has `llama-server` which covers most of this.
+- **MTP_TQ uses 3-bit Lloyd-Max + WHT** — llama.cpp's [#21038](https://github.com/ggml-org/llama.cpp/pull/21038) already lands rotation + standard scalar quant types (q4_0 etc.). Ours is 3-bit (vs 4-bit), which gives a slightly higher compression ratio on KV. Whether this beats q4_0 RTN on perplexity is **not yet verified head-to-head**.
+- **Continuous batching with per-slot prefix snapshots** — not unique conceptually. The integration with our scheduler is tight; whether it actually beats llama.cpp's batched server is **not yet measured**.
+- **Qwen3-VL multimodal** — we have it. So does llama.cpp via `tools/mtmd/models/qwen3vl.cpp`. Not an advantage.
+- **DFlash + DDTree speculative decode (experimental, currently broken)** — z-lab pretrained drafter mismatches Qwopus3.6 distill distribution; produces degenerate output. Listed for transparency, not as a feature. Requires drafter fine-tune to be usable.
 
 ## Hardware
 
@@ -217,6 +218,8 @@ Layer split (4-GPU 27B example): GPU 0 holds layers 0–15 + token embeddings; G
 
 ## Limitations & known issues
 
+- **MoE not supported.** Only dense Qwen3 hybrid (GDN + Attention) models — Qwen3-Moe and similar mixture-of-experts variants do not load.
+- **DFlash + DDTree spec decode is currently broken.** Pretrained drafter (`lucebox-hub/dflash`) is trained on stock Qwen3.5; output distribution doesn't match the Qwopus distill we use, so accept rate ≈ 0% and the chains degenerate. Code is in the repo for the eventual fine-tuned drafter, but as shipped this path is unusable.
 - **No batched MTP / spec.** Speculative paths run only when `slots == 1`. With `slots > 1`, the batched gen loop is plain greedy.
 - **GGUF Q8_0 is the supported path.** Q5_K_M / Q6_K load but quality is degraded — use Q8_0.
 - **sm_70 specific tuning.** Should run on sm_75; sm_80+ has better engines anyway.

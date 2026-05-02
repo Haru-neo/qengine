@@ -10,12 +10,12 @@ vLLM, llama.cpp MMQ, FlashAttention, bitsandbytes — 전부 cuBLAS Tensor Core 
 
 ## 뭐 하는 거냐
 
-- **Qwen3.5 / Qwen3.6 27B / 9B** GGUF Q8_0 서빙
-- **Qwen3-VL 멀티모달** (mmproj — ViT + M-RoPE + spatial reshape)
+- **Qwen3.5 / Qwen3.6 dense hybrid 27B / 9B** GGUF Q8_0 서빙. MoE (Qwen3-Moe 등) **미지원**
+- **Qwen3-VL 멀티모달** (mmproj — ViT + M-RoPE + spatial reshape). llama.cpp 도 mtmd 로 지원함, 우리 unique 강점 X
 - **OpenAI 호환 HTTP API** (chat/completions, streaming, tool calls)
 - **Continuous batching** N슬롯 동시 + per-slot prefix cache
-- **Speculative decoding** — MTP K=1 (default), DFlash + DDTree (실험)
-- **3-bit KV cache (MTP_TQ)** — Walsh-Hadamard 회전 + Lloyd-Max 양자화. 27B 256K 컨텍스트 fp16 17GB → 3.5GB
+- **Speculative decoding** — MTP K=1 (동작). DFlash + DDTree 코드 있지만 **현재 동작 안 함** (drafter mismatch)
+- **3-bit KV cache (MTP_TQ)** — Walsh-Hadamard 회전 + Lloyd-Max 양자화. 27B 256K 컨텍스트 fp16 17GB → 3.5GB. llama.cpp [#21038](https://github.com/ggml-org/llama.cpp/pull/21038) 가 같은 방향 (rotation + 4-bit RTN) 머지됨
 - 멀티 GPU layer-parallel split, P2P 없이 pinned-host activation bridge
 
 ## 왜 만들었냐
@@ -81,6 +81,9 @@ CUDA_VISIBLE_DEVICES=0,1 ./build/qwen-engine ... --serve 8001
 
 ## 한계
 
+- **MoE 미지원** — dense Qwen3 hybrid 만. Qwen3-Moe 안 됨
+- **DFlash + DDTree spec 동작 X** — drafter (z-lab pretrained) 가 stock Qwen3.5 기준이라 Qwopus distill 와 분포 mismatch. accept ≈ 0%, chain degenerate. 코드는 fine-tune 후 사용 목적으로 넣어둠
+- **Prefill 2~4배 느림** (vs llama.cpp). 최대 약점. 최적화 진행 중
 - batched MTP / spec 미지원 (`slots > 1` 이면 plain greedy)
 - Q8_0 만 정식 지원 (Q5_K_M / Q6_K 는 quality 떨어짐)
 - sm_70 타겟 — sm_75 에서 돌긴 하지만 최적화 X. sm_80+ 은 vLLM/SGLang 쓰는 게 나음
