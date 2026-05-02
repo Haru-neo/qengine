@@ -12,6 +12,7 @@
 #include "vision.cuh"
 #include "dflash_decode.cuh"
 #include <cstdio>
+#include <csignal>
 // Vision hooks (shared via global pointers — see main() wiring). When the CLI
 // is invoked with --mmproj + --image-raw, main() runs the ViT on GPU 0 and
 // populates g_vision_embeds with 576 fp16 rows of LLM-hidden dim. During
@@ -3313,6 +3314,7 @@ int serve_gemma(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
 
 int main(int argc, char** argv) {
     setvbuf(stdout, NULL, _IONBF, 0);  // disable stdout buffering for logging
+    signal(SIGPIPE, SIG_IGN);  // dead-client socket writes return EPIPE instead of killing process
     if (argc < 2) {
         printf("Usage: %s <model.gguf> [options] [token_ids...]\n", argv[0]);
         printf("Options:\n");

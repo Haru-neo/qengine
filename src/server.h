@@ -611,7 +611,7 @@ struct HttpServer {
              << "\r\n"
              << body;
         std::string r = resp.str();
-        ::send(client_fd, r.c_str(), r.size(), 0);
+        ::send(client_fd, r.c_str(), r.size(), MSG_NOSIGNAL);
     }
 
     void handle_models(int client_fd) {

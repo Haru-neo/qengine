@@ -1,2 +1,46 @@
 build/
 *.o
+*.so
+*.a
+
+# logs / runtime artifacts
+*.log
+*.err
+*.exit
+nohup.out
+
+# editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# personal harness state
+.claude/
+CLAUDE.md
+
+# work-in-progress sources
+*.working
+*.working2
+
+# debug output (personal ablation logs)
+debug/
+
+# tool binaries
+tools/bench_hfma2_gemm
+tools/bench_mlp_gemm
+tools/dump_gguf
+tools/test_turboquant
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# model artifacts (users supply their own)
+*.gguf
+*.safetensors
+*.bin
+mtp_work/
+models/

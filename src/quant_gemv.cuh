@@ -98,7 +98,7 @@ __global__ void gemv_q5_K_q8(
     for (int off=16;off>0;off>>=1) thread_sum+=__shfl_xor_sync(0xffffffff,thread_sum,off);
     __shared__ float sm[8]; int w2=threadIdx.x>>5,l=threadIdx.x&31,nw=blockDim.x>>5;
     if(l==0)sm[w2]=thread_sum; __syncthreads();
-    if(w2==0&&l<nw){float v=sm[l]; for(int o=16;o>0;o>>=1)v+=__shfl_xor_sync(0xffffffff,v,o); if(l==0)output[row]=__float2half(v);}
+    if(w2==0){float v=(l<nw)?sm[l]:0.0f; for(int o=16;o>0;o>>=1)v+=__shfl_xor_sync(0xffffffff,v,o); if(l==0)output[row]=__float2half(v);}
 }
 
 // ============ Q6_K GEMV — dp4a + vec ============
@@ -127,17 +127,22 @@ __global__ void gemv_q6_K_q8(
         const int quarter  = sub & 3;             // sub % 4
         const int ql_shift = (quarter >> 1) * 4;  // 0 or 4
         const int qh_shift = quarter * 2;         // 0,2,4,6
-        const uint32_t* ql32 = (const uint32_t*)(b->ql + sg * 64 + (quarter & 1) * 32);
-        const uint32_t* qh32 = (const uint32_t*)(b->qh + sg * 32);
+        // sizeof(block_q6_K) = 210 (not divisible by 4), so b can land on an
+        // odd 2-byte boundary. uint32_t casts of b->ql / b->qh would be
+        // misaligned on those rows and silently return corrupt bytes, zeroing
+        // the row's output. Read as bytes (uchar) and pack manually.
+        const uint8_t* ql_bytes = b->ql + sg * 64 + (quarter & 1) * 32;
+        const uint8_t* qh_bytes = b->qh + sg * 32;
         const int8_t sc0 = b->scales[sub * 2];
         const int8_t sc1 = b->scales[sub * 2 + 1];
 
         int isum0 = 0;
         #pragma unroll
         for (int j = 0; j < 16; j += 4) {
-            int lw = j >> 2;
-            uint32_t ql_w = ql32[lw];
-            uint32_t qh_w = qh32[lw];
+            uint32_t ql_w = (uint32_t)ql_bytes[j] | ((uint32_t)ql_bytes[j+1] << 8)
+                          | ((uint32_t)ql_bytes[j+2] << 16) | ((uint32_t)ql_bytes[j+3] << 24);
+            uint32_t qh_w = (uint32_t)qh_bytes[j] | ((uint32_t)qh_bytes[j+1] << 8)
+                          | ((uint32_t)qh_bytes[j+2] << 16) | ((uint32_t)qh_bytes[j+3] << 24);
             uint32_t ql4 = (ql_w >> ql_shift) & 0x0F0F0F0Fu;
             uint32_t qh2 = (qh_w >> qh_shift) & 0x03030303u;
             uint32_t q   = ql4 | (qh2 << 4);             // 6-bit unsigned bytes in [0..63]
@@ -147,9 +152,10 @@ __global__ void gemv_q6_K_q8(
         int isum1 = 0;
         #pragma unroll
         for (int j = 16; j < 32; j += 4) {
-            int lw = j >> 2;
-            uint32_t ql_w = ql32[lw];
-            uint32_t qh_w = qh32[lw];
+            uint32_t ql_w = (uint32_t)ql_bytes[j] | ((uint32_t)ql_bytes[j+1] << 8)
+                          | ((uint32_t)ql_bytes[j+2] << 16) | ((uint32_t)ql_bytes[j+3] << 24);
+            uint32_t qh_w = (uint32_t)qh_bytes[j] | ((uint32_t)qh_bytes[j+1] << 8)
+                          | ((uint32_t)qh_bytes[j+2] << 16) | ((uint32_t)qh_bytes[j+3] << 24);
             uint32_t ql4 = (ql_w >> ql_shift) & 0x0F0F0F0Fu;
             uint32_t qh2 = (qh_w >> qh_shift) & 0x03030303u;
             uint32_t q   = ql4 | (qh2 << 4);
@@ -161,7 +167,7 @@ __global__ void gemv_q6_K_q8(
     for (int off=16;off>0;off>>=1) thread_sum+=__shfl_xor_sync(0xffffffff,thread_sum,off);
     __shared__ float sm[8]; int w2=threadIdx.x>>5,l=threadIdx.x&31,nw=blockDim.x>>5;
     if(l==0)sm[w2]=thread_sum; __syncthreads();
-    if(w2==0&&l<nw){float v=sm[l]; for(int o=16;o>0;o>>=1)v+=__shfl_xor_sync(0xffffffff,v,o); if(l==0)output[row]=__float2half(v);}
+    if(w2==0){float v=(l<nw)?sm[l]:0.0f; for(int o=16;o>0;o>>=1)v+=__shfl_xor_sync(0xffffffff,v,o); if(l==0)output[row]=__float2half(v);}
 }
 
 // ============ Q8_0 / FP16 / F32 ============
@@ -175,7 +181,7 @@ __global__ void gemv_q8_0(const void* __restrict__ w, const half* __restrict__ x
     for(int o=16;o>0;o>>=1)s+=__shfl_xor_sync(0xffffffff,s,o);
     __shared__ float sm[8];int w2=threadIdx.x>>5,l=threadIdx.x&31,nw=blockDim.x>>5;
     if(l==0)sm[w2]=s;__syncthreads();
-    if(w2==0&&l<nw){s=sm[l];for(int o=16;o>0;o>>=1)s+=__shfl_xor_sync(0xffffffff,s,o);if(l==0)y[row]=__float2half(s);}
+    if(w2==0){s=(l<nw)?sm[l]:0.0f;for(int o=16;o>0;o>>=1)s+=__shfl_xor_sync(0xffffffff,s,o);if(l==0)y[row]=__float2half(s);}
 }
 
 // Q8_0 × Q8_1 GEMV with per-block BM output rows. Each thread reads each
@@ -305,7 +311,7 @@ __global__ void gemv_q8_0_q8(
     for (int off=16;off>0;off>>=1) thread_sum+=__shfl_xor_sync(0xffffffff,thread_sum,off);
     __shared__ float sm[8]; int w2=threadIdx.x>>5,l=threadIdx.x&31,nw=blockDim.x>>5;
     if(l==0)sm[w2]=thread_sum; __syncthreads();
-    if(w2==0&&l<nw){float v=sm[l]; for(int o=16;o>0;o>>=1)v+=__shfl_xor_sync(0xffffffff,v,o); if(l==0)output[row]=__float2half(v);}
+    if(w2==0){float v=(l<nw)?sm[l]:0.0f; for(int o=16;o>0;o>>=1)v+=__shfl_xor_sync(0xffffffff,v,o); if(l==0)output[row]=__float2half(v);}
 }
 // N=2 BATCHED Q8_0 weight × Q8_1 input GEMV.
 // Same as gemv_q8_0_q8 but processes two independent input vectors that share
@@ -362,8 +368,9 @@ __global__ void gemv_q8_0_q8_n2(
     int w2 = threadIdx.x >> 5, l = threadIdx.x & 31, nw = blockDim.x >> 5;
     if (l == 0) { sm_a[w2] = thread_sum_a; sm_b[w2] = thread_sum_b; }
     __syncthreads();
-    if (w2 == 0 && l < nw) {
-        float va = sm_a[l], vb = sm_b[l];
+    if (w2 == 0) {
+        float va = (l < nw) ? sm_a[l] : 0.0f;
+        float vb = (l < nw) ? sm_b[l] : 0.0f;
         for (int o=16; o>0; o>>=1) {
             va += __shfl_xor_sync(0xffffffff, va, o);
             vb += __shfl_xor_sync(0xffffffff, vb, o);
@@ -1024,7 +1031,7 @@ __global__ void gemv_fp16(const half* __restrict__ w,const half* __restrict__ x,
     for(int o=16;o>0;o>>=1)s+=__shfl_xor_sync(0xffffffff,s,o);
     __shared__ float sm[8];int w2=threadIdx.x>>5,l=threadIdx.x&31,nw=blockDim.x>>5;
     if(l==0)sm[w2]=s;__syncthreads();
-    if(w2==0&&l<nw){s=sm[l];for(int o=16;o>0;o>>=1)s+=__shfl_xor_sync(0xffffffff,s,o);if(l==0)y[row]=__float2half(s);}
+    if(w2==0){s=(l<nw)?sm[l]:0.0f;for(int o=16;o>0;o>>=1)s+=__shfl_xor_sync(0xffffffff,s,o);if(l==0)y[row]=__float2half(s);}
 }
 __global__ void gemv_f32(const float* __restrict__ w,const half* __restrict__ x,half* __restrict__ y,int K,int N){
     int row=blockIdx.x;if(row>=N)return;float s=0.0f;
@@ -1032,7 +1039,7 @@ __global__ void gemv_f32(const float* __restrict__ w,const half* __restrict__ x,
     for(int o=16;o>0;o>>=1)s+=__shfl_xor_sync(0xffffffff,s,o);
     __shared__ float sm[8];int w2=threadIdx.x>>5,l=threadIdx.x&31,nw=blockDim.x>>5;
     if(l==0)sm[w2]=s;__syncthreads();
-    if(w2==0&&l<nw){s=sm[l];for(int o=16;o>0;o>>=1)s+=__shfl_xor_sync(0xffffffff,s,o);if(l==0)y[row]=__float2half(s);}
+    if(w2==0){s=(l<nw)?sm[l]:0.0f;for(int o=16;o>0;o>>=1)s+=__shfl_xor_sync(0xffffffff,s,o);if(l==0)y[row]=__float2half(s);}
 }
 
 // ============ Dispatch ============
