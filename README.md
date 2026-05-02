@@ -8,7 +8,7 @@
 
 > 🚧 **Prefill is currently 2–4× slower than llama.cpp on the same hardware. Active optimization in progress — target: ≥1.5× llama.cpp prefill.** Generation already wins (+30–50%). See [Honest Benchmarks](#honest-benchmarks-vs-llamacpp).
 
-A custom CUDA inference engine for **Qwen3 hybrid (GDN + Attention) models**, written from scratch and tuned for the cards nobody wants — NVIDIA mining cards (CMP 100-210, ex-mining V100), 16 GB HBM2, PCIe Gen2 x1, no P2P.
+A custom CUDA inference engine for **Qwen3 hybrid (GDN + Attention) models**, written from scratch and tuned for the cards nobody wants — NVIDIA mining cards (CMP 100-210, ex-mining V100), 16 GB HBM2, PCIe Gen1 x1, no P2P.
 
 > A GPU-poor person's `vLLM`. Not a fork — every kernel was written for sm_70 with mining-card constraints in mind.
 
@@ -31,7 +31,7 @@ A custom CUDA inference engine for **Qwen3 hybrid (GDN + Attention) models**, wr
 Mining cards (CMP 100-210, ex-mining V100) are dirt-cheap on the secondhand market and have **HBM2 + 16 GB** of VRAM that nobody is buying back, but NVIDIA cripples them in software:
 
 - **Tensor Cores throttled** — HMMA latency stretched 64× (8 → 512 cycles), hard cap ~5 TFLOP via cuBLAS WMMA.
-- **PCIe Gen2 x1 only**, no P2P, no NVLink.
+- **PCIe Gen1 x1 only**, no P2P, no NVLink.
 - **CUPTI blocked** — no vendor profiler, no `torch.profiler`.
 - **Driver enforces all of this** via signed firmware, can't be bypassed.
 
@@ -96,7 +96,7 @@ These weren't measured head-to-head — feel free to verify and PR a benchmark.
 ## Hardware
 
 **Designed for / regularly tested on:**
-- 4× NVIDIA **CMP 100-210** (Volta GV100, 16 GB HBM2, sm_70, PCIe Gen2 x1, no P2P)
+- 4× NVIDIA **CMP 100-210** (Volta GV100, 16 GB HBM2, sm_70, PCIe Gen1 x1, no P2P)
 - Total 64 GB VRAM, ~8 GB system RAM (yes, eight)
 
 **Should also work on (sm_70 / sm_72 / sm_75):**

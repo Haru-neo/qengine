@@ -23,7 +23,7 @@ vLLM, llama.cpp MMQ, FlashAttention, bitsandbytes — 전부 cuBLAS Tensor Core 
 CMP 100-210, V100 같은 채굴 카드는 중고 시장에 헐값으로 풀려있고 **HBM2 16GB** 인데, NVIDIA 가 SW 로 일부러 죽여놨음:
 
 - **Tensor Core throttle** — HMMA latency 64배 (8 → 512 cycle), cuBLAS WMMA 5 TFLOP 한계
-- **PCIe Gen2 x1**, P2P 없음, NVLink 없음
+- **PCIe Gen1 x1**, P2P 없음, NVLink 없음
 - **CUPTI 차단** — torch.profiler 못 씀
 - 다 펌웨어 차원이라 우회 불가
 
