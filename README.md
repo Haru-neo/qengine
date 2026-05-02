@@ -1,16 +1,13 @@
 # qengine
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Vibe Coded](https://img.shields.io/badge/vibe%20coded-with%20Claude-8A2BE2)](https://en.wikipedia.org/wiki/Vibe_coding)
 [![CUDA](https://img.shields.io/badge/CUDA-12.x-76B900?logo=nvidia)](https://developer.nvidia.com/cuda-toolkit)
 [![Volta sm_70](https://img.shields.io/badge/sm__70-Volta-green)](https://en.wikipedia.org/wiki/Volta_(microarchitecture))
 [![Prefill: optimizing](https://img.shields.io/badge/prefill-optimizing%20%F0%9F%9A%A7-orange)](#honest-benchmarks-vs-llamacpp)
 
 > 🚧 **Prefill is currently 2–4× slower than llama.cpp on the same hardware. Active optimization in progress — target: ≥1.5× llama.cpp prefill.** Generation already wins (+30–50%). See [Honest Benchmarks](#honest-benchmarks-vs-llamacpp).
 
-A custom CUDA inference engine for **Qwen3 hybrid (GDN + Attention) models**, written from scratch and tuned for the cards nobody wants — NVIDIA mining cards (CMP 100-210, ex-mining V100), 16 GB HBM2, PCIe Gen1 x1, no P2P.
-
-> A GPU-poor person's `vLLM`, **vibe-coded by a Korean high school student**. Not a fork — every kernel was written for sm_70 with mining-card constraints in mind.
+A custom CUDA inference engine for **Qwen3 hybrid (GDN + Attention) models**, written from scratch and tuned for NVIDIA mining cards (CMP 100-210, ex-mining V100) — 16 GB HBM2, sm_70, PCIe Gen1 x1, no P2P. Not a fork — every kernel is written for these constraints.
 
 📖 **한국어 README → [README.ko.md](README.ko.md)**
 
@@ -238,11 +235,7 @@ Active personal project. APIs and env vars may change. Issues / PRs welcome but 
 - **`llama.cpp`** for the GGUF format, reference quant kernels, and the cargo of measurement / quantization research the broader community has produced. Particularly [#21038](https://github.com/ggml-org/llama.cpp/pull/21038) (rotation for KV quant) which arrived ahead of our MTP_TQ work.
 - **`stb_image.h`** (public domain) for image decode in the vision path.
 - **TurboQuant**, **DFlash + DDTree** speculative decoding (`lucebox-hub/dflash`) as experimental references.
-- **Anthropic Claude** — see authorship below.
-
-## Authorship
-
-This codebase was built via [vibe coding](https://en.wikipedia.org/wiki/Vibe_coding) — code authored primarily by Claude (Anthropic) across many sessions, with direction, debugging, architecture decisions, kernel verification, and hardware reverse-engineering by **HARU-Neo** ([@Haru-neo](https://github.com/Haru-neo)) — a Korean high school student. Bugs are mine; clever kernels are Claude's.
+- **Anthropic Claude** — kernel implementation and CUDA work across many sessions.
 
 ## License
 
