@@ -30,7 +30,7 @@ Mining cards (CMP 100-210, ex-mining V100) are dirt-cheap on the secondhand mark
 - **Tensor Cores throttled** — HMMA latency stretched 64× (8 → 512 cycles), hard cap ~5 TFLOP via cuBLAS WMMA.
 - **PCIe Gen1 x1 only**, no P2P, no NVLink.
 - **CUPTI blocked** — no vendor profiler, no `torch.profiler`.
-- **Driver enforces all of this** via signed firmware, can't be bypassed.
+- **All of this is enforced in hardware** — e-fuse + PMU bootrom double-lock on the die. There is no software unlock; we tried.
 
 So `vLLM`, `llama.cpp`'s default cuBLAS path, FlashAttention, bitsandbytes — anything that goes through cuBLAS Tensor Cores runs at 1/64 speed or fails outright.
 
