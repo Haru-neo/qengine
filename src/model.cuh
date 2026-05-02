@@ -2567,16 +2567,21 @@ struct QwenModel {
 
             if (can_flash) {
                 auto tf0 = pa_now();
-                // FA_BM env: 32 (default, fits 48KB SMEM, lane==r in original
-                // kernel) or 64 (uses BM-generic kernel, halves K/V tile-load
-                // iterations on long contexts; needs 96KB dynamic SMEM opt-in).
+                // FA_BM:  32 (default) | 64 — BM-generic kernel, 96KB SMEM opt-in
+                // FA_NT:  1  (default) | 2 — K/V-sharing kernel, halves K/V HBM
+                //                            traffic by processing 2 t_idx per
+                //                            block. BM is forced to 32 for NT.
                 static const int fa_bm = []{
                     const char* e = getenv("FA_BM");
                     int v = e ? atoi(e) : 32;
                     return (v == 64) ? 64 : 32;
                 }();
+                static const int fa_nt = []{
+                    const char* e = getenv("FA_NT");
+                    int v = e ? atoi(e) : 1;
+                    return (v == 2) ? 2 : 1;
+                }();
                 constexpr int HD = 256, BLOCK = 256;
-                dim3 fg(num_kv, sub_n);
                 static bool fa_smem_set[16] = {false};
                 int cur_dev = 0; cudaGetDevice(&cur_dev);
                 auto ensure_smem = [&](const void* fn) {
@@ -2591,8 +2596,20 @@ struct QwenModel {
                 };
                 if (num_q == 24) {
                     constexpr int GQA = 6;
-                    if (fa_bm == 64) {
+                    if (fa_nt == 2) {
+                        // 27B GQA=6: N_T=2 → 12 active warps, BLOCK=512.
+                        constexpr int BM = 32, NT = 2, NT_BLOCK = 512;
+                        int smem_bytes = NT * GQA * HD * sizeof(half)
+                                       + 2 * BM * HD * sizeof(half)
+                                       + NT * GQA * BM * sizeof(float);
+                        dim3 fg(num_kv, (sub_n + NT - 1) / NT);
+                        flash_attn_chunk_fused_nt<HD, GQA, BM, NT_BLOCK, NT>
+                            <<<fg, NT_BLOCK, smem_bytes, stream>>>(
+                                q_post_sub, k_cache_ptr, v_cache_ptr, out_sub,
+                                num_q, num_kv, sub_start_pos, sub_n, scale);
+                    } else if (fa_bm == 64) {
                         constexpr int BM = 64;
+                        dim3 fg(num_kv, sub_n);
                         int smem_bytes = GQA * HD * sizeof(half)
                                        + 2 * BM * HD * sizeof(half)
                                        + GQA * BM * sizeof(float);
@@ -2603,6 +2620,7 @@ struct QwenModel {
                                 num_q, num_kv, sub_start_pos, sub_n, scale);
                     } else {
                         constexpr int BM = 32;
+                        dim3 fg(num_kv, sub_n);
                         int smem_bytes = GQA * HD * sizeof(half)
                                        + 2 * BM * HD * sizeof(half)
                                        + GQA * BM * sizeof(float);
@@ -2613,8 +2631,20 @@ struct QwenModel {
                     }
                 } else {  // num_q == 16, GQA = 4
                     constexpr int GQA = 4;
-                    if (fa_bm == 64) {
+                    if (fa_nt == 2) {
+                        // 9B GQA=4: N_T=2 → 8 active warps, BLOCK=256 (exact fit).
+                        constexpr int BM = 32, NT = 2;
+                        int smem_bytes = NT * GQA * HD * sizeof(half)
+                                       + 2 * BM * HD * sizeof(half)
+                                       + NT * GQA * BM * sizeof(float);
+                        dim3 fg(num_kv, (sub_n + NT - 1) / NT);
+                        flash_attn_chunk_fused_nt<HD, GQA, BM, BLOCK, NT>
+                            <<<fg, BLOCK, smem_bytes, stream>>>(
+                                q_post_sub, k_cache_ptr, v_cache_ptr, out_sub,
+                                num_q, num_kv, sub_start_pos, sub_n, scale);
+                    } else if (fa_bm == 64) {
                         constexpr int BM = 64;
+                        dim3 fg(num_kv, sub_n);
                         int smem_bytes = GQA * HD * sizeof(half)
                                        + 2 * BM * HD * sizeof(half)
                                        + GQA * BM * sizeof(float);
@@ -2625,6 +2655,7 @@ struct QwenModel {
                                 num_q, num_kv, sub_start_pos, sub_n, scale);
                     } else {
                         constexpr int BM = 32;
+                        dim3 fg(num_kv, sub_n);
                         int smem_bytes = GQA * HD * sizeof(half)
                                        + 2 * BM * HD * sizeof(half)
                                        + GQA * BM * sizeof(float);

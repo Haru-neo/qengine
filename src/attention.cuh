@@ -1414,6 +1414,188 @@ __global__ void flash_attn_chunk_fused(
     }
 }
 
+// K/V-sharing FA kernel. One block processes N_T consecutive t_idx values for
+// the same kv_head, so the K/V tile is loaded ONCE per tile_start and reused
+// for all N_T softmax/O accumulators. Halves (N_T=2) or quarters (N_T=4) the
+// K/V HBM traffic at long contexts where K/V load dominates wall time.
+//
+// Block layout: BLOCK threads, N_WARPS = BLOCK/32. Each warp owns one (n, g)
+// pair where n ∈ [0, N_T), g ∈ [0, GQA), so we need BLOCK >= N_T*GQA*32.
+//   9B (GQA=4) N_T=2: 8 warps → BLOCK=256 (exact fit)
+//   27B (GQA=6) N_T=2: 12 warps → BLOCK=512 (4 idle warps for K/V load only)
+//
+// SMEM (HD=256 BM=32 N_T=2):
+//   9B  GQA=4: q_s 4KB + k 16KB + v 16KB + s 1KB = 37 KB (fits 48 KB default)
+//   27B GQA=6: q_s 6KB + k 16KB + v 16KB + s 1.5KB ≈ 40 KB (fits)
+template<int HD, int GQA, int BM, int BLOCK, int N_T>
+__global__ void flash_attn_chunk_fused_nt(
+    const half* __restrict__ q_chunk,
+    const half* __restrict__ k_cache,
+    const half* __restrict__ v_cache,
+    half*       __restrict__ out_chunk,
+    int num_q, int num_kv,
+    int start_pos, int sub_n, float scale
+) {
+    static_assert(BM == 32, "flash_attn_chunk_fused_nt assumes BM == 32 (lane==r)");
+    constexpr int N_WARPS  = BLOCK / 32;
+    constexpr int LANE_D   = HD / 32;
+    constexpr int N_ACTIVE = N_T * GQA;
+    static_assert(N_ACTIVE <= N_WARPS, "Need BLOCK >= N_T*GQA*32 warps");
+
+    int kv_head   = blockIdx.x;
+    int group_idx = blockIdx.y;
+    int t_base    = group_idx * N_T;
+    if (t_base >= sub_n) return;
+
+    int tid  = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+
+    int my_n  = warp / GQA;          // valid only if warp < N_ACTIVE
+    int my_g  = warp - my_n * GQA;
+    int my_t  = t_base + my_n;
+    bool warp_active = (warp < N_ACTIVE) && (my_t < sub_n);
+
+    extern __shared__ unsigned char smem_fa_nt[];
+    half*  q_s    = (half*)smem_fa_nt;
+    half*  k_tile = q_s    + N_T * GQA * HD;
+    half*  v_tile = k_tile + BM  * HD;
+    float* s_smem = (float*)(v_tile + BM * HD);
+
+    // Load Q for all (n, g) in this group. Out-of-range t_idx → zero-pad.
+    #pragma unroll
+    for (int i = tid; i < N_T * GQA * HD; i += BLOCK) {
+        int n = i / (GQA * HD);
+        int rem = i - n * GQA * HD;
+        int g = rem / HD;
+        int c = rem - g * HD;
+        int t_idx = t_base + n;
+        if (t_idx < sub_n) {
+            int q_head = kv_head * GQA + g;
+            q_s[(n * GQA + g) * HD + c] =
+                q_chunk[(size_t)t_idx * num_q * HD + (size_t)q_head * HD + c];
+        } else {
+            q_s[(n * GQA + g) * HD + c] = __float2half(0.0f);
+        }
+    }
+    __syncthreads();
+
+    float acc_o[LANE_D];
+    #pragma unroll
+    for (int i = 0; i < LANE_D; i++) acc_o[i] = 0.0f;
+    float m_w = -INFINITY;
+    float l_w = 0.0f;
+
+    // Furthest position any t_idx in this group looks at. Smaller-t_idx warps
+    // mask scores past their own causal end via -INFINITY, so the loop runs
+    // up to the group max (1..N_T-1 extra tile loads on the trailing warps).
+    int group_size = min(N_T, sub_n - t_base);
+    int max_active_end = t_base + group_size - 1 + start_pos + 1;
+
+    for (int tile_start = 0; tile_start < max_active_end; tile_start += BM) {
+        int tile_end_max = min(tile_start + BM, max_active_end);
+        int tile_len = tile_end_max - tile_start;
+
+        #pragma unroll
+        for (int i = tid; i < BM * HD; i += BLOCK) {
+            int r = i / HD;
+            int c = i - r * HD;
+            half zero_h = __float2half(0.0f);
+            if (r < tile_len) {
+                size_t base = (size_t)(tile_start + r) * num_kv * HD
+                            + kv_head * HD;
+                k_tile[r * HD + c] = k_cache[base + c];
+                v_tile[r * HD + c] = v_cache[base + c];
+            } else {
+                k_tile[r * HD + c] = zero_h;
+                v_tile[r * HD + c] = zero_h;
+            }
+        }
+        __syncthreads();
+
+        // Score: each active (n,g) warp computes BM scores over its own Q row,
+        // sharing the same K tile. Per-warp work is BM dot products serially —
+        // 2× the original kernel's per-warp score work, but N_T t_idx values
+        // produced per K/V load (the actual win at long contexts).
+        if (warp_active) {
+            const half2* qs2 = reinterpret_cast<const half2*>(
+                q_s + (my_n * GQA + my_g) * HD);
+            int my_active_end = my_t + start_pos + 1;
+            #pragma unroll
+            for (int r = 0; r < BM; r++) {
+                float partial = 0.0f;
+                const half2* kt2 = reinterpret_cast<const half2*>(k_tile + r * HD);
+                #pragma unroll
+                for (int i = 0; i < LANE_D / 2; i++) {
+                    half2 qv = qs2[lane * (LANE_D / 2) + i];
+                    half2 kv = kt2[lane * (LANE_D / 2) + i];
+                    float2 qf = __half22float2(qv);
+                    float2 kf = __half22float2(kv);
+                    partial += qf.x * kf.x + qf.y * kf.y;
+                }
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    partial += __shfl_xor_sync(0xffffffff, partial, off);
+                if (lane == 0) {
+                    int abs_pos_r = tile_start + r;
+                    bool causal_ok = (abs_pos_r < my_active_end);
+                    bool tile_ok   = (r < tile_len);
+                    float val = (causal_ok && tile_ok) ? partial * scale : -INFINITY;
+                    s_smem[(my_n * GQA + my_g) * BM + r] = val;
+                }
+            }
+        }
+        __syncthreads();
+
+        if (warp_active) {
+            float s_val = s_smem[(my_n * GQA + my_g) * BM + lane];
+
+            float m_row = s_val;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                m_row = fmaxf(m_row, __shfl_xor_sync(0xffffffff, m_row, off));
+            float m_new = fmaxf(m_w, m_row);
+            float correction = expf(m_w - m_new);
+            float p_lane = expf(s_val - m_new);
+            float sum_p = p_lane;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                sum_p += __shfl_xor_sync(0xffffffff, sum_p, off);
+
+            #pragma unroll
+            for (int i = 0; i < LANE_D; i++) acc_o[i] *= correction;
+            l_w = l_w * correction + sum_p;
+
+            #pragma unroll
+            for (int r = 0; r < BM; r++) {
+                float p_r = __shfl_sync(0xffffffff, p_lane, r);
+                const half2* vt = reinterpret_cast<const half2*>(
+                    v_tile + r * HD + lane * LANE_D);
+                #pragma unroll
+                for (int i = 0; i < LANE_D / 2; i++) {
+                    half2 vv = vt[i];
+                    float2 vf = __half22float2(vv);
+                    acc_o[i * 2]     += p_r * vf.x;
+                    acc_o[i * 2 + 1] += p_r * vf.y;
+                }
+            }
+            m_w = m_new;
+        }
+        __syncthreads();
+    }
+
+    if (warp_active) {
+        int q_head = kv_head * GQA + my_g;
+        float inv_l = (l_w > 0.0f) ? (1.0f / l_w) : 0.0f;
+        size_t out_base = (size_t)my_t * num_q * HD + (size_t)q_head * HD;
+        #pragma unroll
+        for (int i = 0; i < LANE_D; i++) {
+            int c = lane * LANE_D + i;
+            out_chunk[out_base + c] = __float2half(acc_o[i] * inv_l);
+        }
+    }
+}
+
 // BM-generic FA kernel. Each lane covers R_PER_LANE = BM/32 r values per softmax
 // row, so BM > 32 fits without lane==r assumption. BM=32 path (R_PER_LANE=1)
 // reduces to the same structure as flash_attn_chunk_fused above.
