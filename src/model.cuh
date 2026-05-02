@@ -2567,26 +2567,72 @@ struct QwenModel {
 
             if (can_flash) {
                 auto tf0 = pa_now();
-                constexpr int HD = 256, BM = 32, BLOCK = 256;
+                // FA_BM env: 32 (default, fits 48KB SMEM, lane==r in original
+                // kernel) or 64 (uses BM-generic kernel, halves K/V tile-load
+                // iterations on long contexts; needs 96KB dynamic SMEM opt-in).
+                static const int fa_bm = []{
+                    const char* e = getenv("FA_BM");
+                    int v = e ? atoi(e) : 32;
+                    return (v == 64) ? 64 : 32;
+                }();
+                constexpr int HD = 256, BLOCK = 256;
                 dim3 fg(num_kv, sub_n);
+                static bool fa_smem_set[16] = {false};
+                int cur_dev = 0; cudaGetDevice(&cur_dev);
+                auto ensure_smem = [&](const void* fn) {
+                    if (fa_bm == 64 && cur_dev >= 0 && cur_dev < 16
+                        && !fa_smem_set[cur_dev]) {
+                        cudaFuncSetAttribute(
+                            fn,
+                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                            96 * 1024);
+                        fa_smem_set[cur_dev] = true;
+                    }
+                };
                 if (num_q == 24) {
                     constexpr int GQA = 6;
-                    int smem_bytes = GQA * HD * sizeof(half)
-                                   + 2 * BM * HD * sizeof(half)
-                                   + GQA * BM * sizeof(float);
-                    flash_attn_chunk_fused<HD, GQA, BM, BLOCK>
-                        <<<fg, BLOCK, smem_bytes, stream>>>(
-                            q_post_sub, k_cache_ptr, v_cache_ptr, out_sub,
-                            num_q, num_kv, sub_start_pos, sub_n, scale);
+                    if (fa_bm == 64) {
+                        constexpr int BM = 64;
+                        int smem_bytes = GQA * HD * sizeof(half)
+                                       + 2 * BM * HD * sizeof(half)
+                                       + GQA * BM * sizeof(float);
+                        ensure_smem((const void*)flash_attn_chunk_fused_bm<HD, GQA, BM, BLOCK>);
+                        flash_attn_chunk_fused_bm<HD, GQA, BM, BLOCK>
+                            <<<fg, BLOCK, smem_bytes, stream>>>(
+                                q_post_sub, k_cache_ptr, v_cache_ptr, out_sub,
+                                num_q, num_kv, sub_start_pos, sub_n, scale);
+                    } else {
+                        constexpr int BM = 32;
+                        int smem_bytes = GQA * HD * sizeof(half)
+                                       + 2 * BM * HD * sizeof(half)
+                                       + GQA * BM * sizeof(float);
+                        flash_attn_chunk_fused<HD, GQA, BM, BLOCK>
+                            <<<fg, BLOCK, smem_bytes, stream>>>(
+                                q_post_sub, k_cache_ptr, v_cache_ptr, out_sub,
+                                num_q, num_kv, sub_start_pos, sub_n, scale);
+                    }
                 } else {  // num_q == 16, GQA = 4
                     constexpr int GQA = 4;
-                    int smem_bytes = GQA * HD * sizeof(half)
-                                   + 2 * BM * HD * sizeof(half)
-                                   + GQA * BM * sizeof(float);
-                    flash_attn_chunk_fused<HD, GQA, BM, BLOCK>
-                        <<<fg, BLOCK, smem_bytes, stream>>>(
-                            q_post_sub, k_cache_ptr, v_cache_ptr, out_sub,
-                            num_q, num_kv, sub_start_pos, sub_n, scale);
+                    if (fa_bm == 64) {
+                        constexpr int BM = 64;
+                        int smem_bytes = GQA * HD * sizeof(half)
+                                       + 2 * BM * HD * sizeof(half)
+                                       + GQA * BM * sizeof(float);
+                        ensure_smem((const void*)flash_attn_chunk_fused_bm<HD, GQA, BM, BLOCK>);
+                        flash_attn_chunk_fused_bm<HD, GQA, BM, BLOCK>
+                            <<<fg, BLOCK, smem_bytes, stream>>>(
+                                q_post_sub, k_cache_ptr, v_cache_ptr, out_sub,
+                                num_q, num_kv, sub_start_pos, sub_n, scale);
+                    } else {
+                        constexpr int BM = 32;
+                        int smem_bytes = GQA * HD * sizeof(half)
+                                       + 2 * BM * HD * sizeof(half)
+                                       + GQA * BM * sizeof(float);
+                        flash_attn_chunk_fused<HD, GQA, BM, BLOCK>
+                            <<<fg, BLOCK, smem_bytes, stream>>>(
+                                q_post_sub, k_cache_ptr, v_cache_ptr, out_sub,
+                                num_q, num_kv, sub_start_pos, sub_n, scale);
+                    }
                 }
                 if (g_profile_attn) g_attn_fused_ms += pa_sync_ms(tf0);
                 sub_processed += sub_n;

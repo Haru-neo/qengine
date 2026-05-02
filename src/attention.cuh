@@ -1413,3 +1413,174 @@ __global__ void flash_attn_chunk_fused(
         }
     }
 }
+
+// BM-generic FA kernel. Each lane covers R_PER_LANE = BM/32 r values per softmax
+// row, so BM > 32 fits without lane==r assumption. BM=32 path (R_PER_LANE=1)
+// reduces to the same structure as flash_attn_chunk_fused above.
+//
+// SMEM at HD=256, GQA=4, BM=64: q_s 2KB + k_tile 32KB + v_tile 32KB + s_smem 1KB
+// = 67KB (needs 96KB dynamic SMEM opt-in on Volta — caller responsibility).
+template<int HD, int GQA, int BM, int BLOCK>
+__global__ void flash_attn_chunk_fused_bm(
+    const half* __restrict__ q_chunk,
+    const half* __restrict__ k_cache,
+    const half* __restrict__ v_cache,
+    half*       __restrict__ out_chunk,
+    int num_q, int num_kv,
+    int start_pos, int sub_n, float scale
+) {
+    static_assert(BM % 32 == 0, "BM must be a multiple of 32");
+    constexpr int N_WARPS    = BLOCK / 32;
+    constexpr int LANE_D     = HD / 32;
+    constexpr int R_PER_LANE = BM / 32;
+    int kv_head = blockIdx.x;
+    int t_idx   = blockIdx.y;
+    if (t_idx >= sub_n) return;
+    int abs_pos    = start_pos + t_idx;
+    int active_end = abs_pos + 1;
+    int tid  = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+
+    extern __shared__ unsigned char smem_fa[];
+    half*  q_s    = (half*)smem_fa;
+    half*  k_tile = q_s    + GQA * HD;
+    half*  v_tile = k_tile + BM  * HD;
+    float* s_smem = (float*)(v_tile + BM * HD);
+
+    #pragma unroll
+    for (int i = tid; i < GQA * HD; i += BLOCK) {
+        int g = i / HD;
+        int c = i - g * HD;
+        int q_head = kv_head * GQA + g;
+        q_s[g * HD + c] = q_chunk[(size_t)t_idx * num_q * HD
+                                  + (size_t)q_head * HD + c];
+    }
+    __syncthreads();
+
+    float acc_o[LANE_D];
+    #pragma unroll
+    for (int i = 0; i < LANE_D; i++) acc_o[i] = 0.0f;
+    float m_w = -INFINITY;
+    float l_w = 0.0f;
+
+    for (int tile_start = 0; tile_start < active_end; tile_start += BM) {
+        int tile_end = min(tile_start + BM, active_end);
+        int tile_len = tile_end - tile_start;
+
+        #pragma unroll
+        for (int i = tid; i < BM * HD; i += BLOCK) {
+            int r = i / HD;
+            int c = i - r * HD;
+            half zero_h = __float2half(0.0f);
+            if (r < tile_len) {
+                size_t base = (size_t)(tile_start + r) * num_kv * HD
+                            + kv_head * HD;
+                k_tile[r * HD + c] = k_cache[base + c];
+                v_tile[r * HD + c] = v_cache[base + c];
+            } else {
+                k_tile[r * HD + c] = zero_h;
+                v_tile[r * HD + c] = zero_h;
+            }
+        }
+        __syncthreads();
+
+        // Score: warp-per-(g,r). NITERS = ceil(GQA*BM / N_WARPS).
+        constexpr int NITERS = (GQA * BM + N_WARPS - 1) / N_WARPS;
+        #pragma unroll
+        for (int k_it = 0; k_it < NITERS; k_it++) {
+            int flat = warp + k_it * N_WARPS;
+            if (flat >= GQA * BM) break;
+            int g = flat / BM;
+            int r = flat - g * BM;
+
+            float partial = 0.0f;
+            const half2* qs2 = reinterpret_cast<const half2*>(q_s    + g * HD);
+            const half2* kt2 = reinterpret_cast<const half2*>(k_tile + r * HD);
+            #pragma unroll
+            for (int i = 0; i < LANE_D / 2; i++) {
+                half2 qv = qs2[lane * (LANE_D / 2) + i];
+                half2 kv = kt2[lane * (LANE_D / 2) + i];
+                float2 qf = __half22float2(qv);
+                float2 kf = __half22float2(kv);
+                partial += qf.x * kf.x + qf.y * kf.y;
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                partial += __shfl_xor_sync(0xffffffff, partial, off);
+            if (lane == 0) {
+                float val = (r < tile_len) ? partial * scale : -INFINITY;
+                s_smem[g * BM + r] = val;
+            }
+        }
+        __syncthreads();
+
+        // Softmax + O update. Each warp owns one g; lane handles R_PER_LANE r's
+        // per softmax row (r = rp*32 + lane for rp in [0, R_PER_LANE)).
+        if (warp < GQA) {
+            int g = warp;
+            float s_vals[R_PER_LANE];
+            #pragma unroll
+            for (int rp = 0; rp < R_PER_LANE; rp++)
+                s_vals[rp] = s_smem[g * BM + rp * 32 + lane];
+
+            float m_row = s_vals[0];
+            #pragma unroll
+            for (int rp = 1; rp < R_PER_LANE; rp++)
+                m_row = fmaxf(m_row, s_vals[rp]);
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                m_row = fmaxf(m_row, __shfl_xor_sync(0xffffffff, m_row, off));
+            float m_new = fmaxf(m_w, m_row);
+            float correction = expf(m_w - m_new);
+
+            float p_vals[R_PER_LANE];
+            float sum_p = 0.0f;
+            #pragma unroll
+            for (int rp = 0; rp < R_PER_LANE; rp++) {
+                p_vals[rp] = expf(s_vals[rp] - m_new);
+                sum_p += p_vals[rp];
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                sum_p += __shfl_xor_sync(0xffffffff, sum_p, off);
+
+            #pragma unroll
+            for (int i = 0; i < LANE_D; i++) acc_o[i] *= correction;
+            l_w = l_w * correction + sum_p;
+
+            // O += sum_r P[r] * V[r, lane*LANE_D : lane*LANE_D + LANE_D]
+            #pragma unroll
+            for (int rp = 0; rp < R_PER_LANE; rp++) {
+                #pragma unroll
+                for (int r_in = 0; r_in < 32; r_in++) {
+                    float p_r = __shfl_sync(0xffffffff, p_vals[rp], r_in);
+                    int r = rp * 32 + r_in;
+                    const half2* vt = reinterpret_cast<const half2*>(
+                        v_tile + r * HD + lane * LANE_D);
+                    #pragma unroll
+                    for (int i = 0; i < LANE_D / 2; i++) {
+                        half2 vv = vt[i];
+                        float2 vf = __half22float2(vv);
+                        acc_o[i * 2]     += p_r * vf.x;
+                        acc_o[i * 2 + 1] += p_r * vf.y;
+                    }
+                }
+            }
+            m_w = m_new;
+        }
+        __syncthreads();
+    }
+
+    if (warp < GQA) {
+        int g = warp;
+        int q_head = kv_head * GQA + g;
+        float inv_l = (l_w > 0.0f) ? (1.0f / l_w) : 0.0f;
+        size_t out_base = (size_t)t_idx * num_q * HD + (size_t)q_head * HD;
+        #pragma unroll
+        for (int i = 0; i < LANE_D; i++) {
+            int c = lane * LANE_D + i;
+            out_chunk[out_base + c] = __float2half(acc_o[i] * inv_l);
+        }
+    }
+}
