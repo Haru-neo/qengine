@@ -3,9 +3,9 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![CUDA](https://img.shields.io/badge/CUDA-12.x-76B900?logo=nvidia)](https://developer.nvidia.com/cuda-toolkit)
 [![Volta sm_70](https://img.shields.io/badge/sm__70-Volta-green)](https://en.wikipedia.org/wiki/Volta_(microarchitecture))
-[![Prefill: optimizing](https://img.shields.io/badge/prefill-optimizing%20%F0%9F%9A%A7-orange)](#honest-benchmarks-vs-llamacpp)
+[![Prefill: 1.5–3× llama.cpp ≤4.6 K](https://img.shields.io/badge/prefill-1.5%E2%80%933%C3%97%20llama.cpp%20%E2%89%A44.6K-brightgreen)](#honest-benchmarks-vs-llamacpp)
 
-> 🚧 **Prefill is currently 2–4× slower than llama.cpp on the same hardware. Active optimization in progress — target: ≥1.5× llama.cpp prefill.** Generation already wins (+30–50%). See [Honest Benchmarks](#honest-benchmarks-vs-llamacpp).
+> **9B single-GPU prefill is now 1.5–3× llama.cpp at every length up to ~4.6 K tokens** (after the 2026-05-02 default flip — see commit `ca30368`). Long-context (≥18 K) prefill still trails on 9B (~0.83×) and on multi-GPU layouts where `llama.cpp`'s pipeline scales better. Generation continues to win by +30–50%. See [Honest Benchmarks](#honest-benchmarks-vs-llamacpp).
 
 A custom CUDA inference engine for **Qwen3 hybrid (GDN + Attention) models**, written from scratch and tuned for NVIDIA mining cards (CMP 100-210, ex-mining V100) — 16 GB HBM2, sm_70, PCIe Gen1 x1, no P2P. Not a fork — every kernel is written for these constraints.
 
@@ -45,27 +45,35 @@ It's not faster than llama.cpp at everything. See the honest benchmarks below.
 
 ## Honest benchmarks (vs `llama.cpp`)
 
-All measurements on the same 4× CMP 100-210 host, same `Q8_0` GGUF, batch 1, single inflight request, `-ngl 999`, FA on, layer split. Both engines built for sm_70 with the int8 (MMQ / DP4A) path. Numbers are **server-side** (excludes streaming SSE handshake). Bigger is better.
+All measurements on a CMP 100-210 host, same `Q8_0` GGUF (Qwopus3.5-9B-v3.5), batch 1, single inflight request, FA on, layer split. Both engines built for sm_70 with the int8 (MMQ / DP4A) path. qengine numbers are **server-side prefill wall** (excludes SSE handshake) for `bench_curl.sh`-style real chat-completion prompts; `llama.cpp` numbers are `llama-bench` at matching prompt sizes. Bigger is better; **bold** = winner. All measured 2026-05-02 against `llama.cpp` build `8462`.
 
 ### 9B Q8_0 — single GPU
 
 | Prompt | qengine PP t/s | llama.cpp PP t/s | qengine TG t/s | llama.cpp TG t/s |
 |---:|---:|---:|---:|---:|
-| 128 | 165 | **221** | 70.4 | 46.6 |
-| 512 | 161 | **265** | — | — |
-| 2048 | 161 | **356** | — | — |
-| 8192 | 134 | **352** | — | — |
-| 18 K | 75 | — | 27 | — |
+| 297 | **594** | 199 | 70.4 | — |
+| 1.16 K | **683** | 316 | — | — |
+| 4.62 K | **563** | 361 | — | — |
+| 18.4 K | 270 | **324** | 27.6 | — |
+| tg64 | — | — | — | 46.6 |
+
+`qengine`: 1.56–2.99× over `llama.cpp` on prompts up to ~4.6 K tokens; ~0.83× at 18 K. Generation +51% on the comparable short-context point (70.4 vs 46.6 t/s).
 
 ### 9B Q8_0 — dual GPU (layer split)
 
 | Prompt | qengine PP t/s | llama.cpp PP t/s | qengine TG t/s | llama.cpp TG t/s |
 |---:|---:|---:|---:|---:|
-| 128 | 165 | **209** | 62 | 44 |
-| 2048 | 157 | **501** | 58 | — |
-| 8192 | 132 | **579** | 47 | — |
+| 297 | **495** | 188 | 68.6 | — |
+| 1.16 K | **611** | 412 | — | — |
+| 4.62 K | 519 | **574** | — | — |
+| 18.4 K | 259 | **545** | 27.4 | — |
+| tg64 | — | — | — | 44.2 |
+
+Multi-GPU is `llama.cpp`'s strong suit — its layer pipeline overlaps activation transfer with compute and roughly doubles long-prompt throughput from single GPU. Our pinned-host bridge between GPUs is sequential, so multi-GPU doesn't speed prefill on the layouts we have. Open work item.
 
 ### 27B Q8_0 — 3 GPU (layer split)
+
+> ⚠️ Numbers below predate the 2026-05-02 default flip. Re-measurement pending; expect a proportional improvement (the same code paths flipped on 9B). Treat as a lower bound for the current build.
 
 | Prompt | qengine PP t/s | llama.cpp PP t/s | qengine TG t/s | llama.cpp TG t/s |
 |---:|---:|---:|---:|---:|
@@ -76,9 +84,10 @@ All measurements on the same 4× CMP 100-210 host, same `Q8_0` GGUF, batch 1, si
 
 ### What this says
 
-- **Prefill: llama.cpp wins, often by 2–4×.** Their MMQ path is the product of years of contribution and we are not catching up on prefill any time soon. If your workload is prefill-heavy (many long prompts, short responses, batch > 1), use llama.cpp.
-- **Generation (decode): qengine wins by ~30–50% on 9B and ~50% on 27B.** This is what users feel as "the model is responding fast" in chat / agent / coding workflows where the prompt is processed once and the response is streamed token-by-token.
-- **18 K prefill on 27B is brutal (~14 min on qengine).** Heavy room to improve — likely better Q8_0 GEMM tile, batched matmul pipelining.
+- **9B single-GPU prefill ≤ 4.6 K: qengine wins by 1.56–2.99×.** This is the chat-app sweet spot — short-to-medium prompts, real OpenAI-API requests.
+- **9B long-context prefill (≥ 18 K) and multi-GPU layouts: `llama.cpp` is still ahead.** Their MMQ + multi-GPU pipeline carries here. Open work for us.
+- **Generation throughput: qengine wins by ~30–50%** on 9B and (per pre-flip data) on 27B too. This is what users feel as the chat being responsive.
+- **27B is on the same code paths as 9B**, so the default flip should help proportionally — re-bench is pending.
 
 ## Things qengine does that llama.cpp doesn't (or differs)
 
@@ -181,10 +190,12 @@ curl http://localhost:8000/v1/chat/completions \
 | Var | Default | Effect |
 |---|---|---|
 | `MTP_TQ` | `0` | 3-bit KV cache (WHT + Lloyd-Max). Required for 27B at 256 K. |
-| `FLASH_ATTN` | auto | `1` forces FA, `0` disables. Auto-on if `max_seq > 32 K`. |
+| `FLASH_ATTN` | `1` | FA fused score+softmax+value. `0` falls back to the strict block-per-score path (bit-exact with per-token, ~2× slower prefill). |
+| `BIT_EXACT_GEMM_ON` | `0` | Use the strict column-wise GEMV reduction path instead of the GEMM tile (regression / bit-exact testing, ~2.4× slower prefill). |
+| `FA_BM` | `32` | FA tile width. `64` halves K/V tile-load iterations (96 KB SMEM opt-in). Marginal on the prompts we measured. |
+| `FA_NT` | `1` | Per-block t_idx count. `2` shares K/V tile across 2 query rows; currently 14% slower at long context (kept as infra). |
 | `QWEN_SLOTS` | `1` | Concurrent slots (continuous batching). Set via `--slots` too. |
 | `QWEN_MAX_QUEUE` | `64` | Max queued requests; `0` = unbounded. |
-| `BIT_EXACT_GEMM_ON` | `0` | Use bit-exact column-wise GEMV path (for regression tests; slower). |
 | `MTP_ACCEPT_TOP2` | `0` | MTP K=2 top-2 verify (small accept rate gain). |
 | `CUDA_VISIBLE_DEVICES` | — | Standard CUDA mask; engine splits layers across visible GPUs. |
 
@@ -222,7 +233,7 @@ Layer split (4-GPU 27B example): GPU 0 holds layers 0–15 + token embeddings; G
 - **sm_70 specific tuning.** Should run on sm_75; sm_80+ has better engines anyway.
 - **Single-host.** No tensor parallelism across machines, no multi-node.
 - **Linux only.**
-- **Prefill is 2–4× slower than llama.cpp.** Biggest known weakness. Active work targeting ≥1.5× llama.cpp prefill (= flipping the gap to a lead). Likely paths: better Q8_0 GEMM tile, batched matmul pipelining, multi-stage SMEM, fused QKV. PRs welcome.
+- **Long-context (≥ 18 K tokens) and multi-GPU prefill still trail `llama.cpp`** — ~0.83× on 9B 1× GPU @ 18 K, ~0.48× on 9B 2× GPU @ 18 K. Their MMQ path and especially their dual-GPU pipeline carry here. Likely paths to close the gap: K/V-sharing FA scoring (the `FA_NT=2` opt-in is a first stab — currently 14% slower at long context, kept as infra for a follow-up); fused QKV; pipelined activation transfer between GPUs to replace today's blocking pinned-host bridge. PRs welcome.
 - **Continuous batching with system-prompt-less requests can stop after 1 token** on Qwopus distill models — known issue with empty-system-prompt EOS bias under batched gen. Set `--default-system-prompt`.
 
 ## Status
