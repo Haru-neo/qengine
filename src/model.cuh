@@ -785,6 +785,17 @@ struct QwenModel {
     // dequant [0, kv_slot+1)). Subsequent calls only dequant the new range
     // [tq_decoded_until[L]+1, kv_slot+1). Reset to -1 on reset_all_states.
     std::vector<int> tq_decoded_until;
+    // Per-attn-layer fp16 KV cache that mirrors the TQ cache: TQ encode and
+    // a half-precision write happen in the same step, then per-token
+    // attention reads the fp16 layout directly (skips the cooperative TQ
+    // decode that profiling measured at 84% of fused FA cycles). Sized to
+    // `kv_total_seq * kv_dim` per attn layer = 1 GB at max_seq 262144 (per
+    // layer per GPU), so leave it opt-in via FA_FP16_CACHE=1 — only safe
+    // when max-seq is small enough to fit in HBM (≤ ~32 K with the 27 B
+    // weights resident).
+    struct FP16DecCache { half* k = nullptr; half* v = nullptr; };
+    std::unordered_map<int, FP16DecCache> fp16_dec_caches;
+    bool fp16_dec_cache_on = false;
 
     void init_kv_cache(int slot_max_seq_arg, int num_slots_arg = 1) {
         slot_max_seq = slot_max_seq_arg;
@@ -828,6 +839,28 @@ struct QwenModel {
             float fp16_mb  = (float)tq_kv_caches.size() * kv_size * 2 / 1e6;
             printf("KV cache (TurboQuant 3-bit): %d layers, slot_max_seq=%d × %d slots = %d total, %.1f MB (vs %.1f MB fp16, %.2fx compression)\n",
                 (int)tq_kv_caches.size(), slot_max_seq, num_slots, kv_total_seq, total_mb, fp16_mb, fp16_mb / total_mb);
+            // Optional fp16 mirror so attention can skip the per-token cooperative
+            // TQ decode. Only allocated when env asks for it; the caller is
+            // responsible for keeping max-seq small enough to fit.
+            fp16_dec_cache_on = (getenv("FA_FP16_CACHE") != nullptr);
+            if (fp16_dec_cache_on) {
+                size_t bytes_per_layer = (size_t)kv_total_seq * kv_dim * sizeof(half);
+                size_t total_alloc = 0;
+                for (int layer = 0; layer < cfg.num_layers; layer++) {
+                    if (!is_attn_layer(layer)) continue;
+                    int g = gpu->layer_gpu[layer];
+                    cudaSetDevice(g);
+                    FP16DecCache fc;
+                    cudaMalloc(&fc.k, bytes_per_layer);
+                    cudaMalloc(&fc.v, bytes_per_layer);
+                    cudaMemset(fc.k, 0, bytes_per_layer);
+                    cudaMemset(fc.v, 0, bytes_per_layer);
+                    fp16_dec_caches[layer] = fc;
+                    total_alloc += bytes_per_layer * 2;
+                }
+                printf("FA fp16 decode cache: %d attn layers, %.1f MB total (skips per-token TQ decode)\n",
+                    (int)fp16_dec_caches.size(), total_alloc / 1e6);
+            }
             return;
         }
 
@@ -860,6 +893,15 @@ struct QwenModel {
                 cudaMemset(kv.k, 0, sz);
                 cudaMemset(kv.v, 0, sz);
             }
+            if (fp16_dec_cache_on) {
+                size_t fc_sz = (size_t)kv_total_seq * kv_dim * sizeof(half);
+                for (auto& [layer, fc] : fp16_dec_caches) {
+                    int g = gpu->layer_gpu[layer];
+                    cudaSetDevice(g);
+                    cudaMemset(fc.k, 0, fc_sz);
+                    cudaMemset(fc.v, 0, fc_sz);
+                }
+            }
             return;
         }
         size_t kv_size = (size_t)kv_total_seq * kv_dim * sizeof(half);
@@ -885,6 +927,16 @@ struct QwenModel {
                 cudaSetDevice(g);
                 cudaMemset(kv.k + off, 0, per_slot);
                 cudaMemset(kv.v + off, 0, per_slot);
+            }
+            if (fp16_dec_cache_on) {
+                size_t fc_per_slot = (size_t)slot_max_seq * kv_dim * sizeof(half);
+                size_t fc_off      = (size_t)slot * slot_max_seq * kv_dim;
+                for (auto& [layer, fc] : fp16_dec_caches) {
+                    int g = gpu->layer_gpu[layer];
+                    cudaSetDevice(g);
+                    cudaMemset(fc.k + fc_off, 0, fc_per_slot);
+                    cudaMemset(fc.v + fc_off, 0, fc_per_slot);
+                }
             }
             return;
         }
@@ -1075,6 +1127,15 @@ struct QwenModel {
                 ab.k_proj, &tq.k[off], bpt);
             tq3_quantize_kernel<<<(bpt+31)/32, 32, 0, stream>>>(
                 ab.v_proj, &tq.v[off], bpt);
+            if (fp16_dec_cache_on) {
+                auto& fc = fp16_dec_caches[layer];
+                half* fp16_k_pos = fc.k + slot_kv_off + (size_t)kv_slot * kv_dim;
+                half* fp16_v_pos = fc.v + slot_kv_off + (size_t)kv_slot * kv_dim;
+                cudaMemcpyAsync(fp16_k_pos, ab.k_proj, kv_dim * sizeof(half),
+                                cudaMemcpyDeviceToDevice, stream);
+                cudaMemcpyAsync(fp16_v_pos, ab.v_proj, kv_dim * sizeof(half),
+                                cudaMemcpyDeviceToDevice, stream);
+            }
         } else {
             auto& kv = kv_caches[layer];
             half* k_cache_pos = kv.k + slot_kv_off + (size_t)kv_slot * kv_dim;
@@ -1122,9 +1183,12 @@ struct QwenModel {
             // At per-token gen the base FA grid is (num_kv=4, 1) = 4 blocks,
             // which leaves the 80-SM CMP cards almost entirely idle. Split-K
             // factors the K/V tile loop into K independent blocks per kv_head,
-            // merged with log-sum-exp. K=8 yields 32 blocks at gen — sweet
-            // spot. K=16 makes it slightly worse (more merge overhead +
-            // accept-rate drop on MTP from extra fp32 reduction noise).
+            // merged with log-sum-exp. Tested values:
+            //   K=4 : 16 blocks  (chunked-path default)  — TBM
+            //   K=8 : 32 blocks  (current sweet spot, +17 % at 18 K vs none)
+            //   K=16: 64 blocks  (slower: more merge + MTP accept-rate drop
+            //                     from extra fp32 reduction noise)
+            // PREFILL_K_SPLITS_PT=N override (4 / 8 / 16).
             //
             // TQ path uses the cooperative-decode variant
             // `flash_attn_chunk_fused_split_tq3`: each warp decodes one
@@ -1153,7 +1217,7 @@ struct QwenModel {
             // the chunked-prefill fp16-directly path the model attended over
             // during prefill, so the draft head's predictions stop matching
             // as well). Cooperative wins overall.
-            if (use_turboquant) {
+            if (use_turboquant && !fp16_dec_cache_on) {
                 auto& tq = tq_kv_caches[layer];
                 int slot_off_blocks_int = slot * slot_max_seq * tq.blocks_per_token;
                 block_tq3* tq_k_slot = tq.k + slot_off_blocks_int;
@@ -1188,9 +1252,20 @@ struct QwenModel {
                             q_buf, num_q, /*sub_n=*/1, ATTN_NB);
                 }
             } else {
-                auto& kv = kv_caches[layer];
-                half* k_src = kv.k + slot_kv_off;
-                half* v_src = kv.v + slot_kv_off;
+                // fp16 cache path: use either the legacy kv_caches (use_turboquant=false)
+                // or the fp16 decode mirror (use_turboquant && fp16_dec_cache_on),
+                // both populated up to kv_slot in the KV-write step above.
+                half* k_src;
+                half* v_src;
+                if (use_turboquant) {
+                    auto& fc = fp16_dec_caches[layer];
+                    k_src = fc.k + slot_kv_off;
+                    v_src = fc.v + slot_kv_off;
+                } else {
+                    auto& kv = kv_caches[layer];
+                    k_src = kv.k + slot_kv_off;
+                    v_src = kv.v + slot_kv_off;
+                }
                 if (num_q == 24) {
                     constexpr int GQA = 6;
                     dim3 fg(num_kv, 1, K_SPLITS_PT);
@@ -2711,6 +2786,15 @@ struct QwenModel {
                 cudaMemcpyAsync(tq_v_buf[g] + slot_kv_off + (size_t)start_pos * kv_dim,
                                 ab.attn_chunk_v, new_bytes,
                                 cudaMemcpyDeviceToDevice, stream);
+                if (fp16_dec_cache_on) {
+                    auto& fc = fp16_dec_caches[layer];
+                    cudaMemcpyAsync(fc.k + slot_kv_off + (size_t)start_pos * kv_dim,
+                                    ab.attn_chunk_k, new_bytes,
+                                    cudaMemcpyDeviceToDevice, stream);
+                    cudaMemcpyAsync(fc.v + slot_kv_off + (size_t)start_pos * kv_dim,
+                                    ab.attn_chunk_v, new_bytes,
+                                    cudaMemcpyDeviceToDevice, stream);
+                }
             } else {
                 half* k_dst = k_cache_ptr + (size_t)start_pos * kv_dim;
                 half* v_dst = v_cache_ptr + (size_t)start_pos * kv_dim;
@@ -3339,6 +3423,15 @@ struct QwenModel {
                 size_t off = slot_blk_off + (size_t)pos * bpt;
                 tq3_quantize_kernel<<<(bpt+31)/32, 32, 0, stream>>>(ab.k_proj, &tq.k[off], bpt);
                 tq3_quantize_kernel<<<(bpt+31)/32, 32, 0, stream>>>(ab.v_proj, &tq.v[off], bpt);
+                if (fp16_dec_cache_on) {
+                    auto& fc = fp16_dec_caches[layer];
+                    half* fp16_k_pos = fc.k + slot_kv_off + (size_t)pos * kv_dim;
+                    half* fp16_v_pos = fc.v + slot_kv_off + (size_t)pos * kv_dim;
+                    cudaMemcpyAsync(fp16_k_pos, ab.k_proj, kv_dim * sizeof(half),
+                                    cudaMemcpyDeviceToDevice, stream);
+                    cudaMemcpyAsync(fp16_v_pos, ab.v_proj, kv_dim * sizeof(half),
+                                    cudaMemcpyDeviceToDevice, stream);
+                }
             } else {
                 auto& kv = kv_caches[layer];
                 half* k_cache_pos = kv.k + slot_kv_off + (size_t)pos * kv_dim;
@@ -3349,7 +3442,19 @@ struct QwenModel {
             int seq_len = pos + 1;
             dim3 score_grid(num_q, seq_len);
             static const bool tq_fused = getenv("TQ_FUSED") != nullptr;
-            if (use_turboquant) {
+            // Pick fp16 source: legacy fp16 KV, or TQ fp16 mirror, or TQ scratch.
+            half* k_src_fp16 = nullptr;
+            half* v_src_fp16 = nullptr;
+            if (!use_turboquant) {
+                auto& kv = kv_caches[layer];
+                k_src_fp16 = kv.k + slot_kv_off;
+                v_src_fp16 = kv.v + slot_kv_off;
+            } else if (fp16_dec_cache_on) {
+                auto& fc = fp16_dec_caches[layer];
+                k_src_fp16 = fc.k + slot_kv_off;
+                v_src_fp16 = fc.v + slot_kv_off;
+            }
+            if (use_turboquant && !fp16_dec_cache_on) {
                 auto& tq = tq_kv_caches[layer];
                 int slot_off_blocks_int = slot * slot_max_seq * tq.blocks_per_token;
                 block_tq3* tq_k_slot = tq.k + slot_off_blocks_int;
@@ -3367,14 +3472,13 @@ struct QwenModel {
                         q_buf, tq_k_buf[g], ab.attn_scores, num_q, num_kv, hd, seq_len, scale);
                 }
             } else {
-                auto& kv = kv_caches[layer];
                 attn_score_kernel_h<<<score_grid, min(hd, 256), 0, stream>>>(
-                    q_buf, kv.k + slot_kv_off, ab.attn_scores, num_q, num_kv, hd, seq_len, scale);
+                    q_buf, k_src_fp16, ab.attn_scores, num_q, num_kv, hd, seq_len, scale);
             }
             { int st = 1; while(st < seq_len && st < 256) st <<= 1;
             softmax_kernel<<<num_q, st, st * sizeof(float), stream>>>(
                 ab.attn_scores, num_q, seq_len); }
-            if (use_turboquant) {
+            if (use_turboquant && !fp16_dec_cache_on) {
                 auto& tq = tq_kv_caches[layer];
                 int slot_off_blocks_int = slot * slot_max_seq * tq.blocks_per_token;
                 block_tq3* tq_v_slot = tq.v + slot_off_blocks_int;
@@ -3393,9 +3497,8 @@ struct QwenModel {
                         ab.attn_scores, tq_v_buf[g], q_buf, num_q, num_kv, hd, seq_len);
                 }
             } else {
-                auto& kv = kv_caches[layer];
                 attn_value_kernel_h<<<num_q, min(hd, 256), 0, stream>>>(
-                    ab.attn_scores, kv.v + slot_kv_off, q_buf, num_q, num_kv, hd, seq_len);
+                    ab.attn_scores, v_src_fp16, q_buf, num_q, num_kv, hd, seq_len);
             }
             apply_gate_sigmoid<<<(total_qg+255)/256, 256, 0, stream>>>(
                 q_buf, gate_buf, total_qg);
@@ -3624,6 +3727,15 @@ struct QwenModel {
                 size_t off = slot_blk_off + (size_t)pos * bpt;
                 tq3_quantize_kernel<<<(bpt+31)/32, 32, 0, stream>>>(ab.k_proj, &tq.k[off], bpt);
                 tq3_quantize_kernel<<<(bpt+31)/32, 32, 0, stream>>>(ab.v_proj, &tq.v[off], bpt);
+                if (fp16_dec_cache_on) {
+                    auto& fc = fp16_dec_caches[layer];
+                    half* fp16_k_pos = fc.k + slot_kv_off + (size_t)pos * kv_dim;
+                    half* fp16_v_pos = fc.v + slot_kv_off + (size_t)pos * kv_dim;
+                    cudaMemcpyAsync(fp16_k_pos, ab.k_proj, kv_dim * sizeof(half),
+                                    cudaMemcpyDeviceToDevice, stream);
+                    cudaMemcpyAsync(fp16_v_pos, ab.v_proj, kv_dim * sizeof(half),
+                                    cudaMemcpyDeviceToDevice, stream);
+                }
             } else {
                 auto& kv = kv_caches[layer];
                 half* k_cache_pos = kv.k + slot_kv_off + (size_t)pos * kv_dim;
@@ -3634,7 +3746,18 @@ struct QwenModel {
             int seq_len = pos + 1;
             dim3 score_grid(num_q, seq_len);
             static const bool tq_fused = getenv("TQ_FUSED") != nullptr;
-            if (use_turboquant) {
+            half* k_src_fp16 = nullptr;
+            half* v_src_fp16 = nullptr;
+            if (!use_turboquant) {
+                auto& kv = kv_caches[layer];
+                k_src_fp16 = kv.k + slot_kv_off;
+                v_src_fp16 = kv.v + slot_kv_off;
+            } else if (fp16_dec_cache_on) {
+                auto& fc = fp16_dec_caches[layer];
+                k_src_fp16 = fc.k + slot_kv_off;
+                v_src_fp16 = fc.v + slot_kv_off;
+            }
+            if (use_turboquant && !fp16_dec_cache_on) {
                 auto& tq = tq_kv_caches[layer];
                 int slot_off_blocks_int = slot * slot_max_seq * tq.blocks_per_token;
                 block_tq3* tq_k_slot = tq.k + slot_off_blocks_int;
@@ -3652,14 +3775,13 @@ struct QwenModel {
                         q_buf, tq_k_buf[g], ab.attn_scores, num_q, num_kv, hd, seq_len, scale);
                 }
             } else {
-                auto& kv = kv_caches[layer];
                 attn_score_kernel_h<<<score_grid, min(hd, 256), 0, stream>>>(
-                    q_buf, kv.k + slot_kv_off, ab.attn_scores, num_q, num_kv, hd, seq_len, scale);
+                    q_buf, k_src_fp16, ab.attn_scores, num_q, num_kv, hd, seq_len, scale);
             }
             { int st = 1; while(st < seq_len && st < 256) st <<= 1;
               softmax_kernel<<<num_q, st, st * sizeof(float), stream>>>(
                   ab.attn_scores, num_q, seq_len); }
-            if (use_turboquant) {
+            if (use_turboquant && !fp16_dec_cache_on) {
                 auto& tq = tq_kv_caches[layer];
                 int slot_off_blocks_int = slot * slot_max_seq * tq.blocks_per_token;
                 block_tq3* tq_v_slot = tq.v + slot_off_blocks_int;
@@ -3678,9 +3800,8 @@ struct QwenModel {
                         ab.attn_scores, tq_v_buf[g], q_buf, num_q, num_kv, hd, seq_len);
                 }
             } else {
-                auto& kv = kv_caches[layer];
                 attn_value_kernel_h<<<num_q, min(hd, 256), 0, stream>>>(
-                    ab.attn_scores, kv.v + slot_kv_off, q_buf, num_q, num_kv, hd, seq_len);
+                    ab.attn_scores, v_src_fp16, q_buf, num_q, num_kv, hd, seq_len);
             }
             apply_gate_sigmoid<<<(total_qg+255)/256, 256, 0, stream>>>(
                 q_buf, gate_buf, total_qg);
