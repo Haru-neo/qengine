@@ -675,6 +675,12 @@ struct QwenModel {
         float* attn_chunk_scores = nullptr;  // [CHUNK_SIZE * num_q * max_seq] softmax scratch
         half*  attn_chunk_out    = nullptr;  // [CHUNK_SIZE * num_q * head_dim] V-weighted output
         half*  attn_chunk_oproj  = nullptr;  // [CHUNK_SIZE * H] o_proj output staging
+        // Split-K FA scratch (lazy-alloc when FA_SK env opts in, sized for
+        // K_SPLITS_MAX=8). Layouts: [num_q, ATTN_NB, K_SPLITS_MAX] for m/l,
+        // [num_q, ATTN_NB, K_SPLITS_MAX, HD] for o.
+        float* attn_split_m = nullptr;
+        float* attn_split_l = nullptr;
+        half*  attn_split_o = nullptr;
     };
     AttnBuffers attn_bufs[4];
     AttnBuffers attn_bufs2[4];  // second-token attn buffers, for forward_attn_n2
@@ -2060,6 +2066,10 @@ struct QwenModel {
             cudaMalloc(&ab.attn_chunk_scores,   (size_t)CHUNK_SIZE * num_q * kv_max_seq * sizeof(float));
             cudaMalloc(&ab.attn_chunk_out,      (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
             cudaMalloc(&ab.attn_chunk_oproj,    (size_t)CHUNK_SIZE * H         * sizeof(half));
+            constexpr int K_SPLITS_MAX = 8;
+            cudaMalloc(&ab.attn_split_m, (size_t)num_q * ATTN_NB * K_SPLITS_MAX * sizeof(float));
+            cudaMalloc(&ab.attn_split_l, (size_t)num_q * ATTN_NB * K_SPLITS_MAX * sizeof(float));
+            cudaMalloc(&ab.attn_split_o, (size_t)num_q * ATTN_NB * K_SPLITS_MAX * hd * sizeof(half));
         }
 
         // 1. Batched RMSNorm
@@ -2365,6 +2375,10 @@ struct QwenModel {
             cudaMalloc(&ab.attn_chunk_scores,   (size_t)CHUNK_SIZE * num_q * kv_max_seq * sizeof(float));
             cudaMalloc(&ab.attn_chunk_out,      (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
             cudaMalloc(&ab.attn_chunk_oproj,    (size_t)CHUNK_SIZE * H         * sizeof(half));
+            constexpr int K_SPLITS_MAX = 8;
+            cudaMalloc(&ab.attn_split_m, (size_t)num_q * ATTN_NB * K_SPLITS_MAX * sizeof(float));
+            cudaMalloc(&ab.attn_split_l, (size_t)num_q * ATTN_NB * K_SPLITS_MAX * sizeof(float));
+            cudaMalloc(&ab.attn_split_o, (size_t)num_q * ATTN_NB * K_SPLITS_MAX * hd * sizeof(half));
         }
 
         // ATTN_DUMP_LAYER + ATTN_DUMP_POS dump for an arbitrary token in
@@ -2581,6 +2595,20 @@ struct QwenModel {
                     int v = e ? atoi(e) : 1;
                     return (v == 2) ? 2 : 1;
                 }();
+                // FA_SK: 0 (default) | 2 | 4 | 8 — split-K, opt-in. Each
+                // (kv_head,t_idx) maps to FA_SK blocks; partials merged via
+                // log-sum-exp. Helps long contexts (SM under-utilisation: the
+                // 64-block grid ≪ 204 SMs). Gated to sub_seq_total>=4096 below.
+                // Speedup: 9B 1GPU 18K 1.46x, 27B 3GPU 18K 1.34x (llama parity).
+                // OFF by default: merge order changes fp16 accumulation, ~31st
+                // gen token diverges at 4.6K prefill. Korean quality regressions
+                // (project_qwopus_lang_bias) are sensitive to such drift.
+                static const int fa_sk = []{
+                    const char* e = getenv("FA_SK");
+                    if (!e) return 0;
+                    int v = atoi(e);
+                    return (v == 2 || v == 4 || v == 8) ? v : 0;
+                }();
                 constexpr int HD = 256, BLOCK = 256;
                 static bool fa_smem_set[16] = {false};
                 int cur_dev = 0; cudaGetDevice(&cur_dev);
@@ -2594,6 +2622,44 @@ struct QwenModel {
                         fa_smem_set[cur_dev] = true;
                     }
                 };
+                // Split-K shortcut. Skipped for short contexts where the base
+                // grid (num_kv*sub_n) already fills SMs and the merge overhead
+                // would dominate.
+                if (fa_sk > 0 && sub_seq_total >= 4096) {
+                    constexpr int BM = 32;
+                    int active_end_max = sub_start_pos + sub_n;
+                    int smem_bytes = (num_q == 24 ? 6 : 4) * HD * sizeof(half)
+                                   + 2 * BM * HD * sizeof(half)
+                                   + (num_q == 24 ? 6 : 4) * BM * sizeof(float);
+                    dim3 fg(num_kv, sub_n, fa_sk);
+                    auto launch_split = [&](auto gqa_const, auto k_const) {
+                        constexpr int GQA = decltype(gqa_const)::value;
+                        constexpr int K   = decltype(k_const)::value;
+                        flash_attn_chunk_fused_split<HD, GQA, BM, BLOCK, K>
+                            <<<fg, BLOCK, smem_bytes, stream>>>(
+                                q_post_sub, k_cache_ptr, v_cache_ptr,
+                                ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
+                                num_q, num_kv, sub_start_pos, sub_n, ATTN_NB,
+                                active_end_max, scale);
+                        dim3 mg(num_kv, sub_n);
+                        flash_attn_split_merge<HD, GQA, BLOCK, K>
+                            <<<mg, BLOCK, 0, stream>>>(
+                                ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
+                                out_sub, num_q, sub_n, ATTN_NB);
+                    };
+                    if (num_q == 24) {
+                        if      (fa_sk == 2) launch_split(std::integral_constant<int,6>{}, std::integral_constant<int,2>{});
+                        else if (fa_sk == 4) launch_split(std::integral_constant<int,6>{}, std::integral_constant<int,4>{});
+                        else                 launch_split(std::integral_constant<int,6>{}, std::integral_constant<int,8>{});
+                    } else {
+                        if      (fa_sk == 2) launch_split(std::integral_constant<int,4>{}, std::integral_constant<int,2>{});
+                        else if (fa_sk == 4) launch_split(std::integral_constant<int,4>{}, std::integral_constant<int,4>{});
+                        else                 launch_split(std::integral_constant<int,4>{}, std::integral_constant<int,8>{});
+                    }
+                    if (g_profile_attn) g_attn_fused_ms += pa_sync_ms(tf0);
+                    sub_processed += sub_n;
+                    continue;
+                }
                 if (num_q == 24) {
                     constexpr int GQA = 6;
                     if (fa_nt == 2) {

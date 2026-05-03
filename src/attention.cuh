@@ -1414,6 +1414,248 @@ __global__ void flash_attn_chunk_fused(
     }
 }
 
+// ============ Split-K FA: parallelize the K/V tile loop across blocks ============
+// At long context the base flash_attn_chunk_fused has only num_kv*sub_n = 64
+// blocks (≪ 3·68 = 204 SMs across 3 GPUs) and each block runs a sequential
+// loop of ⌈active_end/BM⌉ tile iterations. Split-K factors that loop into
+// K_SPLITS independent blocks per (kv_head, t_idx), each handling a contiguous
+// tile range. Each block emits an unnormalised (m, l, acc_o) triplet; a tiny
+// merge kernel combines them with the standard log-sum-exp identity:
+//
+//   m_global = max_s m_s
+//   l_global = Σ_s exp(m_s − m_global) · l_s
+//   o_global = Σ_s exp(m_s − m_global) · acc_o_s   (then divide by l_global)
+//
+// Splits whose range lies past a token's causal end produce m=-inf,l=0,o=0 and
+// drop out cleanly via the exp(-inf - m_global) = 0 identity, so we don't need
+// per-(t_idx,split) skip logic at the launcher.
+//
+// SMEM identical to flash_attn_chunk_fused (same Q/K/V/score scratch).
+//
+// part_m, part_l: [num_q, sub_n_max, K_SPLITS]   float  (lane==0 writes)
+// part_o:         [num_q, sub_n_max, K_SPLITS, HD]   half
+template<int HD, int GQA, int BM, int BLOCK, int K_SPLITS>
+__global__ void flash_attn_chunk_fused_split(
+    const half* __restrict__ q_chunk,
+    const half* __restrict__ k_cache,
+    const half* __restrict__ v_cache,
+    float*      __restrict__ part_m,
+    float*      __restrict__ part_l,
+    half*       __restrict__ part_o,
+    int num_q, int num_kv,
+    int start_pos, int sub_n, int sub_n_max,
+    int active_end_max, float scale
+) {
+    constexpr int N_WARPS = BLOCK / 32;
+    constexpr int LANE_D  = HD / 32;
+    int kv_head    = blockIdx.x;
+    int t_idx      = blockIdx.y;
+    int split_idx  = blockIdx.z;
+    if (t_idx >= sub_n) return;
+    int abs_pos       = start_pos + t_idx;
+    int active_end_t  = abs_pos + 1;
+    int tid  = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+
+    int total_tiles     = (active_end_max + BM - 1) / BM;
+    int tiles_per_split = (total_tiles + K_SPLITS - 1) / K_SPLITS;
+    int tile_lo         = split_idx * tiles_per_split * BM;
+    int tile_hi         = min((split_idx + 1) * tiles_per_split * BM, active_end_t);
+
+    extern __shared__ unsigned char smem_fa_split[];
+    half*  q_s    = (half*)smem_fa_split;
+    half*  k_tile = q_s    + GQA * HD;
+    half*  v_tile = k_tile + BM  * HD;
+    float* s_smem = (float*)(v_tile + BM * HD);
+
+    #pragma unroll
+    for (int i = tid; i < GQA * HD; i += BLOCK) {
+        int g = i / HD;
+        int c = i - g * HD;
+        int q_head = kv_head * GQA + g;
+        q_s[g * HD + c] = q_chunk[(size_t)t_idx * num_q * HD
+                                  + (size_t)q_head * HD + c];
+    }
+    __syncthreads();
+
+    float acc_o[LANE_D];
+    #pragma unroll
+    for (int i = 0; i < LANE_D; i++) acc_o[i] = 0.0f;
+    float m_w = -INFINITY;
+    float l_w = 0.0f;
+
+    if (tile_lo < tile_hi) {
+        for (int tile_start = tile_lo; tile_start < tile_hi; tile_start += BM) {
+            int tile_end = min(tile_start + BM, tile_hi);
+            int tile_len = tile_end - tile_start;
+
+            #pragma unroll
+            for (int i = tid; i < BM * HD; i += BLOCK) {
+                int r = i / HD;
+                int c = i - r * HD;
+                half zero_h = __float2half(0.0f);
+                if (r < tile_len) {
+                    size_t base = (size_t)(tile_start + r) * num_kv * HD
+                                + kv_head * HD;
+                    k_tile[r * HD + c] = k_cache[base + c];
+                    v_tile[r * HD + c] = v_cache[base + c];
+                } else {
+                    k_tile[r * HD + c] = zero_h;
+                    v_tile[r * HD + c] = zero_h;
+                }
+            }
+            __syncthreads();
+
+            constexpr int NITERS = (GQA * BM + N_WARPS - 1) / N_WARPS;
+            #pragma unroll
+            for (int k_it = 0; k_it < NITERS; k_it++) {
+                int flat = warp + k_it * N_WARPS;
+                if (flat >= GQA * BM) break;
+                int g = flat / BM;
+                int r = flat - g * BM;
+
+                float partial = 0.0f;
+                const half2* qs2 = reinterpret_cast<const half2*>(q_s    + g * HD);
+                const half2* kt2 = reinterpret_cast<const half2*>(k_tile + r * HD);
+                #pragma unroll
+                for (int i = 0; i < LANE_D / 2; i++) {
+                    half2 qv = qs2[lane * (LANE_D / 2) + i];
+                    half2 kv = kt2[lane * (LANE_D / 2) + i];
+                    float2 qf = __half22float2(qv);
+                    float2 kf = __half22float2(kv);
+                    partial += qf.x * kf.x + qf.y * kf.y;
+                }
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    partial += __shfl_xor_sync(0xffffffff, partial, off);
+                if (lane == 0) {
+                    float val = (r < tile_len) ? partial * scale : -INFINITY;
+                    s_smem[g * BM + r] = val;
+                }
+            }
+            __syncthreads();
+
+            if (warp < GQA) {
+                int g = warp;
+                float s_val = s_smem[g * BM + lane];
+
+                float m_row = s_val;
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    m_row = fmaxf(m_row, __shfl_xor_sync(0xffffffff, m_row, off));
+                float m_new = fmaxf(m_w, m_row);
+                float correction = expf(m_w - m_new);
+                float p_lane    = expf(s_val - m_new);
+                float sum_p = p_lane;
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    sum_p += __shfl_xor_sync(0xffffffff, sum_p, off);
+
+                #pragma unroll
+                for (int i = 0; i < LANE_D; i++) acc_o[i] *= correction;
+                l_w = l_w * correction + sum_p;
+
+                #pragma unroll
+                for (int r = 0; r < BM; r++) {
+                    float p_r = __shfl_sync(0xffffffff, p_lane, r);
+                    const half2* vt = reinterpret_cast<const half2*>(
+                        v_tile + r * HD + lane * LANE_D);
+                    #pragma unroll
+                    for (int i = 0; i < LANE_D / 2; i++) {
+                        half2 vv = vt[i];
+                        float2 vf = __half22float2(vv);
+                        acc_o[i * 2]     += p_r * vf.x;
+                        acc_o[i * 2 + 1] += p_r * vf.y;
+                    }
+                }
+                m_w = m_new;
+            }
+            __syncthreads();
+        }
+    }
+
+    if (warp < GQA) {
+        int g = warp;
+        int q_head = kv_head * GQA + g;
+        size_t ml_idx = ((size_t)q_head * sub_n_max + t_idx) * K_SPLITS + split_idx;
+        if (lane == 0) {
+            part_m[ml_idx] = m_w;
+            part_l[ml_idx] = l_w;
+        }
+        size_t o_base = (((size_t)q_head * sub_n_max + t_idx) * K_SPLITS + split_idx) * HD;
+        #pragma unroll
+        for (int i = 0; i < LANE_D; i++) {
+            int c = lane * LANE_D + i;
+            part_o[o_base + c] = __float2half(acc_o[i]);
+        }
+    }
+}
+
+// Merge K_SPLITS partials into final O. One warp per (kv_head, q_head_within_kv,
+// t_idx) — block has GQA warps. Each lane reads its LANE_D slice of each split's
+// part_o, applies the exp(m_s - m_global) weight, and writes the renormalised
+// fp16 output to out_chunk[t_idx, q_head, :].
+template<int HD, int GQA, int BLOCK, int K_SPLITS>
+__global__ void flash_attn_split_merge(
+    const float* __restrict__ part_m,
+    const float* __restrict__ part_l,
+    const half*  __restrict__ part_o,
+    half*        __restrict__ out_chunk,
+    int num_q, int sub_n, int sub_n_max
+) {
+    int kv_head = blockIdx.x;
+    int t_idx   = blockIdx.y;
+    if (t_idx >= sub_n) return;
+    int tid  = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    constexpr int LANE_D = HD / 32;
+    if (warp >= GQA) return;
+    int g = warp;
+    int q_head = kv_head * GQA + g;
+
+    float m_global = -INFINITY;
+    #pragma unroll
+    for (int s = 0; s < K_SPLITS; s++) {
+        size_t ml_idx = ((size_t)q_head * sub_n_max + t_idx) * K_SPLITS + s;
+        m_global = fmaxf(m_global, part_m[ml_idx]);
+    }
+
+    float l_global = 0.0f;
+    float o_acc[LANE_D];
+    #pragma unroll
+    for (int i = 0; i < LANE_D; i++) o_acc[i] = 0.0f;
+
+    #pragma unroll
+    for (int s = 0; s < K_SPLITS; s++) {
+        size_t ml_idx = ((size_t)q_head * sub_n_max + t_idx) * K_SPLITS + s;
+        float ms = part_m[ml_idx];
+        float ls = part_l[ml_idx];
+        if (!isfinite(ms) || ls <= 0.0f) continue;
+        float w = expf(ms - m_global);
+        l_global += w * ls;
+        size_t o_base = (((size_t)q_head * sub_n_max + t_idx) * K_SPLITS + s) * HD;
+        const half2* o2 = reinterpret_cast<const half2*>(
+            part_o + o_base + lane * LANE_D);
+        #pragma unroll
+        for (int i = 0; i < LANE_D / 2; i++) {
+            half2 ov = o2[i];
+            float2 of = __half22float2(ov);
+            o_acc[i * 2]     += w * of.x;
+            o_acc[i * 2 + 1] += w * of.y;
+        }
+    }
+
+    float inv_l = (l_global > 0.0f) ? (1.0f / l_global) : 0.0f;
+    size_t out_base = (size_t)t_idx * num_q * HD + (size_t)q_head * HD;
+    #pragma unroll
+    for (int i = 0; i < LANE_D; i++) {
+        int c = lane * LANE_D + i;
+        out_chunk[out_base + c] = __float2half(o_acc[i] * inv_l);
+    }
+}
+
 // K/V-sharing FA kernel. One block processes N_T consecutive t_idx values for
 // the same kv_head, so the K/V tile is loaded ONCE per tile_start and reused
 // for all N_T softmax/O accumulators. Halves (N_T=2) or quarters (N_T=4) the
