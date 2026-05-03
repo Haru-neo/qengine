@@ -5,7 +5,7 @@
 [![Volta sm_70](https://img.shields.io/badge/sm__70-Volta-green)](https://en.wikipedia.org/wiki/Volta_(microarchitecture))
 [![Prefill: 1.2–3× llama.cpp](https://img.shields.io/badge/prefill-1.2%E2%80%933%C3%97%20llama.cpp-brightgreen)](#honest-benchmarks-vs-llamacpp)
 
-> **9B single-GPU prefill is 1.5–3× llama.cpp at every length up to ~4.6 K tokens** (2026-05-02 default flip, commit `ca30368`). With **split-K FlashAttention** on by default (commit `f2e52b8`), 9B 18 K prefill jumps to **1.22× llama.cpp** and 27B 3-GPU 18 K reaches **parity (0.99×)**. Generation continues to win by +30–50%. Multi-GPU prefill at long context still trails on 9B 2-GPU (open work). See [Honest Benchmarks](#honest-benchmarks-vs-llamacpp).
+> **9B single-GPU prefill is 1.5–3× llama.cpp at every length up to ~4.6 K tokens** (2026-05-02 default flip, commit `ca30368`). With **split-K FlashAttention** on by default (commit `f2e52b8`), 9B 18 K prefill jumps to **1.22× llama.cpp** and 27B 3-GPU 18 K reaches **parity (0.99×)**. Generation continues to win by +30–50%. **Multi-GPU prefill is now pipelined** (per-GPU compute / D2H / H2D streams + double-buffered hidden chunks): 9B dual-GPU 18 K hits **1.32× llama.cpp** and 27B 3-GPU 18 K hits **1.45×** — the long-context multi-GPU gap is closed. See [Honest Benchmarks](#honest-benchmarks-vs-llamacpp).
 
 A custom CUDA inference engine for **Qwen3.5 / Qwen3.6 hybrid (GDN + Attention) models**, written from scratch and tuned for NVIDIA mining cards (CMP 100-210, ex-mining V100) — 16 GB HBM2, sm_70, PCIe Gen1 x1, no P2P. Not a fork — every kernel is written for these constraints.
 
@@ -59,35 +59,35 @@ All measurements on a CMP 100-210 host, same `Q8_0` GGUFs (Qwopus3.5-9B-v3.5, Qw
 
 `qengine`: 1.56–2.99× on prompts up to ~4.6 K, **1.22×** at 18 K (split-K FA, 1.46× over the pre-split-K build). Generation +51% on the comparable short-context point (70.4 vs 46.6 t/s).
 
-### 9B Q8_0 — dual GPU (layer split)
+### 9B Q8_0 — dual GPU (layer split, prefill pipelining on)
 
 | Prompt | qengine PP t/s | llama.cpp PP t/s | qengine TG t/s | llama.cpp TG t/s |
 |---:|---:|---:|---:|---:|
-| 297 | **495** | 188 | 68.6 | — |
-| 1.16 K | **611** | 412 | — | — |
-| 4.62 K | 519 | **574** | — | — |
-| 18.4 K | 259 | **545** | 27.4 | — |
+| 297 | **594** | 188 | 68.5 | — |
+| 1.16 K | **968** | 412 | — | — |
+| 4.62 K | **982** | 574 | — | — |
+| 18.4 K | **720** | 545 | 27.0 | — |
 | tg64 | — | — | — | 44.2 |
 
-Multi-GPU is still `llama.cpp`'s strong suit at long context — its layer pipeline overlaps activation transfer with compute and roughly doubles long-prompt throughput from single GPU. Our pinned-host bridge between GPUs is sequential, so 9B multi-GPU doesn't speed prefill at 18 K. (At 9B sizes a single GPU is already faster, so multi-GPU is mostly a 27B story.) Open work item — these numbers predate split-K, so the gap may shrink.
+Cross-GPU prefill pipelining lands 2026-05-03 (default on; `PREFILL_NO_PIPELINE=1` to opt out): per-GPU compute / D2H / H2D streams + double-buffered host transfer + double-buffered per-GPU hidden chunks overlap chunk i's cross-GPU activation transfer with chunk i+1's downstream compute. 9B dual-GPU 18 K jumps from 259 → **720 t/s (2.78×)** and now wins llama.cpp at every length (1.32× even at 18 K). Sampled tokens are bit-equivalent to the sequential path — verified against the per-token greedy argmax up to 18 K.
 
-### 27B Q8_0 — 3 GPU (layer split, 2026-05-03)
+### 27B Q8_0 — 3 GPU (layer split, prefill pipelining on, 2026-05-03)
 
 | Prompt | qengine PP t/s | llama.cpp PP t/s | qengine TG t/s | llama.cpp TG t/s |
 |---:|---:|---:|---:|---:|
-| 297 | **185** | 74.2 | 26.3 | — |
-| 1.16 K | **200** | 127.8 | 23.1 | — |
-| 4.62 K | **188** | 146.0 | 16.1 | — |
-| 18.4 K | 139 | 140.0 | 7.7 | — |
+| 297 | **212** | 74.2 | 27.1 | — |
+| 1.16 K | **264** | 127.8 | 25.6 | — |
+| 4.62 K | **268** | 146.0 | 20.4 | — |
+| 18.4 K | **203** | 140.0 | 11.4 | — |
 | tg128 | — | — | — | 17.7 |
 
-`qengine`: **2.49× / 1.57× / 1.29×** at 297 / 1.16 K / 4.62 K, **0.99× (parity) at 18 K** with split-K FA. Generation +48% at 297 ctx (26.3 vs 17.7 t/s).
+`qengine`: **2.86× / 2.07× / 1.84× / 1.45×** at 297 / 1.16 K / 4.62 K / 18 K — pipelining lifts the long-context number from parity (139, split-K only) to a clean 1.45× win. Generation +53% at 297 ctx (27.1 vs 17.7 t/s).
 
 ### What this says
 
 - **9B single-GPU prefill: qengine wins at every length now**, 1.22–2.99×. The chat-app sweet spot.
-- **27B 3-GPU prefill: qengine wins ≤ 4.6 K (1.29–2.49×), parity at 18 K.** Same code paths as 9B; the default flip + split-K closed the long-context gap.
-- **9B dual-GPU 18 K still trails llama.cpp.** Their layer pipeline carries here; ours is sequential. Open work, but at 9B the single-GPU run is already faster than either dual-GPU result.
+- **9B dual-GPU prefill: qengine now wins at every length** (1.32× at 18 K) thanks to cross-GPU pipelining.
+- **27B 3-GPU prefill: qengine wins everywhere**, 1.45–2.86×. The parity gap at 18 K is gone.
 - **Generation throughput: qengine wins by ~30–50%** on both 9B and 27B. This is what users feel as the chat being responsive.
 
 ## Things qengine does that llama.cpp doesn't (or differs)
@@ -196,6 +196,8 @@ curl http://localhost:8000/v1/chat/completions \
 | `FA_BM` | `32` | FA tile width. `64` halves K/V tile-load iterations (96 KB SMEM opt-in). Marginal on the prompts we measured. |
 | `FA_NT` | `1` | Per-block t_idx count. `2` shares K/V tile across 2 query rows; currently 14% slower at long context (kept as infra). |
 | `FA_SK` | `4` | FA split-K factor at sub_seq_total ≥ 4 K. Spreads each (kv_head, t_idx) across N blocks (default 4) merged via log-sum-exp; lifts long-prompt prefill ~1.46× on 9B and ~1.34× on 27B. `0` to opt out. fp32 partials keep argmax bit-stable with the base FA path. |
+| `PREFILL_NO_PIPELINE` | unset | Set to disable cross-GPU prefill pipelining (per-GPU compute / D2H / H2D streams + double-buffered hidden + host transfer). Pipelining is auto-enabled with ≥2 GPU segments and gives ~2–3× prefill at 1K-18K. |
+| `PREFILL_NO_HOST_FENCE` | unset | Set to drop the `cudaEventSynchronize` between cross-GPU D2H and H2D — racy on CMP 100-210 (sampled tokens diverge from the sequential path). Only set this for benchmarking the upper-bound throughput on hardware where cross-device stream waits properly fence pinned memory. |
 | `QWEN_SLOTS` | `1` | Concurrent slots (continuous batching). Set via `--slots` too. |
 | `QWEN_MAX_QUEUE` | `64` | Max queued requests; `0` = unbounded. |
 | `MTP_ACCEPT_TOP2` | `0` | MTP K=2 top-2 verify (small accept rate gain). |
@@ -235,7 +237,7 @@ Layer split (4-GPU 27B example): GPU 0 holds layers 0–15 + token embeddings; G
 - **sm_70 specific tuning.** Should run on sm_75; sm_80+ has better engines anyway.
 - **Single-host.** No tensor parallelism across machines, no multi-node.
 - **Linux only.**
-- **9B dual-GPU 18 K prefill still trails `llama.cpp`** (~0.48× pre-split-K). Their layer pipeline overlaps activation transfer with compute; ours is sequential. Single-GPU 9B is already faster than either dual-GPU run, so this matters mostly as a multi-GPU correctness benchmark, not a perf path users hit. 27B 3-GPU 18 K is at parity now; closing the 9B 2-GPU gap means pipelining the pinned-host activation bridge. PRs welcome.
+- **Cross-GPU prefill pipelining requires a host-side fence** (`cudaEventSynchronize` between D2H and H2D). On CMP 100-210 (PCIe 1.0 x1, no P2P) the cross-device `cudaStreamWaitEvent` doesn't reliably fence pinned host memory between the source GPU's D2H and the destination GPU's H2D — H2D reads stale bytes and the first sampled token diverges from the sequential path on some prompt lengths. The host fence is default-on (`PREFILL_NO_HOST_FENCE=1` to revert to the racy event-only path) and the perf cost is ≤3% at 18 K because chunks-internal overlap is already serialized by stream FIFOs. May or may not affect newer hardware with proper P2P.
 - **Continuous batching with system-prompt-less requests can stop after 1 token** on Qwopus distill models — known issue with empty-system-prompt EOS bias under batched gen. Set `--default-system-prompt`.
 
 ## Status

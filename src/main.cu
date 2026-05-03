@@ -866,6 +866,65 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     float* host_transfer; cudaMallocHost(&host_transfer, H * sizeof(float));
     float* host_batch_transfer; cudaMallocHost(&host_batch_transfer, (size_t)batch_cap * H * sizeof(float));
     float* host_chunk_transfer; cudaMallocHost(&host_chunk_transfer, CHUNK_SIZE * H * sizeof(float));
+    // ── Cross-GPU prefill pipelining resources ──────────────────────────────
+    // The chunked prefill loop overlaps chunk i's D2H/H2D transfers with
+    // chunk i+1's GPU0 compute. To do that safely we need:
+    //   - a second pinned host buffer (host_chunk_transfer is now buf 0)
+    //   - a second per-GPU device hidden chunk (so chunk i and chunk i+1
+    //     can hold their hidden state on the same GPU concurrently)
+    //   - per-GPU compute / D2H / H2D streams so the three queues run in
+    //     parallel rather than serializing on the legacy null-stream
+    // Memory cost: 2 pinned host + 1 extra device per GPU = ~5 MB / GPU at
+    // CHUNK_SIZE=256 H=5120, negligible vs KV state.
+    float* host_chunk_transfer_pp; cudaMallocHost(&host_chunk_transfer_pp, (size_t)CHUNK_SIZE * H * sizeof(float));
+    float* host_chunk_xfer_db[2] = { host_chunk_transfer, host_chunk_transfer_pp };
+    float* gpu_hidden_chunk_pp[4] = {};
+    float* gpu_hidden_chunk_db[4][2] = {};
+    cudaStream_t prefill_comp_stream[4] = {};
+    cudaStream_t prefill_d2h_stream[4]  = {};
+    cudaStream_t prefill_h2d_stream[4]  = {};
+    for (int g = 0; g < n_gpus; g++) {
+        cudaSetDevice(g);
+        cudaMalloc(&gpu_hidden_chunk_pp[g], (size_t)CHUNK_SIZE * H * sizeof(float));
+        gpu_hidden_chunk_db[g][0] = gpu_hidden_chunk[g];
+        gpu_hidden_chunk_db[g][1] = gpu_hidden_chunk_pp[g];
+        cudaStreamCreate(&prefill_comp_stream[g]);
+        cudaStreamCreate(&prefill_d2h_stream[g]);
+        cudaStreamCreate(&prefill_h2d_stream[g]);
+    }
+    // Contiguous (gpu, layer_lo, layer_hi) segments of the layer pipeline.
+    // Each segment runs on its GPU's compute stream; transfers happen
+    // between consecutive segments.
+    struct GpuSeg { int g; int l_lo; int l_hi; };
+    std::vector<GpuSeg> gpu_segs;
+    {
+        int cur_g = gpu_model.layer_gpu[0]; int seg_start = 0;
+        for (int l = 1; l < model.cfg.num_layers; l++) {
+            if (gpu_model.layer_gpu[l] != cur_g) {
+                gpu_segs.push_back({cur_g, seg_start, l});
+                cur_g = gpu_model.layer_gpu[l]; seg_start = l;
+            }
+        }
+        gpu_segs.push_back({cur_g, seg_start, model.cfg.num_layers});
+    }
+    // Per-buffer events used to chain dependencies across the pipeline:
+    //   seg_done[s][b]   : segment s of buf b finished compute
+    //   d2h_done[s][b]   : D2H from segment s end of buf b finished
+    //   h2d_done[s][b]   : H2D into segment s+1 input of buf b finished
+    // Allocated up to MAX_SEGS = 4 (we currently have at most 3 GPUs in
+    // service). buf is 0 or 1 (double-buffered chunks).
+    constexpr int PP_MAX_SEGS = 4;
+    cudaEvent_t pp_seg_done[PP_MAX_SEGS][2] = {};
+    cudaEvent_t pp_d2h_done[PP_MAX_SEGS][2] = {};
+    cudaEvent_t pp_h2d_done[PP_MAX_SEGS][2] = {};
+    for (int s = 0; s < (int)gpu_segs.size(); s++) {
+        cudaSetDevice(gpu_segs[s].g);
+        for (int b = 0; b < 2; b++) {
+            cudaEventCreateWithFlags(&pp_seg_done[s][b], cudaEventDisableTiming);
+            cudaEventCreateWithFlags(&pp_d2h_done[s][b], cudaEventDisableTiming);
+            cudaEventCreateWithFlags(&pp_h2d_done[s][b], cudaEventDisableTiming);
+        }
+    }
     QuantInput qi_logits;
     // GPU argmax fast path: when temp=0 and rep_penalty=1.0 we can pick the
     // winning token entirely on-device and only transfer 4 bytes back over
@@ -1215,174 +1274,337 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         // 넘겨버리는지 확인용. 맞으면 chunked kernel 수정 타깃.
         static const bool skip_chunked = getenv("DISABLE_CHUNKED_PREFILL") != nullptr;
         if (skip_chunked) prefill_len = 0;
-        while (chunk_pos < prefill_len) {
-            if (cancelled && cancelled->load(std::memory_order_relaxed)) {
-                if (out_completion_tokens) *out_completion_tokens = (int)generated.size();
-                return tok.decode(generated);
-            }
-            int chunk_n = std::min(CHUNK_SIZE, prefill_len - chunk_pos);
+        // DEBUG envs for bit-exact bisect. Each env forces the chunked
+        // control flow to call the per-token forward_* in a loop over
+        // n_tokens instead of the batched chunked kernel. Combine with
+        // DUMP_LAYERS=1 to diff against DISABLE_CHUNKED_PREFILL=1 path.
+        // ATTN chunked kernels: the score kernel now has a strict variant
+        // (`attn_score_kernel_h_chunk_strict`, block-per-score with per-
+        // token reduction tree) enabled by default. CHUNK_FORCE_PT_ATTN=1
+        // still forces per-token (debug/bisect). CHUNK_ATTN_FAST=1 swaps
+        // back to the old warp-per-score kernel (fastest but ~1% argmax
+        // drift on Korean).
+        static const bool force_pt_gdn  = getenv("CHUNK_FORCE_PT_GDN")  != nullptr;
+        static const bool force_pt_attn = getenv("CHUNK_FORCE_PT_ATTN") != nullptr;
+        static const bool force_pt_mlp  = getenv("CHUNK_FORCE_PT_MLP")  != nullptr;
+        static const bool dump_layers_chunk = getenv("DUMP_LAYERS") != nullptr;
+        static const bool dump_prefill_hash = getenv("DUMP_PREFILL_HASH") != nullptr;
+        // Cross-GPU pipelining (PREFILL_NO_PIPELINE=1 to opt out). Requires:
+        //   - ≥2 GPU segments (single-GPU is already optimal)
+        //   - no debug env that needs in-loop sync
+        //   - PROFILE_PREFILL=0 (the prof timers serialize each phase)
+        static const bool no_pipeline_env = getenv("PREFILL_NO_PIPELINE") != nullptr;
+        // PREFILL_CHUNKS_SERIAL=1 forces each chunk to wait for the
+        // previous chunk's last segment to finish (disables cross-chunk
+        // overlap, keeps cross-segment async). Bisect helper for the drift
+        // we see at certain prompt lengths.
+        static const bool chunks_serial = getenv("PREFILL_CHUNKS_SERIAL") != nullptr;
+        const bool use_pipeline = (gpu_segs.size() >= 2)
+            && !no_pipeline_env && !do_prof
+            && !force_pt_gdn && !force_pt_attn && !force_pt_mlp
+            && !dump_layers_chunk && !dump_prefill_hash;
 
-            // 1. Embed all chunk tokens to gpu_hidden_chunk[0] (fp32)
-            cudaSetDevice(0);
-            auto te0 = prof_now();
-            for (int t = 0; t < chunk_n; t++) {
-                int token_id = prompt_ids[chunk_pos + t];
-                // Vision override: substitute the pre-computed ViT embedding
-                // for each <|image_pad|> token, in order of appearance. Falls
-                // through to the normal dequant path when the token is not
-                // an image placeholder or when vision is disabled.
-                bool vision_hit = false;
-                if (g_vision_embeds && g_image_pad_id >= 0 && token_id == g_image_pad_id) {
-                    if (s_vision_idx < g_vision_n_tokens && H == g_vision_H) {
-                        cudaMemcpyAsync(gpu_hidden_half[0],
-                                        g_vision_embeds + (size_t)s_vision_idx * H,
-                                        (size_t)H * sizeof(half),
-                                        cudaMemcpyDeviceToDevice);
-                        s_vision_idx++;
-                        vision_hit = true;
+        if (use_pipeline) {
+            // ── Pipelined chunked prefill ──────────────────────────────────
+            // Per-segment compute streams + per-GPU D2H/H2D streams + double-
+            // buffered (host transfer, per-GPU hidden chunk). chunk i's D2H
+            // and H2D run while chunk i+1's GPU0 segment is computing on the
+            // other buffer; chunk i+2 then reuses chunk i's buffer once the
+            // last segment has finished consuming it.
+            int chunk_idx = 0;
+            int last_buf = -1;
+            int last_chunk_n = 0;
+            const int last_seg = (int)gpu_segs.size() - 1;
+            while (chunk_pos < prefill_len) {
+                if (cancelled && cancelled->load(std::memory_order_relaxed)) {
+                    for (auto& seg : gpu_segs) {
+                        cudaSetDevice(seg.g);
+                        cudaStreamSynchronize(prefill_comp_stream[seg.g]);
                     }
+                    if (out_completion_tokens) *out_completion_tokens = (int)generated.size();
+                    return tok.decode(generated);
                 }
-                if (!vision_hit) {
-                    if (embd_t->type == GGML_TYPE_Q8_0)
-                        dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
-                    else if (embd_t->type == GGML_TYPE_Q5_K)
-                        dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
-                    else if (embd_t->type == GGML_TYPE_Q6_K)
-                        dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
-                }
-                half_to_float_kernel<<<(H+255)/256, 256>>>(
-                    gpu_hidden_half[0], gpu_hidden_chunk[0] + (size_t)t * H, H);
-            }
-            if (do_prof) t_embed += prof_sync_ms(te0, 0);
+                int chunk_n = std::min(CHUNK_SIZE, prefill_len - chunk_pos);
+                int buf = chunk_idx & 1;
 
-            // 2. Process chunk through all layers (transfer between GPUs as needed)
-            float* h_chunk = gpu_hidden_chunk[0];
-            for (int layer = 0; layer < model.cfg.num_layers; layer++) {
-                int g = gpu_model.layer_gpu[layer];
-                int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
-                if (g != prev_g) {
-                    auto tx0 = prof_now();
-                    cudaSetDevice(prev_g);
-                    cudaMemcpy(host_chunk_transfer, h_chunk, (size_t)chunk_n * H * sizeof(float), cudaMemcpyDeviceToHost);
+                // Reusing host_xfer[buf] / gpu_hidden_chunk_db[*][buf]: wait
+                // for the last segment of the previous tenant of this buffer
+                // to be done consuming it.
+                if (chunk_idx >= 2) {
+                    cudaSetDevice(gpu_segs[0].g);
+                    cudaStreamWaitEvent(prefill_comp_stream[gpu_segs[0].g],
+                                        pp_seg_done[last_seg][buf], 0);
+                }
+                // Bisect: force serial chunks (waits for previous chunk's
+                // last segment, not just chunk_idx-2's). Disables cross-
+                // chunk overlap entirely.
+                if (chunks_serial && chunk_idx >= 1) {
+                    int prev_buf = (chunk_idx - 1) & 1;
+                    cudaSetDevice(gpu_segs[0].g);
+                    cudaStreamWaitEvent(prefill_comp_stream[gpu_segs[0].g],
+                                        pp_seg_done[last_seg][prev_buf], 0);
+                }
+
+                // 1. Embed onto buf-side hidden of segment 0's GPU.
+                cudaSetDevice(gpu_segs[0].g);
+                float* h_in = gpu_hidden_chunk_db[gpu_segs[0].g][buf];
+                cudaStream_t s0 = prefill_comp_stream[gpu_segs[0].g];
+                for (int t = 0; t < chunk_n; t++) {
+                    int token_id = prompt_ids[chunk_pos + t];
+                    bool vision_hit = false;
+                    if (g_vision_embeds && g_image_pad_id >= 0
+                        && token_id == g_image_pad_id) {
+                        if (s_vision_idx < g_vision_n_tokens && H == g_vision_H) {
+                            cudaMemcpyAsync(gpu_hidden_half[0],
+                                            g_vision_embeds + (size_t)s_vision_idx * H,
+                                            (size_t)H * sizeof(half),
+                                            cudaMemcpyDeviceToDevice, s0);
+                            s_vision_idx++;
+                            vision_hit = true;
+                        }
+                    }
+                    if (!vision_hit) {
+                        if (embd_t->type == GGML_TYPE_Q8_0)
+                            dequant_embd_q8_0_row<<<(H+255)/256, 256, 0, s0>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+                        else if (embd_t->type == GGML_TYPE_Q5_K)
+                            dequant_embd_q5k_row_v2<<<(H+255)/256, 256, 0, s0>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+                        else if (embd_t->type == GGML_TYPE_Q6_K)
+                            dequant_embd_q6k_row_v2<<<(H+255)/256, 256, 0, s0>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+                    }
+                    half_to_float_kernel<<<(H+255)/256, 256, 0, s0>>>(
+                        gpu_hidden_half[0], h_in + (size_t)t * H, H);
+                }
+
+                // 2. For each segment: compute its layers on its compute
+                //    stream, record done-event, then chain D2H + H2D into
+                //    the next segment's input buffer.
+                for (int s = 0; s < (int)gpu_segs.size(); s++) {
+                    int g = gpu_segs[s].g;
                     cudaSetDevice(g);
-                    cudaMemcpy(gpu_hidden_chunk[g], host_chunk_transfer, (size_t)chunk_n * H * sizeof(float), cudaMemcpyHostToDevice);
-                    h_chunk = gpu_hidden_chunk[g];
-                    if (do_prof) t_xfer += prof_sync_ms(tx0, g);
-                } else { cudaSetDevice(g); }
-
-                auto ta0 = prof_now();
-                bool is_attn = model.is_attn_layer(layer);
-                // DEBUG envs for bit-exact bisect. Each env forces the chunked
-                // control flow to call the per-token forward_* in a loop over
-                // n_tokens instead of the batched chunked kernel. Combine with
-                // DUMP_LAYERS=1 to diff against DISABLE_CHUNKED_PREFILL=1 path.
-                static const bool force_pt_gdn  = getenv("CHUNK_FORCE_PT_GDN")  != nullptr;
-                // ATTN chunked kernels: the score kernel now has a strict
-                // variant (`attn_score_kernel_h_chunk_strict`, block-per-score
-                // with per-token reduction tree) enabled by default. It's
-                // argmax-stable with the per-token path, so per-token fallback
-                // is no longer needed for correctness. CHUNK_FORCE_PT_ATTN=1
-                // still forces per-token (debug/bisect). CHUNK_ATTN_FAST=1
-                // swaps back to the old warp-per-score kernel (fastest but
-                // ~1% argmax drift on Korean).
-                static const bool force_pt_attn = getenv("CHUNK_FORCE_PT_ATTN") != nullptr;
-                static const bool force_pt_mlp  = getenv("CHUNK_FORCE_PT_MLP")  != nullptr;
-                if (is_attn) {
-                    if (force_pt_attn) {
-                        for (int tt = 0; tt < chunk_n; tt++) {
-                            float* h_t = h_chunk + (size_t)tt * H;
-                            model.forward_attn(layer, h_t, chunk_pos + tt, 0,
-                                               /*external_proj=*/false, /*slot_pos=*/-1,
-                                               /*mask_start=*/-1, /*mask_len=*/0,
-                                               /*mask_bits=*/0xffffffffu, slot);
+                    cudaStream_t cs = prefill_comp_stream[g];
+                    float* h_chunk = gpu_hidden_chunk_db[g][buf];
+                    for (int layer = gpu_segs[s].l_lo; layer < gpu_segs[s].l_hi; layer++) {
+                        bool is_attn = model.is_attn_layer(layer);
+                        if (is_attn) {
+                            model.forward_attn_chunk(layer, h_chunk, chunk_pos, chunk_n, cs, slot);
+                        } else {
+                            model.forward_gdn_chunk(layer, h_chunk, chunk_n, cs, slot);
                         }
-                    } else {
-                        model.forward_attn_chunk(layer, h_chunk, chunk_pos, chunk_n, 0, slot);
+                        model.forward_mlp_chunk(layer, h_chunk, chunk_n, cs);
+                        model.dflash_capture_chunk(layer, h_chunk, chunk_pos, chunk_n, g, cs);
                     }
-                } else {
-                    if (force_pt_gdn) {
-                        for (int tt = 0; tt < chunk_n; tt++) {
-                            float* h_t = h_chunk + (size_t)tt * H;
-                            model.forward_gdn(layer, h_t, 0, slot);
+                    cudaEventRecord(pp_seg_done[s][buf], cs);
+                    if (s < last_seg) {
+                        cudaStream_t d2h_s = prefill_d2h_stream[g];
+                        cudaStreamWaitEvent(d2h_s, pp_seg_done[s][buf], 0);
+                        cudaMemcpyAsync(host_chunk_xfer_db[buf], h_chunk,
+                                        (size_t)chunk_n * H * sizeof(float),
+                                        cudaMemcpyDeviceToHost, d2h_s);
+                        cudaEventRecord(pp_d2h_done[s][buf], d2h_s);
+                        int g_next = gpu_segs[s + 1].g;
+                        cudaSetDevice(g_next);
+                        cudaStream_t h2d_s = prefill_h2d_stream[g_next];
+                        // Cross-device cudaStreamWaitEvent does NOT fence
+                        // pinned host memory between the source GPU's D2H
+                        // and the destination GPU's H2D on CMP 100-210 (or
+                        // any PCIe 1.0 / no-P2P setup we tested). The H2D
+                        // reads stale host bytes and sampled tokens diverge
+                        // from the sequential path on certain prompt
+                        // lengths. cudaEventSynchronize is the cheapest
+                        // available host-side fence and chunks-internal
+                        // overlap is already serialized via stream FIFOs,
+                        // so the perf cost is ≤3% (measured at 18 K). Set
+                        // PREFILL_NO_HOST_FENCE=1 to revert to the (racy)
+                        // event-only path for benchmarking.
+                        static const bool no_host_fence = getenv("PREFILL_NO_HOST_FENCE") != nullptr;
+                        if (no_host_fence) {
+                            cudaStreamWaitEvent(h2d_s, pp_d2h_done[s][buf], 0);
+                        } else {
+                            cudaEventSynchronize(pp_d2h_done[s][buf]);
                         }
-                    } else {
-                        model.forward_gdn_chunk(layer, h_chunk, chunk_n, 0, slot);
+                        cudaMemcpyAsync(gpu_hidden_chunk_db[g_next][buf],
+                                        host_chunk_xfer_db[buf],
+                                        (size_t)chunk_n * H * sizeof(float),
+                                        cudaMemcpyHostToDevice, h2d_s);
+                        cudaEventRecord(pp_h2d_done[s][buf], h2d_s);
+                        cudaStreamWaitEvent(prefill_comp_stream[g_next],
+                                            pp_h2d_done[s][buf], 0);
                     }
                 }
-                if (do_prof) {
-                    double ms = prof_sync_ms(ta0, g);
-                    if (is_attn) t_attn += ms; else t_gdn += ms;
-                }
 
-                auto tm0 = prof_now();
-                if (force_pt_mlp) {
-                    for (int tt = 0; tt < chunk_n; tt++) {
-                        float* h_t = h_chunk + (size_t)tt * H;
-                        model.forward_mlp(layer, h_t, 0);
+                last_buf = buf;
+                last_chunk_n = chunk_n;
+                chunk_idx++;
+                chunk_pos += chunk_n;
+
+                // Snapshot needs all in-flight pipeline stages to be done so
+                // the saved KV state is consistent. Drain & restart cycle.
+                if (snapshot_target > 0 && prefix_skip == 0
+                    && chunk_pos == snapshot_target) {
+                    for (auto& seg : gpu_segs) {
+                        cudaSetDevice(seg.g);
+                        cudaStreamSynchronize(prefill_comp_stream[seg.g]);
                     }
-                } else {
-                    model.forward_mlp_chunk(layer, h_chunk, chunk_n, 0);
-                }
-                if (do_prof) t_mlp += prof_sync_ms(tm0, g);
-
-                // DFlash hidden capture (no-op unless dflash mode enabled).
-                // Captures only configured layer ids into the GPU0 ring buffer.
-                model.dflash_capture_chunk(layer, h_chunk, chunk_pos, chunk_n, g, 0);
-
-                // DUMP_LAYERS=1: chunked prefill 경로에서도 마지막 prompt
-                // token 의 layer output hidden 처음 8 float 를 덤프한다.
-                // per-token 경로 (DISABLE_CHUNKED_PREFILL=1) 와 같은 포맷
-                // "[L%02d gdn/attn] ..." 로 찍어 diff 로 drift 레이어 bisect.
-                static const bool dump_layers_chunk = getenv("DUMP_LAYERS") != nullptr;
-                if (dump_layers_chunk && chunk_pos + chunk_n == prefill_len) {
-                    cudaSetDevice(g); cudaDeviceSynchronize();
-                    float sample[8];
-                    float* last_h = h_chunk + (size_t)(chunk_n - 1) * H;
-                    cudaMemcpy(sample, last_h, 8 * sizeof(float), cudaMemcpyDeviceToHost);
-                    fprintf(stderr, "[L%02d %s] %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f\n",
-                            layer, is_attn ? "attn" : "gdn ",
-                            sample[0], sample[1], sample[2], sample[3],
-                            sample[4], sample[5], sample[6], sample[7]);
-                    fflush(stderr);
-                }
-                // DUMP_PREFILL_HASH=1: per-token hidden hash for the whole
-                // chunk after each layer. Pair with the same env in the
-                // per-token (DISABLE_CHUNKED_PREFILL=1) path to bisect the
-                // exact (layer, token) where chunked drifts from per-token.
-                static const bool dump_prefill_hash = getenv("DUMP_PREFILL_HASH") != nullptr;
-                if (dump_prefill_hash) {
-                    cudaSetDevice(g); cudaDeviceSynchronize();
-                    static thread_local std::vector<float> host_buf;
-                    host_buf.resize((size_t)chunk_n * H);
-                    cudaMemcpy(host_buf.data(), h_chunk,
-                               (size_t)chunk_n * H * sizeof(float),
-                               cudaMemcpyDeviceToHost);
-                    for (int t = 0; t < chunk_n; t++) {
-                        uint64_t h = 0xcbf29ce484222325ULL;
-                        const float* p = host_buf.data() + (size_t)t * H;
-                        for (int i = 0; i < H; i++) {
-                            uint32_t b; memcpy(&b, &p[i], 4);
-                            h = (h ^ (uint64_t)b) * 0x100000001b3ULL;
-                        }
-                        fprintf(stderr, "[CHK L%02d t%03d %s] hash=%016lx\n",
-                                layer, chunk_pos + t,
-                                is_attn ? "attn" : "gdn ", h);
-                    }
-                    fflush(stderr);
+                    model.save_prefix_snapshot(prompt_ids, snapshot_target, slot);
+                    printf("[CACHE] snapshot saved at pos=%d\n", snapshot_target);
+                    fflush(stdout);
+                    chunk_idx = 0;
                 }
             }
-            cudaSetDevice(last_gpu); cudaDeviceSynchronize();
+            // Drain pipeline before the per-token loop reads the final
+            // hidden / KV cache. cudaDeviceSynchronize on every GPU drains
+            // ALL streams (compute + d2h + h2d) so the per-token forward
+            // (which uses the default stream) sees consistent KV/GDN state.
+            for (int g = 0; g < n_gpus; g++) {
+                cudaSetDevice(g);
+                cudaDeviceSynchronize();
+            }
+            // Per-token loop reads from gpu_hidden_chunk[last_gpu] (slot 0 of
+            // the double-buffer); copy back when last chunk landed in slot 1.
+            if (last_buf == 1 && last_chunk_n > 0) {
+                int g = gpu_model.layer_gpu[model.cfg.num_layers - 1];
+                cudaSetDevice(g);
+                cudaMemcpy(gpu_hidden_chunk[g],
+                           gpu_hidden_chunk_db[g][1],
+                           (size_t)last_chunk_n * H * sizeof(float),
+                           cudaMemcpyDeviceToDevice);
+            }
+            cudaSetDevice(last_gpu);
+        } else {
+            // ── Sequential chunked prefill (legacy, debug, single-GPU) ───
+            while (chunk_pos < prefill_len) {
+                if (cancelled && cancelled->load(std::memory_order_relaxed)) {
+                    if (out_completion_tokens) *out_completion_tokens = (int)generated.size();
+                    return tok.decode(generated);
+                }
+                int chunk_n = std::min(CHUNK_SIZE, prefill_len - chunk_pos);
 
-            chunk_pos += chunk_n;
+                cudaSetDevice(0);
+                auto te0 = prof_now();
+                for (int t = 0; t < chunk_n; t++) {
+                    int token_id = prompt_ids[chunk_pos + t];
+                    bool vision_hit = false;
+                    if (g_vision_embeds && g_image_pad_id >= 0 && token_id == g_image_pad_id) {
+                        if (s_vision_idx < g_vision_n_tokens && H == g_vision_H) {
+                            cudaMemcpyAsync(gpu_hidden_half[0],
+                                            g_vision_embeds + (size_t)s_vision_idx * H,
+                                            (size_t)H * sizeof(half),
+                                            cudaMemcpyDeviceToDevice);
+                            s_vision_idx++;
+                            vision_hit = true;
+                        }
+                    }
+                    if (!vision_hit) {
+                        if (embd_t->type == GGML_TYPE_Q8_0)
+                            dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+                        else if (embd_t->type == GGML_TYPE_Q5_K)
+                            dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+                        else if (embd_t->type == GGML_TYPE_Q6_K)
+                            dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+                    }
+                    half_to_float_kernel<<<(H+255)/256, 256>>>(
+                        gpu_hidden_half[0], gpu_hidden_chunk[0] + (size_t)t * H, H);
+                }
+                if (do_prof) t_embed += prof_sync_ms(te0, 0);
 
-            // Snapshot prefix cache when chunk_pos lands exactly on the
-            // requested snapshot boundary (only on cache miss, since on hit
-            // the snapshot already exists and content is identical).
-            if (snapshot_target > 0 && prefix_skip == 0
-                && chunk_pos == snapshot_target) {
-                model.save_prefix_snapshot(prompt_ids, snapshot_target, slot);
-                printf("[CACHE] snapshot saved at pos=%d\n", snapshot_target);
-                fflush(stdout);
+                float* h_chunk = gpu_hidden_chunk[0];
+                for (int layer = 0; layer < model.cfg.num_layers; layer++) {
+                    int g = gpu_model.layer_gpu[layer];
+                    int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
+                    if (g != prev_g) {
+                        auto tx0 = prof_now();
+                        cudaSetDevice(prev_g);
+                        cudaMemcpy(host_chunk_transfer, h_chunk, (size_t)chunk_n * H * sizeof(float), cudaMemcpyDeviceToHost);
+                        cudaSetDevice(g);
+                        cudaMemcpy(gpu_hidden_chunk[g], host_chunk_transfer, (size_t)chunk_n * H * sizeof(float), cudaMemcpyHostToDevice);
+                        h_chunk = gpu_hidden_chunk[g];
+                        if (do_prof) t_xfer += prof_sync_ms(tx0, g);
+                    } else { cudaSetDevice(g); }
+
+                    auto ta0 = prof_now();
+                    bool is_attn = model.is_attn_layer(layer);
+                    if (is_attn) {
+                        if (force_pt_attn) {
+                            for (int tt = 0; tt < chunk_n; tt++) {
+                                float* h_t = h_chunk + (size_t)tt * H;
+                                model.forward_attn(layer, h_t, chunk_pos + tt, 0,
+                                                   /*external_proj=*/false, /*slot_pos=*/-1,
+                                                   /*mask_start=*/-1, /*mask_len=*/0,
+                                                   /*mask_bits=*/0xffffffffu, slot);
+                            }
+                        } else {
+                            model.forward_attn_chunk(layer, h_chunk, chunk_pos, chunk_n, 0, slot);
+                        }
+                    } else {
+                        if (force_pt_gdn) {
+                            for (int tt = 0; tt < chunk_n; tt++) {
+                                float* h_t = h_chunk + (size_t)tt * H;
+                                model.forward_gdn(layer, h_t, 0, slot);
+                            }
+                        } else {
+                            model.forward_gdn_chunk(layer, h_chunk, chunk_n, 0, slot);
+                        }
+                    }
+                    if (do_prof) {
+                        double ms = prof_sync_ms(ta0, g);
+                        if (is_attn) t_attn += ms; else t_gdn += ms;
+                    }
+
+                    auto tm0 = prof_now();
+                    if (force_pt_mlp) {
+                        for (int tt = 0; tt < chunk_n; tt++) {
+                            float* h_t = h_chunk + (size_t)tt * H;
+                            model.forward_mlp(layer, h_t, 0);
+                        }
+                    } else {
+                        model.forward_mlp_chunk(layer, h_chunk, chunk_n, 0);
+                    }
+                    if (do_prof) t_mlp += prof_sync_ms(tm0, g);
+
+                    model.dflash_capture_chunk(layer, h_chunk, chunk_pos, chunk_n, g, 0);
+
+                    if (dump_layers_chunk && chunk_pos + chunk_n == prefill_len) {
+                        cudaSetDevice(g); cudaDeviceSynchronize();
+                        float sample[8];
+                        float* last_h = h_chunk + (size_t)(chunk_n - 1) * H;
+                        cudaMemcpy(sample, last_h, 8 * sizeof(float), cudaMemcpyDeviceToHost);
+                        fprintf(stderr, "[L%02d %s] %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f\n",
+                                layer, is_attn ? "attn" : "gdn ",
+                                sample[0], sample[1], sample[2], sample[3],
+                                sample[4], sample[5], sample[6], sample[7]);
+                        fflush(stderr);
+                    }
+                    if (dump_prefill_hash) {
+                        cudaSetDevice(g); cudaDeviceSynchronize();
+                        static thread_local std::vector<float> host_buf;
+                        host_buf.resize((size_t)chunk_n * H);
+                        cudaMemcpy(host_buf.data(), h_chunk,
+                                   (size_t)chunk_n * H * sizeof(float),
+                                   cudaMemcpyDeviceToHost);
+                        for (int t = 0; t < chunk_n; t++) {
+                            uint64_t h = 0xcbf29ce484222325ULL;
+                            const float* p = host_buf.data() + (size_t)t * H;
+                            for (int i = 0; i < H; i++) {
+                                uint32_t b; memcpy(&b, &p[i], 4);
+                                h = (h ^ (uint64_t)b) * 0x100000001b3ULL;
+                            }
+                            fprintf(stderr, "[CHK L%02d t%03d %s] hash=%016lx\n",
+                                    layer, chunk_pos + t,
+                                    is_attn ? "attn" : "gdn ", h);
+                        }
+                        fflush(stderr);
+                    }
+                }
+                cudaSetDevice(last_gpu); cudaDeviceSynchronize();
+
+                chunk_pos += chunk_n;
+
+                if (snapshot_target > 0 && prefix_skip == 0
+                    && chunk_pos == snapshot_target) {
+                    model.save_prefix_snapshot(prompt_ids, snapshot_target, slot);
+                    printf("[CACHE] snapshot saved at pos=%d\n", snapshot_target);
+                    fflush(stdout);
+                }
             }
         }
         if (do_prof) {
@@ -3159,6 +3381,23 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         gen_loop_cv.notify_all();
         gen_loop_thread.join();
     }
+    // Cross-GPU prefill pipelining cleanup.
+    for (int s = 0; s < (int)gpu_segs.size(); s++) {
+        cudaSetDevice(gpu_segs[s].g);
+        for (int b = 0; b < 2; b++) {
+            cudaEventDestroy(pp_seg_done[s][b]);
+            cudaEventDestroy(pp_d2h_done[s][b]);
+            cudaEventDestroy(pp_h2d_done[s][b]);
+        }
+    }
+    for (int g = 0; g < n_gpus; g++) {
+        cudaSetDevice(g);
+        cudaStreamDestroy(prefill_comp_stream[g]);
+        cudaStreamDestroy(prefill_d2h_stream[g]);
+        cudaStreamDestroy(prefill_h2d_stream[g]);
+        cudaFree(gpu_hidden_chunk_pp[g]);
+    }
+    cudaFreeHost(host_chunk_transfer_pp);
     return ok ? 0 : 1;
 }
 
