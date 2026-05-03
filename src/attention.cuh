@@ -5,6 +5,11 @@
 #include <cmath>
 #include "turboquant.cuh"
 
+// Device-side phase counters for flash_attn_chunk_fused_split_tq3.
+// Indexed: 0=decode, 1=score, 2=softmax, 3=value, 4=tile_count.
+// Single .cu compile unit (main.cu) so direct definition is safe.
+__device__ unsigned long long g_fa_phase_cyc[5] = {0, 0, 0, 0, 0};
+
 // ============ RoPE precomputed tables ============
 
 struct RoPETable {
@@ -1726,11 +1731,19 @@ __global__ void flash_attn_chunk_fused_split_tq3(
     float m_w = -INFINITY;
     float l_w = 0.0f;
 
+    // Per-block phase cycle accumulators (PROFILE_FA env reads g_fa_phase_cyc).
+    // Only tid==0 in each block writes them; cost is one clock64() + one add per
+    // phase per tile, ~negligible vs the work the warps do in the tile body.
+    unsigned long long ph0=0, ph1=0, ph2=0, ph3=0, tile_cnt=0;
+
     if (tile_lo < tile_hi) {
         const float wht_scale = rsqrtf((float)TQ_BLOCK_SIZE);
         for (int tile_start = tile_lo; tile_start < tile_hi; tile_start += BM) {
             int tile_end = min(tile_start + BM, tile_hi);
             int tile_len = tile_end - tile_start;
+
+            unsigned long long t0_t=0, t1_t=0, t2_t=0, t3_t=0, t4_t=0;
+            if (tid == 0) t0_t = clock64();
 
             // ============ Cooperative TQ3 decode of K + V tile ============
             // 1 warp per 128-elem TQ block, 4 elements per thread.
@@ -1806,6 +1819,7 @@ __global__ void flash_attn_chunk_fused_split_tq3(
                     tile_dst[base_elem + i] = __float2half(v[i]);
             }
             __syncthreads();
+            if (tid == 0) { t1_t = clock64(); ph0 += t1_t - t0_t; }
 
             // ============ Score compute (identical to base split kernel) ============
             constexpr int NITERS = (GQA * BM + N_WARPS - 1) / N_WARPS;
@@ -1836,6 +1850,7 @@ __global__ void flash_attn_chunk_fused_split_tq3(
                 }
             }
             __syncthreads();
+            if (tid == 0) { t2_t = clock64(); ph1 += t2_t - t1_t; }
 
             // Softmax + O accumulation (identical to base split kernel).
             if (warp < GQA) {
@@ -1855,6 +1870,7 @@ __global__ void flash_attn_chunk_fused_split_tq3(
                 #pragma unroll
                 for (int i = 0; i < LANE_D; i++) acc_o[i] *= correction;
                 l_w = l_w * correction + sum_p;
+                if (tid == 0) { t3_t = clock64(); ph2 += t3_t - t2_t; }
                 #pragma unroll
                 for (int r = 0; r < BM; r++) {
                     float p_r = __shfl_sync(0xffffffff, p_lane, r);
@@ -1871,7 +1887,15 @@ __global__ void flash_attn_chunk_fused_split_tq3(
                 m_w = m_new;
             }
             __syncthreads();
+            if (tid == 0) { t4_t = clock64(); ph3 += t4_t - t3_t; tile_cnt++; }
         }
+    }
+    if (tid == 0) {
+        atomicAdd(&g_fa_phase_cyc[0], ph0);
+        atomicAdd(&g_fa_phase_cyc[1], ph1);
+        atomicAdd(&g_fa_phase_cyc[2], ph2);
+        atomicAdd(&g_fa_phase_cyc[3], ph3);
+        atomicAdd(&g_fa_phase_cyc[4], tile_cnt);
     }
 
     // Write partial outputs (identical to base split kernel).

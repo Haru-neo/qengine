@@ -1270,6 +1270,19 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         double g_embed = 0, g_xfer = 0, g_attn = 0, g_gdn = 0, g_mlp = 0,
                g_logits = 0, g_mtp = 0, g_other = 0;
         int g_steps = 0, g_spec_iters = 0;
+        // PROFILE_FA=1 zeroes the device-side fused-FA phase cycle counters
+        // (g_fa_phase_cyc[0..4]: decode/score/softmax/value/tile_cnt) on each
+        // GPU before gen and prints their sum after gen. The kernel always
+        // updates them, but reading them is opt-in to keep noise low.
+        const char* fa_prof_env = getenv("PROFILE_FA");
+        const bool do_fa_prof = fa_prof_env && fa_prof_env[0] == '1';
+        if (do_fa_prof) {
+            unsigned long long zero[5] = {0,0,0,0,0};
+            for (int g = 0; g < n_gpus; g++) {
+                cudaSetDevice(g);
+                cudaMemcpyToSymbol(g_fa_phase_cyc, zero, sizeof(zero));
+            }
+        }
         // DISABLE_CHUNKED_PREFILL=1 : chunked path 우회. per-token loop 가
         // 처음부터 prompt 전체를 처리 (batch=1, state update 명시적 누적).
         // 9B 에서 chunked GDN 의 fp16 누적 오차가 언어 classification 을
@@ -2752,6 +2765,26 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                    g_pt_attn_ms,    pt_sub > 0 ? 100.0*g_pt_attn_ms/pt_sub    : 0,
                    g_pt_oproj_ms,   pt_sub > 0 ? 100.0*g_pt_oproj_ms/pt_sub   : 0);
             fflush(stdout);
+        }
+        if (do_fa_prof) {
+            unsigned long long sum[5] = {0,0,0,0,0};
+            for (int g = 0; g < n_gpus; g++) {
+                cudaSetDevice(g);
+                unsigned long long buf[5];
+                cudaMemcpyFromSymbol(buf, g_fa_phase_cyc, sizeof(buf));
+                for (int i = 0; i < 5; i++) sum[i] += buf[i];
+            }
+            unsigned long long phase_sum = sum[0] + sum[1] + sum[2] + sum[3];
+            if (phase_sum > 0) {
+                printf("[FA PHASE] tiles=%llu  total_cyc=%llu  "
+                       "decode=%.0f%%  score=%.0f%%  softmax=%.0f%%  value=%.0f%%\n",
+                       sum[4], phase_sum,
+                       100.0 * sum[0] / phase_sum,
+                       100.0 * sum[1] / phase_sum,
+                       100.0 * sum[2] / phase_sum,
+                       100.0 * sum[3] / phase_sum);
+                fflush(stdout);
+            }
         }
 
         if (out_completion_tokens) *out_completion_tokens = (int)generated.size();
