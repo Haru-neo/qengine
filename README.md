@@ -3,9 +3,9 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![CUDA](https://img.shields.io/badge/CUDA-12.x-76B900?logo=nvidia)](https://developer.nvidia.com/cuda-toolkit)
 [![Volta sm_70](https://img.shields.io/badge/sm__70-Volta-green)](https://en.wikipedia.org/wiki/Volta_(microarchitecture))
-[![Prefill: 1.5–3× llama.cpp ≤4.6 K](https://img.shields.io/badge/prefill-1.5%E2%80%933%C3%97%20llama.cpp%20%E2%89%A44.6K-brightgreen)](#honest-benchmarks-vs-llamacpp)
+[![Prefill: 1.2–3× llama.cpp](https://img.shields.io/badge/prefill-1.2%E2%80%933%C3%97%20llama.cpp-brightgreen)](#honest-benchmarks-vs-llamacpp)
 
-> **9B single-GPU prefill is now 1.5–3× llama.cpp at every length up to ~4.6 K tokens** (after the 2026-05-02 default flip — see commit `ca30368`). Long-context (≥18 K) prefill still trails on 9B (~0.83×) and on multi-GPU layouts where `llama.cpp`'s pipeline scales better. Generation continues to win by +30–50%. See [Honest Benchmarks](#honest-benchmarks-vs-llamacpp).
+> **9B single-GPU prefill is 1.5–3× llama.cpp at every length up to ~4.6 K tokens** (2026-05-02 default flip, commit `ca30368`). With **split-K FlashAttention** on by default (commit `f2e52b8`), 9B 18 K prefill jumps to **1.22× llama.cpp** and 27B 3-GPU 18 K reaches **parity (0.99×)**. Generation continues to win by +30–50%. Multi-GPU prefill at long context still trails on 9B 2-GPU (open work). See [Honest Benchmarks](#honest-benchmarks-vs-llamacpp).
 
 A custom CUDA inference engine for **Qwen3 hybrid (GDN + Attention) models**, written from scratch and tuned for NVIDIA mining cards (CMP 100-210, ex-mining V100) — 16 GB HBM2, sm_70, PCIe Gen1 x1, no P2P. Not a fork — every kernel is written for these constraints.
 
@@ -45,7 +45,7 @@ It's not faster than llama.cpp at everything. See the honest benchmarks below.
 
 ## Honest benchmarks (vs `llama.cpp`)
 
-All measurements on a CMP 100-210 host, same `Q8_0` GGUF (Qwopus3.5-9B-v3.5), batch 1, single inflight request, FA on, layer split. Both engines built for sm_70 with the int8 (MMQ / DP4A) path. qengine numbers are **server-side prefill wall** (excludes SSE handshake) for `bench_curl.sh`-style real chat-completion prompts; `llama.cpp` numbers are `llama-bench` at matching prompt sizes. Bigger is better; **bold** = winner. All measured 2026-05-02 against `llama.cpp` build `8462`.
+All measurements on a CMP 100-210 host, same `Q8_0` GGUFs (Qwopus3.5-9B-v3.5, Qwopus3.6-27B-v1-preview), batch 1, single inflight request, FA on, layer split, split-K FA on by default. Both engines built for sm_70 with the int8 (MMQ / DP4A) path. qengine numbers are **server-side prefill wall** (excludes SSE handshake) for `bench_curl.sh`-style real chat-completion prompts; `llama.cpp` numbers are `llama-bench` at matching prompt sizes. Bigger is better; **bold** = winner. Single-GPU 9B measured 2026-05-02; 27B 3-GPU and split-K 9B 18 K measured 2026-05-03. `llama.cpp` build `8462`.
 
 ### 9B Q8_0 — single GPU
 
@@ -53,11 +53,11 @@ All measurements on a CMP 100-210 host, same `Q8_0` GGUF (Qwopus3.5-9B-v3.5), ba
 |---:|---:|---:|---:|---:|
 | 297 | **594** | 199 | 70.4 | — |
 | 1.16 K | **683** | 316 | — | — |
-| 4.62 K | **563** | 361 | — | — |
-| 18.4 K | 270 | **324** | 27.6 | — |
+| 4.62 K | **584** | 361 | — | — |
+| 18.4 K | **393** | 324 | 27.6 | — |
 | tg64 | — | — | — | 46.6 |
 
-`qengine`: 1.56–2.99× over `llama.cpp` on prompts up to ~4.6 K tokens; ~0.83× at 18 K. Generation +51% on the comparable short-context point (70.4 vs 46.6 t/s).
+`qengine`: 1.56–2.99× on prompts up to ~4.6 K, **1.22×** at 18 K (split-K FA, 1.46× over the pre-split-K build). Generation +51% on the comparable short-context point (70.4 vs 46.6 t/s).
 
 ### 9B Q8_0 — dual GPU (layer split)
 
@@ -69,25 +69,26 @@ All measurements on a CMP 100-210 host, same `Q8_0` GGUF (Qwopus3.5-9B-v3.5), ba
 | 18.4 K | 259 | **545** | 27.4 | — |
 | tg64 | — | — | — | 44.2 |
 
-Multi-GPU is `llama.cpp`'s strong suit — its layer pipeline overlaps activation transfer with compute and roughly doubles long-prompt throughput from single GPU. Our pinned-host bridge between GPUs is sequential, so multi-GPU doesn't speed prefill on the layouts we have. Open work item.
+Multi-GPU is still `llama.cpp`'s strong suit at long context — its layer pipeline overlaps activation transfer with compute and roughly doubles long-prompt throughput from single GPU. Our pinned-host bridge between GPUs is sequential, so 9B multi-GPU doesn't speed prefill at 18 K. (At 9B sizes a single GPU is already faster, so multi-GPU is mostly a 27B story.) Open work item — these numbers predate split-K, so the gap may shrink.
 
-### 27B Q8_0 — 3 GPU (layer split)
-
-> ⚠️ Numbers below predate the 2026-05-02 default flip. Re-measurement pending; expect a proportional improvement (the same code paths flipped on 9B). Treat as a lower bound for the current build.
+### 27B Q8_0 — 3 GPU (layer split, 2026-05-03)
 
 | Prompt | qengine PP t/s | llama.cpp PP t/s | qengine TG t/s | llama.cpp TG t/s |
 |---:|---:|---:|---:|---:|
-| 128 | 38 | **83** | 26.6 | 17.8 |
-| 2048 | 37 | **137** | 23.5 | — |
-| 8192 | 33 | **146** | 17 | — |
-| 18 K | 22 | — | 7.8 | — |
+| 297 | **185** | 74.2 | 26.3 | — |
+| 1.16 K | **200** | 127.8 | 23.1 | — |
+| 4.62 K | **188** | 146.0 | 16.1 | — |
+| 18.4 K | 139 | 140.0 | 7.7 | — |
+| tg128 | — | — | — | 17.7 |
+
+`qengine`: **2.49× / 1.57× / 1.29×** at 297 / 1.16 K / 4.62 K, **0.99× (parity) at 18 K** with split-K FA. Generation +48% at 297 ctx (26.3 vs 17.7 t/s).
 
 ### What this says
 
-- **9B single-GPU prefill ≤ 4.6 K: qengine wins by 1.56–2.99×.** This is the chat-app sweet spot — short-to-medium prompts, real OpenAI-API requests.
-- **9B long-context prefill (≥ 18 K) and multi-GPU layouts: `llama.cpp` is still ahead.** Their MMQ + multi-GPU pipeline carries here. Open work for us.
-- **Generation throughput: qengine wins by ~30–50%** on 9B and (per pre-flip data) on 27B too. This is what users feel as the chat being responsive.
-- **27B is on the same code paths as 9B**, so the default flip should help proportionally — re-bench is pending.
+- **9B single-GPU prefill: qengine wins at every length now**, 1.22–2.99×. The chat-app sweet spot.
+- **27B 3-GPU prefill: qengine wins ≤ 4.6 K (1.29–2.49×), parity at 18 K.** Same code paths as 9B; the default flip + split-K closed the long-context gap.
+- **9B dual-GPU 18 K still trails llama.cpp.** Their layer pipeline carries here; ours is sequential. Open work, but at 9B the single-GPU run is already faster than either dual-GPU result.
+- **Generation throughput: qengine wins by ~30–50%** on both 9B and 27B. This is what users feel as the chat being responsive.
 
 ## Things qengine does that llama.cpp doesn't (or differs)
 
@@ -194,6 +195,7 @@ curl http://localhost:8000/v1/chat/completions \
 | `BIT_EXACT_GEMM_ON` | `0` | Use the strict column-wise GEMV reduction path instead of the GEMM tile (regression / bit-exact testing, ~2.4× slower prefill). |
 | `FA_BM` | `32` | FA tile width. `64` halves K/V tile-load iterations (96 KB SMEM opt-in). Marginal on the prompts we measured. |
 | `FA_NT` | `1` | Per-block t_idx count. `2` shares K/V tile across 2 query rows; currently 14% slower at long context (kept as infra). |
+| `FA_SK` | `4` | FA split-K factor at sub_seq_total ≥ 4 K. Spreads each (kv_head, t_idx) across N blocks (default 4) merged via log-sum-exp; lifts long-prompt prefill ~1.46× on 9B and ~1.34× on 27B. `0` to opt out. fp32 partials keep argmax bit-stable with the base FA path. |
 | `QWEN_SLOTS` | `1` | Concurrent slots (continuous batching). Set via `--slots` too. |
 | `QWEN_MAX_QUEUE` | `64` | Max queued requests; `0` = unbounded. |
 | `MTP_ACCEPT_TOP2` | `0` | MTP K=2 top-2 verify (small accept rate gain). |
@@ -233,7 +235,7 @@ Layer split (4-GPU 27B example): GPU 0 holds layers 0–15 + token embeddings; G
 - **sm_70 specific tuning.** Should run on sm_75; sm_80+ has better engines anyway.
 - **Single-host.** No tensor parallelism across machines, no multi-node.
 - **Linux only.**
-- **Long-context (≥ 18 K tokens) and multi-GPU prefill still trail `llama.cpp`** — ~0.83× on 9B 1× GPU @ 18 K, ~0.48× on 9B 2× GPU @ 18 K. Their MMQ path and especially their dual-GPU pipeline carry here. Likely paths to close the gap: K/V-sharing FA scoring (the `FA_NT=2` opt-in is a first stab — currently 14% slower at long context, kept as infra for a follow-up); fused QKV; pipelined activation transfer between GPUs to replace today's blocking pinned-host bridge. PRs welcome.
+- **9B dual-GPU 18 K prefill still trails `llama.cpp`** (~0.48× pre-split-K). Their layer pipeline overlaps activation transfer with compute; ours is sequential. Single-GPU 9B is already faster than either dual-GPU run, so this matters mostly as a multi-GPU correctness benchmark, not a perf path users hit. 27B 3-GPU 18 K is at parity now; closing the 9B 2-GPU gap means pipelining the pinned-host activation bridge. PRs welcome.
 - **Continuous batching with system-prompt-less requests can stop after 1 token** on Qwopus distill models — known issue with empty-system-prompt EOS bias under batched gen. Set `--default-system-prompt`.
 
 ## Status
