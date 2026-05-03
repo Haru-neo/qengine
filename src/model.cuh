@@ -796,6 +796,24 @@ struct QwenModel {
     struct FP16DecCache { half* k = nullptr; half* v = nullptr; };
     std::unordered_map<int, FP16DecCache> fp16_dec_caches;
     bool fp16_dec_cache_on = false;
+    // ============ Q8_0 KV cache (Q8KV=1) ============
+    // Alternative to the TurboQuant path for hardware that can't run the
+    // cooperative TQ3 decode (Walsh-Hadamard + cross-warp shuffle) at
+    // tensor-core speed (CMP / sm_70). Each block_q8_0_aligned holds 32
+    // int8 + uint16 pad + half scale = 36 B / 32 elem (≈ 1.125 B / elem,
+    // 2.6× the TQ footprint, half of fp16). Decode is a single int8 ×
+    // fp16-scale multiply per element — no shuffle, no centroid lookup —
+    // which keeps long-context gen close to HBM-bound.
+    //
+    // Layout: per attn layer per GPU, block_q8_0_aligned[kv_total_seq * bpt],
+    // bpt = kv_dim / 32. At kv_dim = 1024 we have 32 blocks/token.
+    struct Q8KVCache {
+        block_q8_0_aligned* k = nullptr;
+        block_q8_0_aligned* v = nullptr;
+        int blocks_per_token = 0;
+    };
+    std::unordered_map<int, Q8KVCache> q8_kv_caches;
+    bool use_q8_kv = false;
 
     void init_kv_cache(int slot_max_seq_arg, int num_slots_arg = 1) {
         slot_max_seq = slot_max_seq_arg;
@@ -807,6 +825,42 @@ struct QwenModel {
         int kv_dim = num_kv * hd;
         int kv_size = kv_total_seq * kv_dim * sizeof(half);
         use_turboquant = (getenv("MTP_TQ") != nullptr);
+        use_q8_kv      = (getenv("Q8KV")    != nullptr);
+        if (use_turboquant && use_q8_kv) {
+            fprintf(stderr, "[KV] both MTP_TQ and Q8KV set — ignoring Q8KV (TQ wins)\n");
+            use_q8_kv = false;
+        }
+
+        if (use_q8_kv) {
+            // Q8_0 KV: 36 B / 32 elem aligned blocks. bpt = kv_dim / 32.
+            int bpt = kv_dim / 32;
+            size_t per_layer_bytes = (size_t)kv_total_seq * bpt * sizeof(block_q8_0_aligned);
+            for (int layer = 0; layer < cfg.num_layers; layer++) {
+                if (!is_attn_layer(layer)) continue;
+                int g = gpu->layer_gpu[layer];
+                cudaSetDevice(g);
+                Q8KVCache kv;
+                kv.blocks_per_token = bpt;
+                cudaMalloc(&kv.k, per_layer_bytes);
+                cudaMalloc(&kv.v, per_layer_bytes);
+                cudaMemset(kv.k, 0, per_layer_bytes);
+                cudaMemset(kv.v, 0, per_layer_bytes);
+                q8_kv_caches[layer] = kv;
+            }
+            // Per-GPU fp16 dequant scratch (same role as the TQ chunked path's
+            // tq_k_buf / tq_v_buf — Q8 chunked attn and the per-token n2/n3
+            // paths bulk-dequant into this buffer before running fp16 kernels).
+            for (int g = 0; g < gpu->num_gpus; g++) {
+                cudaSetDevice(g);
+                cudaMalloc(&tq_k_buf[g], (size_t)kv_total_seq * kv_dim * sizeof(half));
+                cudaMalloc(&tq_v_buf[g], (size_t)kv_total_seq * kv_dim * sizeof(half));
+            }
+            float total_mb = (float)q8_kv_caches.size() * per_layer_bytes * 2 / 1e6;
+            float fp16_mb  = (float)q8_kv_caches.size() * kv_size * 2 / 1e6;
+            printf("KV cache (Q8_0): %d layers, slot_max_seq=%d × %d slots = %d total, %.1f MB (vs %.1f MB fp16, %.2fx compression)\n",
+                (int)q8_kv_caches.size(), slot_max_seq, num_slots, kv_total_seq, total_mb, fp16_mb, fp16_mb / total_mb);
+            return;
+        }
 
         if (use_turboquant) {
             // 3-bit TurboQuant cache. blocks_per_token = kv_dim / 128.
@@ -884,6 +938,17 @@ struct QwenModel {
         int num_kv = cfg.num_kv_heads;
         int hd = cfg.head_dim;
         int kv_dim = num_kv * hd;
+        if (use_q8_kv) {
+            int bpt = kv_dim / 32;
+            size_t sz = (size_t)kv_total_seq * bpt * sizeof(block_q8_0_aligned);
+            for (auto& [layer, kv] : q8_kv_caches) {
+                int g = gpu->layer_gpu[layer];
+                cudaSetDevice(g);
+                cudaMemset(kv.k, 0, sz);
+                cudaMemset(kv.v, 0, sz);
+            }
+            return;
+        }
         if (use_turboquant) {
             int bpt = kv_dim / TQ_BLOCK_SIZE;
             size_t sz = (size_t)kv_total_seq * bpt * sizeof(block_tq3);
@@ -918,6 +983,18 @@ struct QwenModel {
         if (slot < 0 || slot >= num_slots) return;
         int num_kv = cfg.num_kv_heads, hd = cfg.head_dim;
         int kv_dim = num_kv * hd;
+        if (use_q8_kv) {
+            int bpt = kv_dim / 32;
+            size_t per_slot = (size_t)slot_max_seq * bpt * sizeof(block_q8_0_aligned);
+            size_t off      = (size_t)slot * slot_max_seq * bpt;
+            for (auto& [layer, kv] : q8_kv_caches) {
+                int g = gpu->layer_gpu[layer];
+                cudaSetDevice(g);
+                cudaMemset(kv.k + off, 0, per_slot);
+                cudaMemset(kv.v + off, 0, per_slot);
+            }
+            return;
+        }
         if (use_turboquant) {
             int bpt = kv_dim / TQ_BLOCK_SIZE;
             size_t per_slot = (size_t)slot_max_seq * bpt * sizeof(block_tq3);
@@ -1002,7 +1079,8 @@ struct QwenModel {
         // drift to a specific sub-step.
         static const int attn_dump_layer = []{ const char* e=getenv("ATTN_DUMP_LAYER"); return e?atoi(e):-1; }();
         static const int attn_dump_pos   = []{ const char* e=getenv("ATTN_DUMP_POS");   return e?atoi(e):-1; }();
-        bool attn_do_dump = (attn_dump_layer == layer) && (attn_dump_pos == pos);
+        // POS < 0 → dump every call for the matching layer.
+        bool attn_do_dump = (attn_dump_layer == layer) && (attn_dump_pos < 0 || attn_dump_pos == pos);
         auto attn_dump_h = [&](const char* tag, const half* buf, int n=256) {
             if (!attn_do_dump) return;
             cudaSetDevice(g); cudaDeviceSynchronize();
@@ -1118,7 +1196,14 @@ struct QwenModel {
         if (g_profile_attn) { g_pt_qkvr_ms += pt_sync_ms(pt_t0); pt_t0 = pt_now(); }
 
         // 6. Store K, V at slot_offset + kv_slot (may differ from RoPE pos in tree mode)
-        if (use_turboquant) {
+        if (use_q8_kv) {
+            auto& q8 = q8_kv_caches[layer];
+            int bpt = q8.blocks_per_token;
+            size_t slot_off_blocks = (size_t)slot * slot_max_seq * bpt;
+            size_t off = slot_off_blocks + (size_t)kv_slot * bpt;
+            quantize_kv_q8_0_kern<<<bpt, 32, 0, stream>>>(ab.k_proj, q8.k + off, bpt);
+            quantize_kv_q8_0_kern<<<bpt, 32, 0, stream>>>(ab.v_proj, q8.v + off, bpt);
+        } else if (use_turboquant) {
             auto& tq = tq_kv_caches[layer];
             int bpt = tq.blocks_per_token;
             size_t slot_off_blocks = (size_t)slot * slot_max_seq * bpt;
@@ -1217,7 +1302,41 @@ struct QwenModel {
             // the chunked-prefill fp16-directly path the model attended over
             // during prefill, so the draft head's predictions stop matching
             // as well). Cooperative wins overall.
-            if (use_turboquant && !fp16_dec_cache_on) {
+            if (use_q8_kv) {
+                auto& q8 = q8_kv_caches[layer];
+                int slot_off_blocks_int = slot * slot_max_seq * q8.blocks_per_token;
+                block_q8_0_aligned* k_q8_slot = q8.k + slot_off_blocks_int;
+                block_q8_0_aligned* v_q8_slot = q8.v + slot_off_blocks_int;
+                if (num_q == 24) {
+                    constexpr int GQA = 6;
+                    dim3 fg(num_kv, 1, K_SPLITS_PT);
+                    flash_attn_chunk_fused_split_q8<HD, GQA, BM, BLOCK, K_SPLITS_PT>
+                        <<<fg, BLOCK, smem_bytes_24, stream>>>(
+                            q_buf, k_q8_slot, v_q8_slot,
+                            ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
+                            num_q, num_kv, kv_slot, /*sub_n=*/1, ATTN_NB,
+                            active_end_max, scale);
+                    dim3 mg(num_kv, 1);
+                    flash_attn_split_merge<HD, GQA, BLOCK, K_SPLITS_PT>
+                        <<<mg, BLOCK, 0, stream>>>(
+                            ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
+                            q_buf, num_q, /*sub_n=*/1, ATTN_NB);
+                } else {
+                    constexpr int GQA = 4;
+                    dim3 fg(num_kv, 1, K_SPLITS_PT);
+                    flash_attn_chunk_fused_split_q8<HD, GQA, BM, BLOCK, K_SPLITS_PT>
+                        <<<fg, BLOCK, smem_bytes_16, stream>>>(
+                            q_buf, k_q8_slot, v_q8_slot,
+                            ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
+                            num_q, num_kv, kv_slot, /*sub_n=*/1, ATTN_NB,
+                            active_end_max, scale);
+                    dim3 mg(num_kv, 1);
+                    flash_attn_split_merge<HD, GQA, BLOCK, K_SPLITS_PT>
+                        <<<mg, BLOCK, 0, stream>>>(
+                            ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
+                            q_buf, num_q, /*sub_n=*/1, ATTN_NB);
+                }
+            } else if (use_turboquant && !fp16_dec_cache_on) {
                 auto& tq = tq_kv_caches[layer];
                 int slot_off_blocks_int = slot * slot_max_seq * tq.blocks_per_token;
                 block_tq3* tq_k_slot = tq.k + slot_off_blocks_int;
@@ -1300,11 +1419,37 @@ struct QwenModel {
         } else {
             dim3 score_grid(num_q, seq_len);
             static const bool tq_fused = getenv("TQ_FUSED") != nullptr;
-            if (use_turboquant) {
+            // Q8 path: bulk-dequant K/V into the per-GPU fp16 scratch and
+            // run the standard attn_score_kernel_h / attn_value_kernel_h.
+            // (kv_slot < 4096, so the long-context fused-split path the gen
+            // loop uses is gated off — we still need Q8 to feed something
+            // here.) tq_k_buf / tq_v_buf are shared with the chunked-prefill
+            // dequant scratch, so this overwrites whatever was there but
+            // the chunk loop has already finished by the time we land here.
+            half* k_src_q8 = nullptr;
+            half* v_src_q8 = nullptr;
+            if (use_q8_kv) {
+                auto& q8 = q8_kv_caches[layer];
+                int bpt = q8.blocks_per_token;
+                int n_blocks_total = seq_len * bpt;
+                size_t slot_off_blocks = (size_t)slot * slot_max_seq * bpt;
+                dim3 dq_grid((n_blocks_total + 7) / 8);
+                dim3 dq_block(32, 8);
+                dequantize_kv_q8_0_kern<<<dq_grid, dq_block, 0, stream>>>(
+                    q8.k + slot_off_blocks, tq_k_buf[g] + slot_kv_off, n_blocks_total);
+                dequantize_kv_q8_0_kern<<<dq_grid, dq_block, 0, stream>>>(
+                    q8.v + slot_off_blocks, tq_v_buf[g] + slot_kv_off, n_blocks_total);
+                k_src_q8 = tq_k_buf[g] + slot_kv_off;
+                v_src_q8 = tq_v_buf[g] + slot_kv_off;
+            }
+            if (use_q8_kv) {
+                attn_score_kernel_h<<<score_grid, min(hd, 256), 0, stream>>>(
+                    q_buf, k_src_q8, ab.attn_scores,
+                    num_q, num_kv, hd, seq_len, scale);
+            } else if (use_turboquant) {
                 auto& tq = tq_kv_caches[layer];
                 int slot_off_blocks_int = slot * slot_max_seq * tq.blocks_per_token;
                 block_tq3* tq_k_slot = tq.k + slot_off_blocks_int;
-                block_tq3* tq_v_slot = tq.v + slot_off_blocks_int;
                 if (tq_fused) {
                     dim3 tq_score_grid(num_kv, seq_len);
                     int smem_bytes = hd * sizeof(float);
@@ -1340,7 +1485,11 @@ struct QwenModel {
                 ab.attn_scores, num_q, seq_len); }
             attn_dump_f("softmax", ab.attn_scores, seq_len);
 
-            if (use_turboquant) {
+            if (use_q8_kv) {
+                attn_value_kernel_h<<<num_q, min(hd, 256), 0, stream>>>(
+                    ab.attn_scores, v_src_q8, q_buf,
+                    num_q, num_kv, hd, seq_len);
+            } else if (use_turboquant) {
                 auto& tq = tq_kv_caches[layer];
                 int slot_off_blocks_int = slot * slot_max_seq * tq.blocks_per_token;
                 block_tq3* tq_v_slot = tq.v + slot_off_blocks_int;
@@ -2691,7 +2840,13 @@ struct QwenModel {
         // For multi-slot: each pointer is offset to the slot's KV virtual
         // partition. Downstream chunked attn kernels read [0, sub_seq_total)
         // through this base, naturally seeing only the slot's tokens.
-        if (use_turboquant) {
+        if (use_q8_kv) {
+            // Q8_0 chunked path mirrors the TQ chunked path: history is bulk
+            // dequanted into the per-GPU fp16 scratch and the chunked attn
+            // kernels read fp16 from there.
+            k_cache_ptr = tq_k_buf[g] + slot_kv_off;
+            v_cache_ptr = tq_v_buf[g] + slot_kv_off;
+        } else if (use_turboquant) {
             k_cache_ptr = tq_k_buf[g] + slot_kv_off;
             v_cache_ptr = tq_v_buf[g] + slot_kv_off;
         } else {
@@ -2761,7 +2916,33 @@ struct QwenModel {
         // previous per-token O(seq²) fallback.
         {
             size_t new_bytes = (size_t)n_tokens * kv_dim * sizeof(half);
-            if (use_turboquant) {
+            if (use_q8_kv) {
+                auto& q8 = q8_kv_caches[layer];
+                int bpt = q8.blocks_per_token;
+                int new_blocks = n_tokens * bpt;
+                size_t slot_blk_off = (size_t)slot * slot_max_seq * bpt;
+                block_q8_0_aligned* q8_k_slot = q8.k + slot_blk_off;
+                block_q8_0_aligned* q8_v_slot = q8.v + slot_blk_off;
+                quantize_kv_q8_0_kern<<<new_blocks, 32, 0, stream>>>(
+                    ab.attn_chunk_k, &q8_k_slot[(size_t)start_pos * bpt], new_blocks);
+                quantize_kv_q8_0_kern<<<new_blocks, 32, 0, stream>>>(
+                    ab.attn_chunk_v, &q8_v_slot[(size_t)start_pos * bpt], new_blocks);
+                if (start_pos > 0) {
+                    int hist_blocks = start_pos * bpt;
+                    dim3 dq_grid((hist_blocks + 7) / 8);
+                    dim3 dq_block(32, 8);
+                    dequantize_kv_q8_0_kern<<<dq_grid, dq_block, 0, stream>>>(
+                        q8_k_slot, tq_k_buf[g] + slot_kv_off, hist_blocks);
+                    dequantize_kv_q8_0_kern<<<dq_grid, dq_block, 0, stream>>>(
+                        q8_v_slot, tq_v_buf[g] + slot_kv_off, hist_blocks);
+                }
+                cudaMemcpyAsync(tq_k_buf[g] + slot_kv_off + (size_t)start_pos * kv_dim,
+                                ab.attn_chunk_k, new_bytes,
+                                cudaMemcpyDeviceToDevice, stream);
+                cudaMemcpyAsync(tq_v_buf[g] + slot_kv_off + (size_t)start_pos * kv_dim,
+                                ab.attn_chunk_v, new_bytes,
+                                cudaMemcpyDeviceToDevice, stream);
+            } else if (use_turboquant) {
                 auto& tq = tq_kv_caches[layer];
                 int bpt = tq.blocks_per_token;
                 int new_blocks = n_tokens * bpt;
@@ -3416,7 +3597,14 @@ struct QwenModel {
                 q_buf, sin_pos, cos_pos, num_q, hd, rope_dim);
             apply_rope_kernel<<<(num_kv * half_rope + 255)/256, 256, 0, stream>>>(
                 ab.k_proj, sin_pos, cos_pos, num_kv, hd, rope_dim);
-            if (use_turboquant) {
+            if (use_q8_kv) {
+                auto& q8 = q8_kv_caches[layer];
+                int bpt = q8.blocks_per_token;
+                size_t slot_blk_off = (size_t)slot * slot_max_seq * bpt;
+                size_t off = slot_blk_off + (size_t)pos * bpt;
+                quantize_kv_q8_0_kern<<<bpt, 32, 0, stream>>>(ab.k_proj, q8.k + off, bpt);
+                quantize_kv_q8_0_kern<<<bpt, 32, 0, stream>>>(ab.v_proj, q8.v + off, bpt);
+            } else if (use_turboquant) {
                 auto& tq = tq_kv_caches[layer];
                 int bpt = tq.blocks_per_token;
                 size_t slot_blk_off = (size_t)slot * slot_max_seq * bpt;
@@ -3442,10 +3630,24 @@ struct QwenModel {
             int seq_len = pos + 1;
             dim3 score_grid(num_q, seq_len);
             static const bool tq_fused = getenv("TQ_FUSED") != nullptr;
-            // Pick fp16 source: legacy fp16 KV, or TQ fp16 mirror, or TQ scratch.
+            // Pick fp16 source: legacy fp16 KV, fp16 mirror, or Q8 bulk-dequant
+            // into the per-GPU scratch (re-used from the TQ chunked path).
             half* k_src_fp16 = nullptr;
             half* v_src_fp16 = nullptr;
-            if (!use_turboquant) {
+            if (use_q8_kv) {
+                auto& q8 = q8_kv_caches[layer];
+                int bpt = q8.blocks_per_token;
+                int n_blocks_total = seq_len * bpt;
+                size_t slot_off_blocks = (size_t)slot * slot_max_seq * bpt;
+                dim3 dq_grid((n_blocks_total + 7) / 8);
+                dim3 dq_block(32, 8);
+                dequantize_kv_q8_0_kern<<<dq_grid, dq_block, 0, stream>>>(
+                    q8.k + slot_off_blocks, tq_k_buf[g] + slot_kv_off, n_blocks_total);
+                dequantize_kv_q8_0_kern<<<dq_grid, dq_block, 0, stream>>>(
+                    q8.v + slot_off_blocks, tq_v_buf[g] + slot_kv_off, n_blocks_total);
+                k_src_fp16 = tq_k_buf[g] + slot_kv_off;
+                v_src_fp16 = tq_v_buf[g] + slot_kv_off;
+            } else if (!use_turboquant) {
                 auto& kv = kv_caches[layer];
                 k_src_fp16 = kv.k + slot_kv_off;
                 v_src_fp16 = kv.v + slot_kv_off;
@@ -3454,7 +3656,7 @@ struct QwenModel {
                 k_src_fp16 = fc.k + slot_kv_off;
                 v_src_fp16 = fc.v + slot_kv_off;
             }
-            if (use_turboquant && !fp16_dec_cache_on) {
+            if (use_turboquant && !fp16_dec_cache_on && !use_q8_kv) {
                 auto& tq = tq_kv_caches[layer];
                 int slot_off_blocks_int = slot * slot_max_seq * tq.blocks_per_token;
                 block_tq3* tq_k_slot = tq.k + slot_off_blocks_int;
@@ -3478,7 +3680,7 @@ struct QwenModel {
             { int st = 1; while(st < seq_len && st < 256) st <<= 1;
             softmax_kernel<<<num_q, st, st * sizeof(float), stream>>>(
                 ab.attn_scores, num_q, seq_len); }
-            if (use_turboquant && !fp16_dec_cache_on) {
+            if (use_turboquant && !fp16_dec_cache_on && !use_q8_kv) {
                 auto& tq = tq_kv_caches[layer];
                 int slot_off_blocks_int = slot * slot_max_seq * tq.blocks_per_token;
                 block_tq3* tq_v_slot = tq.v + slot_off_blocks_int;
@@ -3720,7 +3922,14 @@ struct QwenModel {
                 q_buf, sin_pos, cos_pos, num_q, hd, rope_dim);
             apply_rope_kernel<<<(num_kv * half_rope + 255)/256, 256, 0, stream>>>(
                 ab.k_proj, sin_pos, cos_pos, num_kv, hd, rope_dim);
-            if (use_turboquant) {
+            if (use_q8_kv) {
+                auto& q8 = q8_kv_caches[layer];
+                int bpt = q8.blocks_per_token;
+                size_t slot_blk_off = (size_t)slot * slot_max_seq * bpt;
+                size_t off = slot_blk_off + (size_t)pos * bpt;
+                quantize_kv_q8_0_kern<<<bpt, 32, 0, stream>>>(ab.k_proj, q8.k + off, bpt);
+                quantize_kv_q8_0_kern<<<bpt, 32, 0, stream>>>(ab.v_proj, q8.v + off, bpt);
+            } else if (use_turboquant) {
                 auto& tq = tq_kv_caches[layer];
                 int bpt = tq.blocks_per_token;
                 size_t slot_blk_off = (size_t)slot * slot_max_seq * bpt;
@@ -3748,7 +3957,20 @@ struct QwenModel {
             static const bool tq_fused = getenv("TQ_FUSED") != nullptr;
             half* k_src_fp16 = nullptr;
             half* v_src_fp16 = nullptr;
-            if (!use_turboquant) {
+            if (use_q8_kv) {
+                auto& q8 = q8_kv_caches[layer];
+                int bpt = q8.blocks_per_token;
+                int n_blocks_total = seq_len * bpt;
+                size_t slot_off_blocks = (size_t)slot * slot_max_seq * bpt;
+                dim3 dq_grid((n_blocks_total + 7) / 8);
+                dim3 dq_block(32, 8);
+                dequantize_kv_q8_0_kern<<<dq_grid, dq_block, 0, stream>>>(
+                    q8.k + slot_off_blocks, tq_k_buf[g] + slot_kv_off, n_blocks_total);
+                dequantize_kv_q8_0_kern<<<dq_grid, dq_block, 0, stream>>>(
+                    q8.v + slot_off_blocks, tq_v_buf[g] + slot_kv_off, n_blocks_total);
+                k_src_fp16 = tq_k_buf[g] + slot_kv_off;
+                v_src_fp16 = tq_v_buf[g] + slot_kv_off;
+            } else if (!use_turboquant) {
                 auto& kv = kv_caches[layer];
                 k_src_fp16 = kv.k + slot_kv_off;
                 v_src_fp16 = kv.v + slot_kv_off;
@@ -3757,7 +3979,7 @@ struct QwenModel {
                 k_src_fp16 = fc.k + slot_kv_off;
                 v_src_fp16 = fc.v + slot_kv_off;
             }
-            if (use_turboquant && !fp16_dec_cache_on) {
+            if (use_turboquant && !fp16_dec_cache_on && !use_q8_kv) {
                 auto& tq = tq_kv_caches[layer];
                 int slot_off_blocks_int = slot * slot_max_seq * tq.blocks_per_token;
                 block_tq3* tq_k_slot = tq.k + slot_off_blocks_int;
@@ -3781,7 +4003,7 @@ struct QwenModel {
             { int st = 1; while(st < seq_len && st < 256) st <<= 1;
               softmax_kernel<<<num_q, st, st * sizeof(float), stream>>>(
                   ab.attn_scores, num_q, seq_len); }
-            if (use_turboquant && !fp16_dec_cache_on) {
+            if (use_turboquant && !fp16_dec_cache_on && !use_q8_kv) {
                 auto& tq = tq_kv_caches[layer];
                 int slot_off_blocks_int = slot * slot_max_seq * tq.blocks_per_token;
                 block_tq3* tq_v_slot = tq.v + slot_off_blocks_int;
