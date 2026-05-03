@@ -63,10 +63,10 @@ All measurements on a CMP 100-210 host, same `Q8_0` GGUFs (Qwopus3.5-9B-v3.5, Qw
 
 | Prompt | qengine PP t/s | llama.cpp PP t/s | qengine TG t/s | llama.cpp TG t/s |
 |---:|---:|---:|---:|---:|
-| 297 | **594** | 188 | 68.5 | — |
-| 1.16 K | **968** | 412 | — | — |
-| 4.62 K | **982** | 574 | — | — |
-| 18.4 K | **720** | 545 | 27.0 | — |
+| 297 | **594** | 188 | 68.4 | — |
+| 1.16 K | **968** | 412 | 66.7 | — |
+| 4.62 K | **982** | 574 | 50.8 | — |
+| 18.4 K | **720** | 545 | 26.4 | — |
 | tg64 | — | — | — | 44.2 |
 
 Cross-GPU prefill pipelining lands 2026-05-03 (default on; `PREFILL_NO_PIPELINE=1` to opt out): per-GPU compute / D2H / H2D streams + double-buffered host transfer + double-buffered per-GPU hidden chunks overlap chunk i's cross-GPU activation transfer with chunk i+1's downstream compute. 9B dual-GPU 18 K jumps from 259 → **720 t/s (2.78×)** and now wins llama.cpp at every length (1.32× even at 18 K). Sampled tokens are bit-equivalent to the sequential path — verified against the per-token greedy argmax up to 18 K.
@@ -190,7 +190,7 @@ curl http://localhost:8000/v1/chat/completions \
 
 | Var | Default | Effect |
 |---|---|---|
-| `MTP_TQ` | `0` | 3-bit KV cache (WHT + Lloyd-Max). Required for 27B at 256 K. |
+| `MTP_TQ` | `0` | 3-bit KV cache (WHT + Lloyd-Max). Required for 27B at 256 K. Tradeoff: gen TG drops at long context (18 K: 11.4 → 7.6 t/s on 27B 3-GPU) because per-token attention pays the dequant cost. Set when you need >32 K context; leave off for fastest gen at smaller windows. |
 | `FLASH_ATTN` | `1` | FA fused score+softmax+value. `0` falls back to the strict block-per-score path (bit-exact with per-token, ~2× slower prefill). |
 | `BIT_EXACT_GEMM_ON` | `0` | Use the strict column-wise GEMV reduction path instead of the GEMM tile (regression / bit-exact testing, ~2.4× slower prefill). |
 | `FA_BM` | `32` | FA tile width. `64` halves K/V tile-load iterations (96 KB SMEM opt-in). Marginal on the prompts we measured. |
