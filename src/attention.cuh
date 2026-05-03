@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cmath>
 #include "turboquant.cuh"
+#include "quant_gemv.cuh"  // block_q8_0_aligned
 
 // Device-side phase counters for flash_attn_chunk_fused_split_tq3.
 // Indexed: 0=decode, 1=score, 2=softmax, 3=value, 4=tile_count.
@@ -1899,6 +1900,225 @@ __global__ void flash_attn_chunk_fused_split_tq3(
     }
 
     // Write partial outputs (identical to base split kernel).
+    if (warp < GQA) {
+        int g = warp;
+        int q_head = kv_head * GQA + g;
+        size_t ml_idx = ((size_t)q_head * sub_n_max + t_idx) * K_SPLITS + split_idx;
+        if (lane == 0) {
+            part_m[ml_idx] = m_w;
+            part_l[ml_idx] = l_w;
+        }
+        size_t o_base = (((size_t)q_head * sub_n_max + t_idx) * K_SPLITS + split_idx) * HD;
+        #pragma unroll
+        for (int i = 0; i < LANE_D; i++) {
+            int c = lane * LANE_D + i;
+            part_o[o_base + c] = acc_o[i];
+        }
+    }
+}
+
+// ===========================================================
+// Q8_0 KV cache quantize / decode helpers
+// ===========================================================
+
+// One thread block per Q8_0 block (32 elements). 32 threads per block.
+// in[n_blocks * 32] (fp16) → out[n_blocks] (block_q8_0_aligned).
+__global__ void quantize_kv_q8_0_kern(
+    const half*               __restrict__ in,
+    block_q8_0_aligned*       __restrict__ out,
+    int n_blocks)
+{
+    int b = blockIdx.x;
+    if (b >= n_blocks) return;
+    int lane = threadIdx.x;
+
+    float v = __half2float(in[(size_t)b * 32 + lane]);
+    float amax = fabsf(v);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+
+    float scale = amax / 127.0f;
+    float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+    int q = __float2int_rn(v * inv_scale);
+    if (q >  127) q =  127;
+    if (q < -128) q = -128;
+    out[b].qs[lane] = (int8_t)q;
+    if (lane == 0) out[b].d = __float2half(scale);
+}
+
+// Bulk dequant: block_q8_0_aligned[n_blocks] → fp16[n_blocks * 32]. Same
+// shape contract as `tq3_dequantize_kernel` so the chunked-prefill path
+// can drop in a Q8 variant identically.
+__global__ void dequantize_kv_q8_0_kern(
+    const block_q8_0_aligned* __restrict__ in,
+    half*                     __restrict__ out,
+    int n_blocks)
+{
+    int b = blockIdx.x * blockDim.y + threadIdx.y;
+    if (b >= n_blocks) return;
+    int lane = threadIdx.x;
+    const block_q8_0_aligned* blk = in + b;
+    float s = __half2float(blk->d);
+    int8_t q = blk->qs[lane];
+    out[(size_t)b * 32 + lane] = __float2half((float)q * s);
+}
+
+// Same shape contract as flash_attn_chunk_fused_split_tq3 but reads from
+// block_q8_0_aligned. Cooperative decode is trivial: 1 warp per 32-element
+// Q8 block, 1 element per thread, single int8 × fp16-scale multiply. No
+// Walsh-Hadamard, no centroid lookup — score / softmax / value bodies are
+// untouched.
+template<int HD, int GQA, int BM, int BLOCK, int K_SPLITS>
+__global__ void flash_attn_chunk_fused_split_q8(
+    const half*               __restrict__ q_chunk,
+    const block_q8_0_aligned* __restrict__ k_q8,
+    const block_q8_0_aligned* __restrict__ v_q8,
+    float*                    __restrict__ part_m,
+    float*                    __restrict__ part_l,
+    float*                    __restrict__ part_o,
+    int num_q, int num_kv,
+    int start_pos, int sub_n, int sub_n_max,
+    int active_end_max, float scale)
+{
+    constexpr int Q8_BLK          = 32;
+    constexpr int N_WARPS         = BLOCK / 32;
+    constexpr int LANE_D          = HD / 32;
+    constexpr int BLOCKS_PER_KV   = HD / Q8_BLK;            // 8 for HD=256
+    constexpr int K_DEC_BLOCKS    = BM * BLOCKS_PER_KV;     // 256 for BM=32
+    constexpr int TOTAL_DEC_BLOCKS = 2 * K_DEC_BLOCKS;       // K + V (= 512)
+
+    int kv_head    = blockIdx.x;
+    int t_idx      = blockIdx.y;
+    int split_idx  = blockIdx.z;
+    if (t_idx >= sub_n) return;
+    int abs_pos       = start_pos + t_idx;
+    int active_end_t  = abs_pos + 1;
+    int tid  = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+
+    int total_tiles     = (active_end_max + BM - 1) / BM;
+    int tiles_per_split = (total_tiles + K_SPLITS - 1) / K_SPLITS;
+    int tile_lo         = split_idx * tiles_per_split * BM;
+    int tile_hi         = min((split_idx + 1) * tiles_per_split * BM, active_end_t);
+
+    extern __shared__ unsigned char smem_fa_split_q8[];
+    half*  q_s    = (half*)smem_fa_split_q8;
+    half*  k_tile = q_s    + GQA * HD;
+    half*  v_tile = k_tile + BM  * HD;
+    float* s_smem = (float*)(v_tile + BM * HD);
+
+    #pragma unroll
+    for (int i = tid; i < GQA * HD; i += BLOCK) {
+        int g = i / HD;
+        int c = i - g * HD;
+        int q_head = kv_head * GQA + g;
+        q_s[g * HD + c] = q_chunk[(size_t)t_idx * num_q * HD
+                                  + (size_t)q_head * HD + c];
+    }
+    __syncthreads();
+
+    float acc_o[LANE_D];
+    #pragma unroll
+    for (int i = 0; i < LANE_D; i++) acc_o[i] = 0.0f;
+    float m_w = -INFINITY;
+    float l_w = 0.0f;
+
+    if (tile_lo < tile_hi) {
+        for (int tile_start = tile_lo; tile_start < tile_hi; tile_start += BM) {
+            int tile_end = min(tile_start + BM, tile_hi);
+            int tile_len = tile_end - tile_start;
+
+            // ============ Cooperative Q8_0 decode of K + V tile ============
+            for (int blk_iter = warp; blk_iter < TOTAL_DEC_BLOCKS; blk_iter += N_WARPS) {
+                bool is_v = (blk_iter >= K_DEC_BLOCKS);
+                int b      = is_v ? (blk_iter - K_DEC_BLOCKS) : blk_iter;
+                int row    = b / BLOCKS_PER_KV;
+                int col_block = b - row * BLOCKS_PER_KV;
+                int abs_row = tile_start + row;
+                half* tile_dst = (is_v ? v_tile : k_tile)
+                               + row * HD + col_block * Q8_BLK;
+                if (abs_row >= tile_end) {
+                    tile_dst[lane] = __float2half(0.0f);
+                    continue;
+                }
+                size_t blk_idx = ((size_t)abs_row * num_kv + kv_head) * BLOCKS_PER_KV
+                               + col_block;
+                const block_q8_0_aligned* blk = (is_v ? v_q8 : k_q8) + blk_idx;
+                int8_t q = blk->qs[lane];
+                float s = __half2float(blk->d);
+                tile_dst[lane] = __float2half((float)q * s);
+            }
+            __syncthreads();
+
+            // ============ Score compute (identical to TQ kernel) ============
+            constexpr int NITERS = (GQA * BM + N_WARPS - 1) / N_WARPS;
+            #pragma unroll
+            for (int k_it = 0; k_it < NITERS; k_it++) {
+                int flat = warp + k_it * N_WARPS;
+                if (flat >= GQA * BM) break;
+                int g = flat / BM;
+                int r = flat - g * BM;
+
+                float partial = 0.0f;
+                const half2* qs2 = reinterpret_cast<const half2*>(q_s    + g * HD);
+                const half2* kt2 = reinterpret_cast<const half2*>(k_tile + r * HD);
+                #pragma unroll
+                for (int i = 0; i < LANE_D / 2; i++) {
+                    half2 qv = qs2[lane * (LANE_D / 2) + i];
+                    half2 kv = kt2[lane * (LANE_D / 2) + i];
+                    float2 qf = __half22float2(qv);
+                    float2 kf = __half22float2(kv);
+                    partial += qf.x * kf.x + qf.y * kf.y;
+                }
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    partial += __shfl_xor_sync(0xffffffff, partial, off);
+                if (lane == 0) {
+                    float val = (r < tile_len) ? partial * scale : -INFINITY;
+                    s_smem[g * BM + r] = val;
+                }
+            }
+            __syncthreads();
+
+            // ============ Softmax + value (identical to TQ kernel) ============
+            if (warp < GQA) {
+                int g = warp;
+                float s_val = s_smem[g * BM + lane];
+                float m_row = s_val;
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    m_row = fmaxf(m_row, __shfl_xor_sync(0xffffffff, m_row, off));
+                float m_new = fmaxf(m_w, m_row);
+                float correction = expf(m_w - m_new);
+                float p_lane    = expf(s_val - m_new);
+                float sum_p = p_lane;
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    sum_p += __shfl_xor_sync(0xffffffff, sum_p, off);
+                #pragma unroll
+                for (int i = 0; i < LANE_D; i++) acc_o[i] *= correction;
+                l_w = l_w * correction + sum_p;
+                #pragma unroll
+                for (int r = 0; r < BM; r++) {
+                    float p_r = __shfl_sync(0xffffffff, p_lane, r);
+                    const half2* vt = reinterpret_cast<const half2*>(
+                        v_tile + r * HD + lane * LANE_D);
+                    #pragma unroll
+                    for (int i = 0; i < LANE_D / 2; i++) {
+                        half2 vv = vt[i];
+                        float2 vf = __half22float2(vv);
+                        acc_o[i * 2]     += p_r * vf.x;
+                        acc_o[i * 2 + 1] += p_r * vf.y;
+                    }
+                }
+                m_w = m_new;
+            }
+            __syncthreads();
+        }
+    }
+
     if (warp < GQA) {
         int g = warp;
         int q_head = kv_head * GQA + g;
