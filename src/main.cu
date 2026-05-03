@@ -1252,6 +1252,8 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         g_use_flash_attn = (fa_env == nullptr) ? true : (fa_env[0] == '1');
         g_attn_score_ms = g_attn_softmax_ms = g_attn_value_ms
                        = g_attn_fused_ms  = g_attn_other_ms = 0.0;
+        g_pt_qkvr_ms = g_pt_kvwrite_ms = g_pt_attn_ms = g_pt_oproj_ms = 0.0;
+        g_pt_calls = 0;
         double t_embed = 0, t_xfer = 0, t_attn = 0, t_gdn = 0, t_mlp = 0;
         auto prof_now = [](){ return std::chrono::high_resolution_clock::now(); };
         auto prof_sync_ms = [&](std::chrono::high_resolution_clock::time_point t_beg, int dev) {
@@ -2737,6 +2739,18 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                    g_attn, 100.0*g_attn/total, g_gdn, 100.0*g_gdn/total,
                    g_mlp, 100.0*g_mlp/total, g_logits, 100.0*g_logits/total,
                    g_mtp, 100.0*g_mtp/total);
+            fflush(stdout);
+        }
+        if (g_profile_attn && g_pt_calls > 0) {
+            double pt_sub = g_pt_qkvr_ms + g_pt_kvwrite_ms + g_pt_attn_ms + g_pt_oproj_ms;
+            printf("[ATTN PT PROF] calls=%ld  sub_sum=%.1fms  "
+                   "qkvr=%.1fms(%.0f%%) kvwrite=%.1fms(%.0f%%) "
+                   "attn_compute=%.1fms(%.0f%%) oproj=%.1fms(%.0f%%)\n",
+                   g_pt_calls, pt_sub,
+                   g_pt_qkvr_ms,    pt_sub > 0 ? 100.0*g_pt_qkvr_ms/pt_sub    : 0,
+                   g_pt_kvwrite_ms, pt_sub > 0 ? 100.0*g_pt_kvwrite_ms/pt_sub : 0,
+                   g_pt_attn_ms,    pt_sub > 0 ? 100.0*g_pt_attn_ms/pt_sub    : 0,
+                   g_pt_oproj_ms,   pt_sub > 0 ? 100.0*g_pt_oproj_ms/pt_sub   : 0);
             fflush(stdout);
         }
 

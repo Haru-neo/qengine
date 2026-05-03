@@ -1658,6 +1658,240 @@ __global__ void flash_attn_split_merge(
     }
 }
 
+// ============ Split-K FA + cooperative TQ3 decode ============
+// Same algorithm as flash_attn_chunk_fused_split, but K/V tiles are read
+// directly from the TurboQuant 3-bit cache and decoded cooperatively in
+// shared memory: one warp per 128-element block, 4 elements per thread,
+// inverse-WHT via __shfl_xor (within-warp stages 3-7) + within-thread
+// butterflies (stages 1-2). This collapses the legacy "bulk dequant the
+// entire K/V history into an fp16 scratch buffer per layer per token"
+// into a per-tile decode that lives entirely in shared memory — at long
+// context this saves O(seq·hd·num_kv) of fp16 HBM traffic per token.
+//
+// HD must be a multiple of TQ_BLOCK_SIZE (= 128).  For Qwen3.5/3.6 hybrid
+// HD=256 → 2 TQ blocks per (row, kv_head) for K and same for V.
+template<int HD, int GQA, int BM, int BLOCK, int K_SPLITS>
+__global__ void flash_attn_chunk_fused_split_tq3(
+    const half*       __restrict__ q_chunk,
+    const block_tq3*  __restrict__ k_tq,
+    const block_tq3*  __restrict__ v_tq,
+    float*            __restrict__ part_m,
+    float*            __restrict__ part_l,
+    float*            __restrict__ part_o,
+    int num_q, int num_kv,
+    int start_pos, int sub_n, int sub_n_max,
+    int active_end_max, float scale
+) {
+    static_assert(HD % TQ_BLOCK_SIZE == 0, "HD must be multiple of 128");
+    constexpr int N_WARPS         = BLOCK / 32;
+    constexpr int LANE_D          = HD / 32;
+    constexpr int BLOCKS_PER_KV   = HD / TQ_BLOCK_SIZE;     // 2 for HD=256
+    constexpr int K_DEC_BLOCKS    = BM * BLOCKS_PER_KV;     // 64 for BM=32
+    constexpr int TOTAL_DEC_BLOCKS = 2 * K_DEC_BLOCKS;       // K + V
+    int kv_head    = blockIdx.x;
+    int t_idx      = blockIdx.y;
+    int split_idx  = blockIdx.z;
+    if (t_idx >= sub_n) return;
+    int abs_pos       = start_pos + t_idx;
+    int active_end_t  = abs_pos + 1;
+    int tid  = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+
+    int total_tiles     = (active_end_max + BM - 1) / BM;
+    int tiles_per_split = (total_tiles + K_SPLITS - 1) / K_SPLITS;
+    int tile_lo         = split_idx * tiles_per_split * BM;
+    int tile_hi         = min((split_idx + 1) * tiles_per_split * BM, active_end_t);
+
+    extern __shared__ unsigned char smem_fa_split_tq[];
+    half*  q_s    = (half*)smem_fa_split_tq;
+    half*  k_tile = q_s    + GQA * HD;
+    half*  v_tile = k_tile + BM  * HD;
+    float* s_smem = (float*)(v_tile + BM * HD);
+
+    // Load Q (same as base).
+    #pragma unroll
+    for (int i = tid; i < GQA * HD; i += BLOCK) {
+        int g = i / HD;
+        int c = i - g * HD;
+        int q_head = kv_head * GQA + g;
+        q_s[g * HD + c] = q_chunk[(size_t)t_idx * num_q * HD
+                                  + (size_t)q_head * HD + c];
+    }
+    __syncthreads();
+
+    float acc_o[LANE_D];
+    #pragma unroll
+    for (int i = 0; i < LANE_D; i++) acc_o[i] = 0.0f;
+    float m_w = -INFINITY;
+    float l_w = 0.0f;
+
+    if (tile_lo < tile_hi) {
+        const float wht_scale = rsqrtf((float)TQ_BLOCK_SIZE);
+        for (int tile_start = tile_lo; tile_start < tile_hi; tile_start += BM) {
+            int tile_end = min(tile_start + BM, tile_hi);
+            int tile_len = tile_end - tile_start;
+
+            // ============ Cooperative TQ3 decode of K + V tile ============
+            // 1 warp per 128-elem TQ block, 4 elements per thread.
+            for (int blk_iter = warp; blk_iter < TOTAL_DEC_BLOCKS; blk_iter += N_WARPS) {
+                bool is_v = (blk_iter >= K_DEC_BLOCKS);
+                int b      = is_v ? (blk_iter - K_DEC_BLOCKS) : blk_iter;
+                int row    = b / BLOCKS_PER_KV;
+                int col_block = b - row * BLOCKS_PER_KV;
+                int abs_row = tile_start + row;
+                half* tile_dst = (is_v ? v_tile : k_tile)
+                               + row * HD + col_block * TQ_BLOCK_SIZE;
+                if (abs_row >= tile_end) {
+                    // Out-of-range row → zero (causal mask handled by score path).
+                    #pragma unroll
+                    for (int i = 0; i < 4; i++)
+                        tile_dst[lane * 4 + i] = __float2half(0.0f);
+                    continue;
+                }
+                size_t blk_idx = ((size_t)abs_row * num_kv + kv_head) * BLOCKS_PER_KV
+                               + col_block;
+                const block_tq3* blk = (is_v ? v_tq : k_tq) + blk_idx;
+
+                // Per-thread: 4 contiguous elements (chunked layout).
+                int base_elem = lane * 4;
+                float v[4];
+
+                // 1. Unpack 3-bit indices → centroid lookup.
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    int elem        = base_elem + i;
+                    int bit_off     = elem * 3;
+                    int byte_off    = bit_off >> 3;
+                    int bit_in_byte = bit_off & 7;
+                    uint16_t two = (uint16_t)blk->qs[byte_off]
+                                 | ((uint16_t)blk->qs[byte_off + 1] << 8);
+                    uint8_t idx = (two >> bit_in_byte) & 0x7;
+                    v[i] = d_tq3_centroids[idx];
+                }
+
+                // 2. Inverse WHT — stages 1-2 within thread, 3-7 cross-thread.
+                { float a=v[0], b=v[1]; v[0]=a+b; v[1]=a-b; }
+                { float a=v[2], b=v[3]; v[2]=a+b; v[3]=a-b; }
+                { float a=v[0], b=v[2]; v[0]=a+b; v[2]=a-b; }
+                { float a=v[1], b=v[3]; v[1]=a+b; v[3]=a-b; }
+                #pragma unroll
+                for (int step = 4; step <= 64; step <<= 1) {
+                    int xor_off = step >> 2;
+                    int upper   = (lane & xor_off) ? 1 : 0;
+                    #pragma unroll
+                    for (int i = 0; i < 4; i++) {
+                        float other = __shfl_xor_sync(0xffffffff, v[i], xor_off);
+                        v[i] = upper ? (other - v[i]) : (v[i] + other);
+                    }
+                }
+
+                // 3. Normalize WHT (1/√d).
+                #pragma unroll
+                for (int i = 0; i < 4; i++) v[i] *= wht_scale;
+
+                // 4. Multiply random ±1 signs (Π^T = D · …).
+                #pragma unroll
+                for (int i = 0; i < 4; i++)
+                    v[i] *= d_tq3_signs[base_elem + i];
+
+                // 5. Re-apply norm.
+                float norm = blk->norm;
+                #pragma unroll
+                for (int i = 0; i < 4; i++) v[i] *= norm;
+
+                // 6. Write to shared-mem tile (fp16).
+                #pragma unroll
+                for (int i = 0; i < 4; i++)
+                    tile_dst[base_elem + i] = __float2half(v[i]);
+            }
+            __syncthreads();
+
+            // ============ Score compute (identical to base split kernel) ============
+            constexpr int NITERS = (GQA * BM + N_WARPS - 1) / N_WARPS;
+            #pragma unroll
+            for (int k_it = 0; k_it < NITERS; k_it++) {
+                int flat = warp + k_it * N_WARPS;
+                if (flat >= GQA * BM) break;
+                int g = flat / BM;
+                int r = flat - g * BM;
+
+                float partial = 0.0f;
+                const half2* qs2 = reinterpret_cast<const half2*>(q_s    + g * HD);
+                const half2* kt2 = reinterpret_cast<const half2*>(k_tile + r * HD);
+                #pragma unroll
+                for (int i = 0; i < LANE_D / 2; i++) {
+                    half2 qv = qs2[lane * (LANE_D / 2) + i];
+                    half2 kv = kt2[lane * (LANE_D / 2) + i];
+                    float2 qf = __half22float2(qv);
+                    float2 kf = __half22float2(kv);
+                    partial += qf.x * kf.x + qf.y * kf.y;
+                }
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    partial += __shfl_xor_sync(0xffffffff, partial, off);
+                if (lane == 0) {
+                    float val = (r < tile_len) ? partial * scale : -INFINITY;
+                    s_smem[g * BM + r] = val;
+                }
+            }
+            __syncthreads();
+
+            // Softmax + O accumulation (identical to base split kernel).
+            if (warp < GQA) {
+                int g = warp;
+                float s_val = s_smem[g * BM + lane];
+                float m_row = s_val;
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    m_row = fmaxf(m_row, __shfl_xor_sync(0xffffffff, m_row, off));
+                float m_new = fmaxf(m_w, m_row);
+                float correction = expf(m_w - m_new);
+                float p_lane    = expf(s_val - m_new);
+                float sum_p = p_lane;
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    sum_p += __shfl_xor_sync(0xffffffff, sum_p, off);
+                #pragma unroll
+                for (int i = 0; i < LANE_D; i++) acc_o[i] *= correction;
+                l_w = l_w * correction + sum_p;
+                #pragma unroll
+                for (int r = 0; r < BM; r++) {
+                    float p_r = __shfl_sync(0xffffffff, p_lane, r);
+                    const half2* vt = reinterpret_cast<const half2*>(
+                        v_tile + r * HD + lane * LANE_D);
+                    #pragma unroll
+                    for (int i = 0; i < LANE_D / 2; i++) {
+                        half2 vv = vt[i];
+                        float2 vf = __half22float2(vv);
+                        acc_o[i * 2]     += p_r * vf.x;
+                        acc_o[i * 2 + 1] += p_r * vf.y;
+                    }
+                }
+                m_w = m_new;
+            }
+            __syncthreads();
+        }
+    }
+
+    // Write partial outputs (identical to base split kernel).
+    if (warp < GQA) {
+        int g = warp;
+        int q_head = kv_head * GQA + g;
+        size_t ml_idx = ((size_t)q_head * sub_n_max + t_idx) * K_SPLITS + split_idx;
+        if (lane == 0) {
+            part_m[ml_idx] = m_w;
+            part_l[ml_idx] = l_w;
+        }
+        size_t o_base = (((size_t)q_head * sub_n_max + t_idx) * K_SPLITS + split_idx) * HD;
+        #pragma unroll
+        for (int i = 0; i < LANE_D; i++) {
+            int c = lane * LANE_D + i;
+            part_o[o_base + c] = acc_o[i];
+        }
+    }
+}
+
 // K/V-sharing FA kernel. One block processes N_T consecutive t_idx values for
 // the same kv_head, so the K/V tile is loaded ONCE per tile_start and reused
 // for all N_T softmax/O accumulators. Halves (N_T=2) or quarters (N_T=4) the
