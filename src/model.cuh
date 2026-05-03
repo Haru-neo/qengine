@@ -677,10 +677,11 @@ struct QwenModel {
         half*  attn_chunk_oproj  = nullptr;  // [CHUNK_SIZE * H] o_proj output staging
         // Split-K FA scratch (lazy-alloc when FA_SK env opts in, sized for
         // K_SPLITS_MAX=8). Layouts: [num_q, ATTN_NB, K_SPLITS_MAX] for m/l,
-        // [num_q, ATTN_NB, K_SPLITS_MAX, HD] for o.
+        // [num_q, ATTN_NB, K_SPLITS_MAX, HD] for o (fp32 to keep merge bit-stable
+        // with the base FA kernel, project_qwopus_lang_bias).
         float* attn_split_m = nullptr;
         float* attn_split_l = nullptr;
-        half*  attn_split_o = nullptr;
+        float* attn_split_o = nullptr;
     };
     AttnBuffers attn_bufs[4];
     AttnBuffers attn_bufs2[4];  // second-token attn buffers, for forward_attn_n2
@@ -2069,7 +2070,7 @@ struct QwenModel {
             constexpr int K_SPLITS_MAX = 8;
             cudaMalloc(&ab.attn_split_m, (size_t)num_q * ATTN_NB * K_SPLITS_MAX * sizeof(float));
             cudaMalloc(&ab.attn_split_l, (size_t)num_q * ATTN_NB * K_SPLITS_MAX * sizeof(float));
-            cudaMalloc(&ab.attn_split_o, (size_t)num_q * ATTN_NB * K_SPLITS_MAX * hd * sizeof(half));
+            cudaMalloc(&ab.attn_split_o, (size_t)num_q * ATTN_NB * K_SPLITS_MAX * hd * sizeof(float));
         }
 
         // 1. Batched RMSNorm
@@ -2378,7 +2379,7 @@ struct QwenModel {
             constexpr int K_SPLITS_MAX = 8;
             cudaMalloc(&ab.attn_split_m, (size_t)num_q * ATTN_NB * K_SPLITS_MAX * sizeof(float));
             cudaMalloc(&ab.attn_split_l, (size_t)num_q * ATTN_NB * K_SPLITS_MAX * sizeof(float));
-            cudaMalloc(&ab.attn_split_o, (size_t)num_q * ATTN_NB * K_SPLITS_MAX * hd * sizeof(half));
+            cudaMalloc(&ab.attn_split_o, (size_t)num_q * ATTN_NB * K_SPLITS_MAX * hd * sizeof(float));
         }
 
         // ATTN_DUMP_LAYER + ATTN_DUMP_POS dump for an arbitrary token in
@@ -2595,19 +2596,19 @@ struct QwenModel {
                     int v = e ? atoi(e) : 1;
                     return (v == 2) ? 2 : 1;
                 }();
-                // FA_SK: 0 (default) | 2 | 4 | 8 — split-K, opt-in. Each
-                // (kv_head,t_idx) maps to FA_SK blocks; partials merged via
-                // log-sum-exp. Helps long contexts (SM under-utilisation: the
-                // 64-block grid ≪ 204 SMs). Gated to sub_seq_total>=4096 below.
-                // Speedup: 9B 1GPU 18K 1.46x, 27B 3GPU 18K 1.34x (llama parity).
-                // OFF by default: merge order changes fp16 accumulation, ~31st
-                // gen token diverges at 4.6K prefill. Korean quality regressions
-                // (project_qwopus_lang_bias) are sensitive to such drift.
+                // FA_SK: 4 (default) | 0 | 2 | 8 — split-K. Each (kv_head,t_idx)
+                // maps to FA_SK blocks; partials merged via log-sum-exp. Helps
+                // long contexts (SM under-utilisation: 64-block grid ≪ 204 SMs).
+                // Gated to sub_seq_total>=4096 below — short ctx unaffected.
+                // 9B 1GPU 18K 1.46x, 27B 3GPU 18K 1.34x (llama parity).
+                // part_o stored fp32 so merge order matches base FA's fp32 noise
+                // floor — greedy argmax stable for Korean coding prompts.
+                // FA_SK=0 to opt out.
                 static const int fa_sk = []{
                     const char* e = getenv("FA_SK");
-                    if (!e) return 0;
+                    if (!e) return 4;
                     int v = atoi(e);
-                    return (v == 2 || v == 4 || v == 8) ? v : 0;
+                    return (v == 0 || v == 2 || v == 4 || v == 8) ? v : 4;
                 }();
                 constexpr int HD = 256, BLOCK = 256;
                 static bool fa_smem_set[16] = {false};

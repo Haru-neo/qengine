@@ -1433,7 +1433,13 @@ __global__ void flash_attn_chunk_fused(
 // SMEM identical to flash_attn_chunk_fused (same Q/K/V/score scratch).
 //
 // part_m, part_l: [num_q, sub_n_max, K_SPLITS]   float  (lane==0 writes)
-// part_o:         [num_q, sub_n_max, K_SPLITS, HD]   half
+// part_o:         [num_q, sub_n_max, K_SPLITS, HD]   float
+//
+// part_o is float (not half) so the merge step reads exactly the same fp32
+// accumulator the compute kernel produced — no fp16 store/reload truncation.
+// That keeps split-K within the fp32-reordering noise floor (≈1e-7 per add)
+// of the base flash_attn_chunk_fused kernel: greedy argmax matches across
+// long generations, so Korean quality stays intact (project_qwopus_lang_bias).
 template<int HD, int GQA, int BM, int BLOCK, int K_SPLITS>
 __global__ void flash_attn_chunk_fused_split(
     const half* __restrict__ q_chunk,
@@ -1441,7 +1447,7 @@ __global__ void flash_attn_chunk_fused_split(
     const half* __restrict__ v_cache,
     float*      __restrict__ part_m,
     float*      __restrict__ part_l,
-    half*       __restrict__ part_o,
+    float*      __restrict__ part_o,
     int num_q, int num_kv,
     int start_pos, int sub_n, int sub_n_max,
     int active_end_max, float scale
@@ -1587,7 +1593,7 @@ __global__ void flash_attn_chunk_fused_split(
         #pragma unroll
         for (int i = 0; i < LANE_D; i++) {
             int c = lane * LANE_D + i;
-            part_o[o_base + c] = __float2half(acc_o[i]);
+            part_o[o_base + c] = acc_o[i];
         }
     }
 }
@@ -1600,7 +1606,7 @@ template<int HD, int GQA, int BLOCK, int K_SPLITS>
 __global__ void flash_attn_split_merge(
     const float* __restrict__ part_m,
     const float* __restrict__ part_l,
-    const half*  __restrict__ part_o,
+    const float* __restrict__ part_o,
     half*        __restrict__ out_chunk,
     int num_q, int sub_n, int sub_n_max
 ) {
@@ -1636,14 +1642,10 @@ __global__ void flash_attn_split_merge(
         float w = expf(ms - m_global);
         l_global += w * ls;
         size_t o_base = (((size_t)q_head * sub_n_max + t_idx) * K_SPLITS + s) * HD;
-        const half2* o2 = reinterpret_cast<const half2*>(
-            part_o + o_base + lane * LANE_D);
+        const float* op = part_o + o_base + lane * LANE_D;
         #pragma unroll
-        for (int i = 0; i < LANE_D / 2; i++) {
-            half2 ov = o2[i];
-            float2 of = __half22float2(ov);
-            o_acc[i * 2]     += w * of.x;
-            o_acc[i * 2 + 1] += w * of.y;
+        for (int i = 0; i < LANE_D; i++) {
+            o_acc[i] += w * op[i];
         }
     }
 
