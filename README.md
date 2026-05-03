@@ -7,7 +7,7 @@
 
 > **9B single-GPU prefill is 1.5–3× llama.cpp at every length up to ~4.6 K tokens** (2026-05-02 default flip, commit `ca30368`). With **split-K FlashAttention** on by default (commit `f2e52b8`), 9B 18 K prefill jumps to **1.22× llama.cpp** and 27B 3-GPU 18 K reaches **parity (0.99×)**. Generation continues to win by +30–50%. Multi-GPU prefill at long context still trails on 9B 2-GPU (open work). See [Honest Benchmarks](#honest-benchmarks-vs-llamacpp).
 
-A custom CUDA inference engine for **Qwen3 hybrid (GDN + Attention) models**, written from scratch and tuned for NVIDIA mining cards (CMP 100-210, ex-mining V100) — 16 GB HBM2, sm_70, PCIe Gen1 x1, no P2P. Not a fork — every kernel is written for these constraints.
+A custom CUDA inference engine for **Qwen3.5 / Qwen3.6 hybrid (GDN + Attention) models**, written from scratch and tuned for NVIDIA mining cards (CMP 100-210, ex-mining V100) — 16 GB HBM2, sm_70, PCIe Gen1 x1, no P2P. Not a fork — every kernel is written for these constraints.
 
 📖 **한국어 README → [README.ko.md](README.ko.md)**
 

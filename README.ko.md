@@ -4,7 +4,7 @@
 >
 > **9B 단일 GPU prefill 이 ~4.6K tok 까지 llama.cpp 대비 1.5–3× 빨라졌습니다** (2026-05-02 default flip, 커밋 `ca30368`). **split-K FlashAttention 디폴트 ON** 이후 (커밋 `f2e52b8`) 9B 18K prefill 도 **1.22× llama.cpp**, 27B 3GPU 18K 는 **거의 평행 (0.99×)** 까지 올라왔습니다. Generation 은 여전히 +30–50% 우세합니다. 9B 듀얼 GPU long-ctx 는 아직 llama 의 layer-pipeline 에 밀립니다 (단일 GPU 가 더 빨라서 실사용 영향은 작음).
 
-NVIDIA 채굴 카드 (CMP 100-210, V100) — sm_70, HBM2 16GB, PCIe Gen1 x1, P2P 없음 — 에서 굴리려고 처음부터 새로 짠 Qwen3 hybrid (GDN + Attention) 추론 엔진입니다. fork 가 아니고, 모든 커널을 sm_70 제약 기준으로 직접 작성했습니다.
+NVIDIA 채굴 카드 (CMP 100-210, V100) — sm_70, HBM2 16GB, PCIe Gen1 x1, P2P 없음 — 에서 굴리려고 처음부터 새로 짠 Qwen3.5 / Qwen3.6 hybrid (GDN + Attention) 추론 엔진입니다. fork 가 아니고, 모든 커널을 sm_70 제약 기준으로 직접 작성했습니다.
 
 vLLM, llama.cpp MMQ, FlashAttention, bitsandbytes — 전부 cuBLAS Tensor Core 경로라 sm_70 + CMP 환경에서는 1/64 속도로 돌거나 아예 동작하지 않습니다. 그래서 직접 짰습니다.
 
