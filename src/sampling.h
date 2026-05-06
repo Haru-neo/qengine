@@ -8,6 +8,7 @@
 #include <cstring>
 #include <unordered_map>
 #include <cuda_fp16.h>
+#include "json_grammar.h"
 
 struct SamplingParams {
     float temperature = 0.6f;
@@ -37,6 +38,15 @@ struct Sampler {
     std::vector<float> logits;
     std::vector<int> indices;
 
+    // Grammar-constrained decoding (response_format). When `grammar` is set we
+    // mask out tokens whose decoded bytes would corrupt the JSON state, then
+    // commit the chosen token's bytes. Cleared by the caller after the request
+    // completes. `tok_bytes` is the per-token decoded byte string; `is_special`
+    // marks `<|...|>`-style tokens that bypass grammar (e.g. EOS).
+    qwen_engine::JsonGrammar* grammar = nullptr;
+    const std::vector<std::string>* tok_bytes = nullptr;
+    const std::vector<uint8_t>*     tok_special = nullptr;
+
     const SamplingParams& params() const { return params_ptr ? *params_ptr : params_default; }
 
     void init(const SamplingParams& p, int vocab_size) {
@@ -62,9 +72,18 @@ struct Sampler {
             apply_rep_penalty(logits, context);
         }
 
+        // 1b. Grammar mask (response_format). Mask out tokens whose decoded
+        // bytes would corrupt the JSON state. Special tokens (EOS / im_end)
+        // bypass — the model needs to be free to stop.
+        if (grammar && tok_bytes && tok_special) {
+            apply_grammar_mask(logits, vocab_size);
+        }
+
         // 2. Greedy
         if (params().temperature <= 0.0f) {
-            return std::max_element(logits.begin(), logits.begin() + vocab_size) - logits.begin();
+            int idx = std::max_element(logits.begin(), logits.begin() + vocab_size) - logits.begin();
+            commit_token_bytes(idx);
+            return idx;
         }
 
         // 3. Temperature
@@ -116,14 +135,53 @@ struct Sampler {
         std::uniform_real_distribution<float> dist(0.0f, sum);
         float r = dist(rng);
         float acc = 0.0f;
+        int chosen = indices[0];
         for (int i = 0; i < n_keep; i++) {
             acc += probs[i];
-            if (acc >= r) return indices[i];
+            if (acc >= r) { chosen = indices[i]; break; }
         }
-        return indices[0];
+        commit_token_bytes(chosen);
+        return chosen;
     }
 
 private:
+    // Apply grammar to in-place logits: any token whose decoded bytes would
+    // corrupt the JSON state gets its logit set to -INF. Special tokens
+    // (`<|im_end|>` etc.) are exempt so the model can still stop.
+    void apply_grammar_mask(std::vector<float>& logits, int vocab_size) {
+        const float NEG_INF = -1e30f;
+        const auto& bytes = *tok_bytes;
+        const auto& special = *tok_special;
+        int kept = 0;
+        for (int i = 0; i < vocab_size; i++) {
+            if (i < (int)special.size() && special[i]) { kept++; continue; }
+            if (i >= (int)bytes.size() || bytes[i].empty()) continue;
+            if (!grammar->try_feed_all(bytes[i].data(), bytes[i].size())) {
+                logits[i] = NEG_INF;
+            } else {
+                kept++;
+            }
+        }
+        // If grammar rejected everything we'd hand the sampler an all-NEG_INF
+        // distribution and softmax would produce NaN. Trip a soft fallback:
+        // mark the grammar corrupt so subsequent steps stop checking, and
+        // restore logits via re-conversion at the next step. Practically this
+        // shouldn't fire because at minimum the model can always emit `}`,
+        // `]`, `,`, EOS, or whitespace from some valid state.
+        if (kept == 0) grammar->corrupt = true;
+    }
+
+    // Permanently advance grammar state by feeding the chosen token's bytes.
+    // No-op when grammar isn't active or the token is a special.
+    void commit_token_bytes(int id) {
+        if (!grammar || !tok_bytes || !tok_special) return;
+        if (id < 0) return;
+        if (id < (int)tok_special->size() && (*tok_special)[id]) return;
+        if (id >= (int)tok_bytes->size()) return;
+        const std::string& b = (*tok_bytes)[id];
+        for (size_t i = 0; i < b.size(); i++) grammar->feed((uint8_t)b[i]);
+    }
+
     void apply_rep_penalty(std::vector<float>& logits, const std::vector<int>& context) {
         int start = std::max(0, (int)context.size() - params().rep_window);
         std::unordered_map<int, int> counts;

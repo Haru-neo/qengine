@@ -560,12 +560,20 @@ static std::vector<ChatMessage> json_get_messages(const std::string& json) {
 
 // ============ HTTP Server ============
 
-using GenerateFunc = std::function<std::string(const std::vector<int>& prompt_ids, int max_tokens, int cached_prompt_tokens, int* out_completion_tokens)>;
+// Optional grammar handle for `response_format`. Server.h doesn't need to
+// know JsonGrammar's full layout — the engine layer constructs and attaches
+// these to the underlying Sequence.
+struct ResponseFormat {
+    bool json_mode = false;       // {"type":"json_object"} or json_schema
+    std::string schema_json;      // raw schema body (currently unused)
+};
+
+using GenerateFunc = std::function<std::string(const std::vector<int>& prompt_ids, int max_tokens, int cached_prompt_tokens, const ResponseFormat& rf, int* out_completion_tokens)>;
 // StreamCallback returns true while the client is still receiving and false
 // once delivery has failed (EPIPE / closed connection). Producers should
 // stop generating as soon as it returns false.
 using StreamCallback = std::function<bool(const std::string& token_text, bool is_done)>;
-using StreamGenerateFunc = std::function<void(const std::vector<int>& prompt_ids, int max_tokens, int cached_prompt_tokens, StreamCallback cb)>;
+using StreamGenerateFunc = std::function<void(const std::vector<int>& prompt_ids, int max_tokens, int cached_prompt_tokens, const ResponseFormat& rf, StreamCallback cb)>;
 
 struct HttpServer {
     int port;
@@ -647,6 +655,20 @@ struct HttpServer {
         bool stream = body.find("\"stream\"") != std::string::npos &&
                       (body.find("\"stream\":true") != std::string::npos ||
                        body.find("\"stream\": true") != std::string::npos);
+
+        // OpenAI response_format. Both `{"type":"json_object"}` and
+        // `{"type":"json_schema","json_schema":{...}}` flip on JSON mode; the
+        // schema body is preserved for future schema-aware validation.
+        ResponseFormat rf;
+        std::string rf_json = json_get_raw(body, "response_format");
+        if (!rf_json.empty()) {
+            std::string rf_type = json_get_str(rf_json, "type");
+            if (rf_type == "json_object" || rf_type == "json_schema") {
+                rf.json_mode = true;
+                std::string sch = json_get_raw(rf_json, "json_schema");
+                if (!sch.empty()) rf.schema_json = sch;
+            }
+        }
 
         // Apply per-request sampling params from OpenAI API
         if (sampling_params) {
@@ -803,6 +825,10 @@ struct HttpServer {
             printf("  msg[%zu] role='%s' len=%zu: %.120s\n", i, msg_pairs[i].first.c_str(),
                    msg_pairs[i].second.size(), msg_pairs[i].second.c_str());
 
+        if (rf.json_mode) {
+            printf("[API] response_format=json_mode (schema_len=%zu)\n", rf.schema_json.size());
+        }
+
         if (stream && stream_generate_fn) {
             // SSE streaming response
             std::string header = "HTTP/1.1 200 OK\r\n"
@@ -825,7 +851,7 @@ struct HttpServer {
                     + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<think>\\n\"},\"finish_reason\":null}]}");
             }
             bool client_alive = true;
-            stream_generate_fn(prompt_ids, max_tokens, cached_prompt_tokens, [&](const std::string& token, bool done) -> bool {
+            stream_generate_fn(prompt_ids, max_tokens, cached_prompt_tokens, rf, [&](const std::string& token, bool done) -> bool {
                 if (!client_alive) return false;  // already dead, stop calling
                 if (done) {
                     auto parsed_calls = parse_tool_calls(stream_accum);
@@ -856,7 +882,7 @@ struct HttpServer {
         } else {
             // Non-streaming response
             int completion_tokens = 0;
-            std::string generated_text = generate_fn(prompt_ids, max_tokens, cached_prompt_tokens, &completion_tokens);
+            std::string generated_text = generate_fn(prompt_ids, max_tokens, cached_prompt_tokens, rf, &completion_tokens);
 
             // The chat encoder may prefill "<think>\n" into the prompt, in
             // which case the generated text starts mid-think with no opening

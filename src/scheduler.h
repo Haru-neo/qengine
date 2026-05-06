@@ -43,6 +43,8 @@
 #include <thread>
 #include <vector>
 
+#include "json_grammar.h"
+
 namespace qwen_engine {
 
 struct Sequence {
@@ -50,6 +52,12 @@ struct Sequence {
     std::vector<int> prompt_ids;
     int  max_tokens          = 0;
     int  cached_prompt_tokens = 0;
+    // Optional response-format grammar (JSON-constrained decoding). When set,
+    // run_fn must route this request through the single-slot legacy path so
+    // the per-token sampler can apply the grammar mask. Continuous-batching
+    // multi-slot mode does its own sampling that doesn't currently honor
+    // grammars; allowing both would silently drop the constraint.
+    std::shared_ptr<JsonGrammar> grammar;
 
     // Output sinks (run_fn calls these as the request progresses).
     //   on_token : called once per emitted token. Used by the SSE streaming

@@ -1139,6 +1139,18 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     Sampler sampler;
     sampler.init(sp, V);
 
+    // Pre-build per-token byte strings + special-token flags for grammar mode.
+    // Only built once at startup (V ≈ 250K * a few bytes ≈ 1.5 MB). The
+    // sampler reads these by pointer when `response_format` is active.
+    std::vector<std::string> tok_bytes(V);
+    std::vector<uint8_t>     tok_special(V, 0);
+    for (int i = 0; i < V; i++) {
+        if (tok.is_special(i)) tok_special[i] = 1;
+        else tok_bytes[i] = tok.decode_token(i);
+    }
+    sampler.tok_bytes = &tok_bytes;
+    sampler.tok_special = &tok_special;
+
     // Unified generate. When `on_token` is provided, it's invoked once per
     // generated token id (in append order, including both tokens accepted by
     // a spec iter). The streaming wrapper below uses it to drive SSE chunks
@@ -1793,7 +1805,8 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 bool greedy_fast = (sp_now.temperature <= 0.0f)
                                 && (sp_now.rep_penalty == 1.0f)
                                 && (sp_now.freq_penalty == 0.0f)
-                                && (sp_now.pres_penalty == 0.0f);
+                                && (sp_now.pres_penalty == 0.0f)
+                                && (sampler.grammar == nullptr);
                 if (greedy_fast) {
                     argmax_half_kernel<<<1, 1024>>>(logits_buf, V, d_argmax);
                     cudaMemcpy(h_argmax_pinned, d_argmax, sizeof(int), cudaMemcpyDeviceToHost);
@@ -1878,7 +1891,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     // commit yet — main keeps producing tokens normally. Validates
                     // that draft.forward + capture buffer + lm_head all wire up.
                     // (Accept + KV/GDN rollback land in 6c-2 / 6c-3.)
-                    if (slot == 0 && dflash_enabled) {
+                    if (slot == 0 && dflash_enabled && sampler.grammar == nullptr) {
                         auto df0 = prof_now();
                         int B = dflash::DraftConfig::block_size;          // 16
                         int ctx_len_draft = step + 1;                     // capture[0..step] filled
@@ -2090,7 +2103,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     // forward_*_tree pipeline to shake out the DDTree kernels
                     // end-to-end. Once this matches K2, we'll widen to real
                     // branching by growing budget and adding ancestor-mask attn.
-                    if (slot == 0 && spec_tree_enabled) {
+                    if (slot == 0 && spec_tree_enabled && sampler.grammar == nullptr) {
                         auto sd0 = prof_now();
                         // MTP_TREE_BRANCH=1: root fan-out of top-2 drafts.
                         //   budget=3 → depth 1 (tree [root, a, b], parents [-1,0,0])
@@ -2399,7 +2412,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     //   verify_a == draft1 && verify_b == draft2 → accept both, provisional verify_c
                     //   verify_a == draft1                       → accept draft1 only
                     //   else                                      → reject both
-                    if (slot == 0 && spec_k2_enabled) {
+                    if (slot == 0 && spec_k2_enabled && sampler.grammar == nullptr) {
                         auto sd0 = prof_now();
                         // 1. Self-chain draft: MTP(norm_buf, max_idx, step+1) → draft1, h_final_draft1
                         //    Then MTP(h_final_draft1, draft1, step+2) → draft2.
@@ -2557,7 +2570,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                             mtp.kv_rollback(2);
                             step += 1;
                         }
-                    } else if (slot == 0 && spec_enabled) {
+                    } else if (slot == 0 && spec_enabled && sampler.grammar == nullptr) {
                         auto sd0 = prof_now();
                         // 1. MTP draft
                         int mtp_draft = mtp.forward(norm_buf, max_idx, step + 1);
@@ -2995,6 +3008,25 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
             int completion_tokens = 0;
             std::string final_text;
 
+            // Grammar-constrained requests force the legacy single-stream path:
+            // sampler is shared (one Sampler instance) so we can only bind one
+            // grammar at a time, and the batched gen loop has its own argmax
+            // that does not consult grammar. Forward mutex serializes other
+            // requests while we generate.
+            if (seq.grammar) {
+                std::lock_guard<std::mutex> lk(sched.forward_mutex());
+                sampler.grammar = seq.grammar.get();
+                try {
+                    final_text = generate_impl(seq.prompt_ids, seq.max_tokens,
+                                               seq.cached_prompt_tokens,
+                                               &completion_tokens, on_tok, slot,
+                                               nullptr, nullptr, &seq.cancelled);
+                } catch (...) { sampler.grammar = nullptr; throw; }
+                sampler.grammar = nullptr;
+                if (seq.on_done) seq.on_done(std::move(final_text), completion_tokens);
+                return;
+            }
+
             if (num_slots <= 1) {
                 // Single-slot legacy path: full generate_impl under mutex.
                 std::lock_guard<std::mutex> lk(sched.forward_mutex());
@@ -3211,11 +3243,13 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     // Non-streaming: submit a Sequence, wait on a future for the result.
     server.generate_fn = [&](const std::vector<int>& prompt_ids, int max_tokens,
                              int cached_prompt_tokens,
+                             const ResponseFormat& rf,
                              int* out_completion_tokens) -> std::string {
         auto seq = std::make_shared<qwen_engine::Sequence>();
         seq->prompt_ids           = prompt_ids;
         seq->max_tokens           = max_tokens;
         seq->cached_prompt_tokens = cached_prompt_tokens;
+        if (rf.json_mode) seq->grammar = std::make_shared<qwen_engine::JsonGrammar>();
 
         std::mutex done_mu;
         std::condition_variable done_cv;
@@ -3256,11 +3290,14 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     // callback. on_done finalizes the trailing UTF-8 buffer (in case a final
     // multi-byte char straddled the last token boundary).
     server.stream_generate_fn = [&](const std::vector<int>& prompt_ids, int max_tokens,
-                                    int cached_prompt_tokens, StreamCallback cb) {
+                                    int cached_prompt_tokens,
+                                    const ResponseFormat& rf,
+                                    StreamCallback cb) {
         auto seq = std::make_shared<qwen_engine::Sequence>();
         seq->prompt_ids           = prompt_ids;
         seq->max_tokens           = max_tokens;
         seq->cached_prompt_tokens = cached_prompt_tokens;
+        if (rf.json_mode) seq->grammar = std::make_shared<qwen_engine::JsonGrammar>();
 
         // utf8_buf is owned by the lambda captures — the worker thread runs
         // on_token, then on_done; both fire before the request handler
@@ -3506,6 +3543,7 @@ int serve_gemma(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
     // Generate callback: takes prompt token IDs, returns generated text
     auto generate = [&](const std::vector<int>& prompt_ids, int max_tokens,
                         int /*cached_prompt_tokens*/,
+                        const ResponseFormat& /*rf*/,
                         int* out_completion_tokens) -> std::string {
         model.reset_all();
         std::vector<int> generated;
