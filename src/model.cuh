@@ -3137,21 +3137,35 @@ struct QwenModel {
                     ab.attn_chunk_k, &q8_k_slot[(size_t)start_pos * bpt], new_blocks);
                 quantize_kv_q8_0_kern<<<new_blocks, 32, 0, stream>>>(
                     ab.attn_chunk_v, &q8_v_slot[(size_t)start_pos * bpt], new_blocks);
-                if (start_pos > 0) {
-                    int hist_blocks = start_pos * bpt;
-                    dim3 dq_grid((hist_blocks + 7) / 8);
-                    dim3 dq_block(32, 8);
-                    dequantize_kv_q8_0_kern<<<dq_grid, dq_block, 0, stream>>>(
-                        q8_k_slot, tq_k_buf[g] + slot_kv_off, hist_blocks);
-                    dequantize_kv_q8_0_kern<<<dq_grid, dq_block, 0, stream>>>(
-                        q8_v_slot, tq_v_buf[g] + slot_kv_off, hist_blocks);
+                // The bulk dequant + new-fp16 copy below is only needed when
+                // attention will read fp16 from tq_k_buf/tq_v_buf. With
+                // Q8KV_FUSED_CHUNK=1 the chunked attn kernel decodes Q8 in-tile
+                // so we can skip both passes — biggest cost at long context
+                // (256K: ~O(seq) per chunk × N chunks = O(seq²) total).
+                //
+                // Skip only when every sub-chunk in this call will use the
+                // split-K fused-Q8 path (sub_seq_total >= 4096). Below that
+                // the non-split kernels still read fp16 and need the scratch
+                // populated, so keep the bulk pass.
+                static const bool q8_fused_chunk = (getenv("Q8KV_FUSED_CHUNK") != nullptr);
+                bool skip_dequant = q8_fused_chunk && (start_pos + ATTN_NB >= 4096);
+                if (!skip_dequant) {
+                    if (start_pos > 0) {
+                        int hist_blocks = start_pos * bpt;
+                        dim3 dq_grid((hist_blocks + 7) / 8);
+                        dim3 dq_block(32, 8);
+                        dequantize_kv_q8_0_kern<<<dq_grid, dq_block, 0, stream>>>(
+                            q8_k_slot, tq_k_buf[g] + slot_kv_off, hist_blocks);
+                        dequantize_kv_q8_0_kern<<<dq_grid, dq_block, 0, stream>>>(
+                            q8_v_slot, tq_v_buf[g] + slot_kv_off, hist_blocks);
+                    }
+                    cudaMemcpyAsync(tq_k_buf[g] + slot_kv_off + (size_t)start_pos * kv_dim,
+                                    ab.attn_chunk_k, new_bytes,
+                                    cudaMemcpyDeviceToDevice, stream);
+                    cudaMemcpyAsync(tq_v_buf[g] + slot_kv_off + (size_t)start_pos * kv_dim,
+                                    ab.attn_chunk_v, new_bytes,
+                                    cudaMemcpyDeviceToDevice, stream);
                 }
-                cudaMemcpyAsync(tq_k_buf[g] + slot_kv_off + (size_t)start_pos * kv_dim,
-                                ab.attn_chunk_k, new_bytes,
-                                cudaMemcpyDeviceToDevice, stream);
-                cudaMemcpyAsync(tq_v_buf[g] + slot_kv_off + (size_t)start_pos * kv_dim,
-                                ab.attn_chunk_v, new_bytes,
-                                cudaMemcpyDeviceToDevice, stream);
             } else if (use_turboquant) {
                 auto& tq = tq_kv_caches[layer];
                 int bpt = tq.blocks_per_token;
@@ -3274,6 +3288,47 @@ struct QwenModel {
                                    + 2 * BM * HD * sizeof(half)
                                    + (num_q == 24 ? 6 : 4) * BM * sizeof(float);
                     dim3 fg(num_kv, sub_n, fa_sk);
+                    // Q8KV_FUSED_CHUNK=1: read directly from the Q8 cache via
+                    // cooperative dequant inside the kernel, skipping the
+                    // bulk-dequant + fp16-scratch round-trip the legacy Q8 path
+                    // takes. Eliminates the per-chunk O(seq²) dequant pass and
+                    // the kv_total_seq×kv_dim fp16 scratch — the latter is the
+                    // dominant cost at 256K (≈1 GB/GPU). Opt-in until correctness
+                    // and speed are confirmed against the bulk path.
+                    static const bool q8_fused_chunk = use_q8_kv && (getenv("Q8KV_FUSED_CHUNK") != nullptr);
+                    if (q8_fused_chunk) {
+                        auto& q8 = q8_kv_caches[layer];
+                        size_t slot_off_blocks = (size_t)slot * slot_max_seq * q8.blocks_per_token;
+                        const block_q8_0_aligned* k_q8_slot = q8.k + slot_off_blocks;
+                        const block_q8_0_aligned* v_q8_slot = q8.v + slot_off_blocks;
+                        auto launch_q8 = [&](auto gqa_const, auto k_const) {
+                            constexpr int GQA = decltype(gqa_const)::value;
+                            constexpr int K   = decltype(k_const)::value;
+                            flash_attn_chunk_fused_split_q8<HD, GQA, BM, BLOCK, K>
+                                <<<fg, BLOCK, smem_bytes, stream>>>(
+                                    q_post_sub, k_q8_slot, v_q8_slot,
+                                    ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
+                                    num_q, num_kv, sub_start_pos, sub_n, ATTN_NB,
+                                    active_end_max, scale);
+                            dim3 mg(num_kv, sub_n);
+                            flash_attn_split_merge<HD, GQA, BLOCK, K>
+                                <<<mg, BLOCK, 0, stream>>>(
+                                    ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
+                                    out_sub, num_q, sub_n, ATTN_NB);
+                        };
+                        if (num_q == 24) {
+                            if      (fa_sk == 2) launch_q8(std::integral_constant<int,6>{}, std::integral_constant<int,2>{});
+                            else if (fa_sk == 4) launch_q8(std::integral_constant<int,6>{}, std::integral_constant<int,4>{});
+                            else                 launch_q8(std::integral_constant<int,6>{}, std::integral_constant<int,8>{});
+                        } else {
+                            if      (fa_sk == 2) launch_q8(std::integral_constant<int,4>{}, std::integral_constant<int,2>{});
+                            else if (fa_sk == 4) launch_q8(std::integral_constant<int,4>{}, std::integral_constant<int,4>{});
+                            else                 launch_q8(std::integral_constant<int,4>{}, std::integral_constant<int,8>{});
+                        }
+                        if (g_profile_attn) g_attn_fused_ms += pa_sync_ms(tf0);
+                        sub_processed += sub_n;
+                        continue;
+                    }
                     auto launch_split = [&](auto gqa_const, auto k_const) {
                         constexpr int GQA = decltype(gqa_const)::value;
                         constexpr int K   = decltype(k_const)::value;
