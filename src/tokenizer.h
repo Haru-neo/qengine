@@ -343,7 +343,10 @@ struct Tokenizer {
                 add_text("\n");
             }
         } else if (force_think == -1) {
-            // Force skip thinking: <think>\n\n</think>\n\n (Qwen3 template)
+            // Force skip thinking: <think>\n\n</think>\n\n (Qwen3 template).
+            // Prefer single-token specials; fall back to BPE encoding for
+            // tokenizers that don't carry `<think>` as one piece (e.g.
+            // distill checkpoints) so the prefill still parses identically.
             auto think_tok = token_to_id.find("<think>");
             auto think_end = token_to_id.find("</think>");
             if (think_tok != token_to_id.end() && think_end != token_to_id.end()) {
@@ -351,6 +354,8 @@ struct Tokenizer {
                 add_text("\n\n");
                 ids.push_back(think_end->second);
                 add_text("\n\n");
+            } else {
+                add_text("<think>\n\n</think>\n\n");
             }
         }
         // force_think == 0: just <|im_start|>assistant\n — model decides

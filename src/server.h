@@ -582,7 +582,13 @@ struct HttpServer {
     SamplingParams* sampling_params = nullptr;  // pointer to shared sampling params
     StreamGenerateFunc stream_generate_fn;
     std::function<std::vector<int>(const std::string&)> encode_fn;
-    std::function<std::vector<int>(const std::vector<std::pair<std::string,std::string>>&)> chat_encode_fn;
+    // chat_encode_fn: encode messages into prompt token ids. The optional
+    // `force_think` int matches Tokenizer::apply_chat: 0=model decides,
+    // 1=prefill `<think>\n`, -1=force-skip thinking with `<think></think>`.
+    // The HTTP layer sets force_think=-1 for response_format=json_object so
+    // the model can't open a reasoning block (grammar would reject the body
+    // bytes inside `<think>...</think>`).
+    std::function<std::vector<int>(const std::vector<std::pair<std::string,std::string>>&, int)> chat_encode_fn;
     std::string model_name = "qwen";
     std::string api_key;
     // When true, the chat encoder prefills "<think>\n" into the prompt, so the
@@ -799,8 +805,26 @@ struct HttpServer {
             }
         }
 
+        if (rf.json_mode) {
+            printf("[API] response_format=json_mode (schema_len=%zu)\n", rf.schema_json.size());
+            // Without an explicit instruction the base model often opens a
+            // string instead of an object — grammar then forces it to keep
+            // emitting body bytes (e.g. `"!!!!"`). Inject a hint into the
+            // already-built msg_pairs so the chat encoder sees it.
+            const std::string hint = "Respond strictly with a single JSON object starting with `{`. Do not include any text, prefix, or commentary outside the JSON.";
+            bool has_system = false;
+            for (auto& [role, content] : msg_pairs) {
+                if (role == "system") {
+                    if (content.find("JSON") == std::string::npos)
+                        content = hint + "\n\n" + content;
+                    has_system = true; break;
+                }
+            }
+            if (!has_system) msg_pairs.insert(msg_pairs.begin(), {"system", hint});
+        }
+
         std::vector<int> prompt_ids;
-        if (chat_encode_fn) prompt_ids = chat_encode_fn(msg_pairs);
+        if (chat_encode_fn) prompt_ids = chat_encode_fn(msg_pairs, rf.json_mode ? -1 : 0);
 
         // Vision: rebuild M-RoPE per-token position arrays now that we know
         // exactly where each image_pad token landed in prompt_ids.
@@ -824,10 +848,6 @@ struct HttpServer {
         for (size_t i = 0; i < msg_pairs.size(); i++)
             printf("  msg[%zu] role='%s' len=%zu: %.120s\n", i, msg_pairs[i].first.c_str(),
                    msg_pairs[i].second.size(), msg_pairs[i].second.c_str());
-
-        if (rf.json_mode) {
-            printf("[API] response_format=json_mode (schema_len=%zu)\n", rf.schema_json.size());
-        }
 
         if (stream && stream_generate_fn) {
             // SSE streaming response

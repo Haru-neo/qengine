@@ -3355,7 +3355,8 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         }
     };
 
-    server.chat_encode_fn = [&](const std::vector<std::pair<std::string, std::string>>& msgs) {
+    server.chat_encode_fn = [&](const std::vector<std::pair<std::string, std::string>>& msgs,
+                                int force_think) {
         // Separate system prompt from conversation messages
         std::string sys_msg;
         std::vector<std::pair<std::string, std::string>> conv;
@@ -3367,10 +3368,11 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 conv.push_back({role, content});
             }
         }
-        // Do not force <think>\n prefill: llama.cpp 참조 구현과 동일하게
-        // 모델이 자율적으로 reasoning 여부 결정. 짧은 greeting 에 강제
-        // reasoning 을 걸면 언어 drift / 환각 증폭 발생함 (실측 확인).
-        auto ids = tok.apply_chat(sys_msg, conv, /*force_think=*/0);
+        // Do not force <think>\n prefill by default (llama.cpp parity);
+        // response_format=json_object passes force_think=-1 so the model
+        // can't open a reasoning block whose body bytes the JSON grammar
+        // would reject.
+        auto ids = tok.apply_chat(sys_msg, conv, force_think);
         if (getenv("DUMP_PROMPT_IDS")) {
             fprintf(stderr, "[PROMPT_IDS %zu]", ids.size());
             for (int id : ids) fprintf(stderr, " %d", id);
@@ -3632,7 +3634,8 @@ int serve_gemma(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
     server.port = port;
     server.model_name = "gemma-4-31B";
     server.generate_fn = generate;
-    server.chat_encode_fn = [&](const std::vector<std::pair<std::string, std::string>>& msgs) {
+    server.chat_encode_fn = [&](const std::vector<std::pair<std::string, std::string>>& msgs,
+                                int /*force_think*/) {
         return tokenizer.apply_chat("", msgs);
     };
     server.encode_fn = [&](const std::string& text) {
