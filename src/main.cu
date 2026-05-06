@@ -1254,6 +1254,11 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                        = g_attn_fused_ms  = g_attn_other_ms = 0.0;
         g_pt_qkvr_ms = g_pt_kvwrite_ms = g_pt_attn_ms = g_pt_oproj_ms = 0.0;
         g_pt_calls = 0;
+        const char* prof_gdn_env = getenv("PROFILE_GDN");
+        g_profile_gdn = prof_gdn_env && prof_gdn_env[0] == '1';
+        g_gdn_norm_ms = g_gdn_proj_ms = g_gdn_conv_ms = g_gdn_recur_ms
+                     = g_gdn_rmsg_ms = g_gdn_oproj_ms = g_gdn_resi_ms = 0.0;
+        g_gdn_calls = 0;
         double t_embed = 0, t_xfer = 0, t_attn = 0, t_gdn = 0, t_mlp = 0;
         auto prof_now = [](){ return std::chrono::high_resolution_clock::now(); };
         auto prof_sync_ms = [&](std::chrono::high_resolution_clock::time_point t_beg, int dev) {
@@ -2764,6 +2769,22 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                    g_pt_kvwrite_ms, pt_sub > 0 ? 100.0*g_pt_kvwrite_ms/pt_sub : 0,
                    g_pt_attn_ms,    pt_sub > 0 ? 100.0*g_pt_attn_ms/pt_sub    : 0,
                    g_pt_oproj_ms,   pt_sub > 0 ? 100.0*g_pt_oproj_ms/pt_sub   : 0);
+            fflush(stdout);
+        }
+        if (g_profile_gdn && g_gdn_calls > 0) {
+            double gdn_sub = g_gdn_norm_ms + g_gdn_proj_ms + g_gdn_conv_ms +
+                             g_gdn_recur_ms + g_gdn_rmsg_ms + g_gdn_oproj_ms + g_gdn_resi_ms;
+            printf("[GDN PROF] calls=%ld sub_sum=%.1fms  "
+                   "norm=%.1f(%.0f%%) proj4gemv=%.1f(%.0f%%) conv1d=%.1f(%.0f%%) "
+                   "recur=%.1f(%.0f%%) rmsg=%.1f(%.0f%%) oproj=%.1f(%.0f%%) resi=%.1f(%.0f%%)\n",
+                   g_gdn_calls, gdn_sub,
+                   g_gdn_norm_ms,  gdn_sub > 0 ? 100.0*g_gdn_norm_ms/gdn_sub  : 0,
+                   g_gdn_proj_ms,  gdn_sub > 0 ? 100.0*g_gdn_proj_ms/gdn_sub  : 0,
+                   g_gdn_conv_ms,  gdn_sub > 0 ? 100.0*g_gdn_conv_ms/gdn_sub  : 0,
+                   g_gdn_recur_ms, gdn_sub > 0 ? 100.0*g_gdn_recur_ms/gdn_sub : 0,
+                   g_gdn_rmsg_ms,  gdn_sub > 0 ? 100.0*g_gdn_rmsg_ms/gdn_sub  : 0,
+                   g_gdn_oproj_ms, gdn_sub > 0 ? 100.0*g_gdn_oproj_ms/gdn_sub : 0,
+                   g_gdn_resi_ms,  gdn_sub > 0 ? 100.0*g_gdn_resi_ms/gdn_sub  : 0);
             fflush(stdout);
         }
         if (do_fa_prof) {

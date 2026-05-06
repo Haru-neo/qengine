@@ -29,6 +29,19 @@ static bool   g_profile_attn    = false;
 // Qwen3.5-27B attention shape (HD=256, num_q=24, num_kv=4).
 static bool   g_use_flash_attn  = false;
 
+// PROFILE_GDN=1 enables per-phase sync timers inside forward_gdn (single-token
+// gen path). Accumulates ms into the globals below; main.cu prints them next
+// to PROFILE_GEN summary. Adds sync overhead so keep OFF in production.
+static double g_gdn_norm_ms     = 0.0;  // input RMSNorm
+static double g_gdn_proj_ms     = 0.0;  // 4 GEMVs: qkv / gate / alpha / beta
+static double g_gdn_conv_ms     = 0.0;  // conv1d_update_silu
+static double g_gdn_recur_ms    = 0.0;  // launch_gdn_recurrent_step
+static double g_gdn_rmsg_ms     = 0.0;  // rms_norm_gated_kernel
+static double g_gdn_oproj_ms    = 0.0;  // output projection GEMV
+static double g_gdn_resi_ms     = 0.0;  // residual add
+static long   g_gdn_calls       = 0;
+static bool   g_profile_gdn     = false;
+
 struct QwenConfig {
     int hidden_size;
     int intermediate_size;
@@ -374,6 +387,11 @@ struct QwenModel {
         half* normed_out;   // [num_v * v_dim]
         half* proj_out;     // [hidden_size]
 
+        // Fused projection output (GDN_PROJ_FUSE): contiguous
+        // [qkv_n + gate_n + alpha_n + beta_n] half. Sub-pointers alias the
+        // 4 traditional buffers (qkv_out, z_out, a_out, b_out).
+        half*  fused_proj_out = nullptr;
+
         // Chunk buffers (per-token data accumulated for chunked GDN)
         float* chunk_qkv;     // [CHUNK_SIZE * qkv_dim] FP32 conv1d outputs
         half*  chunk_qkv_half = nullptr;  // [CHUNK_SIZE * qkv_dim] fp16 staging for batched QKV proj
@@ -386,6 +404,24 @@ struct QwenModel {
         half*  chunk_norm_out;// [CHUNK_SIZE * hidden_size]
     };
     GDNBuffers gdn_bufs[4];
+
+    // GDN_PROJ_FUSE: fused [qkv|gate|alpha|beta] weight buffer per GDN layer.
+    // Built lazily on first forward_gdn call when GDN_PROJ_FUSE=1. Contiguous
+    // block_q8_0_aligned layout, [total_n rows × K/32 blocks per row]. Skip if
+    // any of the 4 source weights is missing or non-Q8_0.
+    struct GdnProjFused {
+        void* weight = nullptr;
+        int qkv_n = 0, gate_n = 0, alpha_n = 0, beta_n = 0, total_n = 0;
+    };
+    std::vector<GdnProjFused> gdn_proj_fused;  // sized to num_layers, indexed by layer
+
+    // ATTN_QKV_FUSE: fused [q|k|v] weight per attention layer. attn_q already
+    // bakes the gate (q_out_dim = num_q*hd*2). Lazy-built on first forward_attn.
+    struct AttnQkvFused {
+        void* weight = nullptr;
+        int q_n = 0, k_n = 0, v_n = 0, total_n = 0;
+    };
+    std::vector<AttnQkvFused> attn_qkv_fused;  // sized to num_layers
 
     void alloc_buffers() {
         int H = cfg.hidden_size;
@@ -413,6 +449,8 @@ struct QwenModel {
             cudaMalloc(&gdn_bufs[g].core_out, v_total * sizeof(half));
             cudaMalloc(&gdn_bufs[g].normed_out, v_total * sizeof(half));
             cudaMalloc(&gdn_bufs[g].proj_out, H * sizeof(half));
+            // Fused proj out: 27B max = qkv 10240 + gate 6144 + alpha 48 + beta 48 = 16480
+            cudaMalloc(&gdn_bufs[g].fused_proj_out, 16480 * sizeof(half));
 
             // Chunk buffers
             cudaMalloc(&gdn_bufs[g].chunk_qkv,      CHUNK_SIZE * qkv_dim * sizeof(float));
@@ -667,6 +705,10 @@ struct QwenModel {
         half* q_proj;      // [num_q * head_dim * 2] (Q + gate)
         half* k_proj;      // [num_kv * head_dim]
         half* v_proj;      // [num_kv * head_dim]
+        // ATTN_QKV_FUSE: contiguous [q_n + k_n + v_n] half. Sub-pointers alias
+        // q_proj / k_proj / v_proj for the duration of one forward_attn call
+        // (RAII guard restores originals on exit).
+        half* fused_qkv_out = nullptr;
         float* attn_scores; // [num_q * max_seq]
         half* gate_buf;     // [num_q * head_dim] for output gate
         half* attn_out;     // [num_q * head_dim]
@@ -715,6 +757,9 @@ struct QwenModel {
             cudaMalloc(&attn_bufs[g].attn_scores, num_q * score_max_len * sizeof(float));
             cudaMalloc(&attn_bufs[g].attn_out, num_q * hd * sizeof(half));
             cudaMalloc(&attn_bufs[g].gate_buf, num_q * hd * sizeof(half));
+            // ATTN_QKV_FUSE output: q_proj (num_q*hd*2) + k_proj + v_proj
+            cudaMalloc(&attn_bufs[g].fused_qkv_out,
+                       (num_q * hd * 2 + 2 * num_kv * hd) * sizeof(half));
         }
 
         // RoPE table (same on all GPUs — just put on GPU 0 for now, copy as needed)
@@ -1112,6 +1157,18 @@ struct QwenModel {
         };
         auto pt_t0 = pt_now();
 
+        // RAII guard: if we alias ab.q_proj/k_proj/v_proj into the fused
+        // output buffer below, restore them on function exit so other code
+        // paths (forward_attn_chunk etc.) keep their original buffers.
+        struct AttnPtrSaver {
+            AttnBuffers& ab;
+            half *sq, *sk, *sv;
+            bool active = false;
+            AttnPtrSaver(AttnBuffers& a) : ab(a), sq(a.q_proj), sk(a.k_proj), sv(a.v_proj) {}
+            ~AttnPtrSaver() { if (active) { ab.q_proj = sq; ab.k_proj = sk; ab.v_proj = sv; } }
+        };
+        AttnPtrSaver ptr_saver(ab);
+
         if (!external_proj) {
             // 1. RMSNorm (FP32 hidden in)
             if (norm_w->type == GGML_TYPE_F32)
@@ -1122,9 +1179,46 @@ struct QwenModel {
 
             // 2. Q/K/V projections
             gpu_qi[g].quantize(norm_out, H, stream);
-            quant_gemv(q_w->data, q_w->type, norm_out, ab.q_proj, H, q_out_dim, &gpu_qi[g], stream);
-            quant_gemv(k_w->data, k_w->type, norm_out, ab.k_proj, H, kv_dim, &gpu_qi[g], stream);
-            quant_gemv(v_w->data, v_w->type, norm_out, ab.v_proj, H, kv_dim, &gpu_qi[g], stream);
+            static const bool use_qkv_fuse = getenv("ATTN_QKV_FUSE") != nullptr;
+            bool can_fuse_qkv = use_qkv_fuse
+                                && q_w->type == GGML_TYPE_Q8_0
+                                && k_w->type == GGML_TYPE_Q8_0
+                                && v_w->type == GGML_TYPE_Q8_0;
+            if (can_fuse_qkv) {
+                if ((int)attn_qkv_fused.size() < cfg.num_layers) attn_qkv_fused.resize(cfg.num_layers);
+                auto& af = attn_qkv_fused[layer];
+                if (!af.weight) {
+                    int blocks_per_row = H / 32;
+                    size_t bpr_bytes = (size_t)blocks_per_row * sizeof(block_q8_0_aligned);
+                    af.q_n = q_w->dims[1];
+                    af.k_n = k_w->dims[1];
+                    af.v_n = v_w->dims[1];
+                    af.total_n = af.q_n + af.k_n + af.v_n;
+                    size_t total_bytes = (size_t)af.total_n * bpr_bytes;
+                    cudaSetDevice(g);
+                    cudaMalloc(&af.weight, total_bytes);
+                    size_t off = 0;
+                    cudaMemcpyAsync((char*)af.weight + off, q_w->data,
+                                    (size_t)af.q_n * bpr_bytes, cudaMemcpyDeviceToDevice, stream);
+                    off += (size_t)af.q_n * bpr_bytes;
+                    cudaMemcpyAsync((char*)af.weight + off, k_w->data,
+                                    (size_t)af.k_n * bpr_bytes, cudaMemcpyDeviceToDevice, stream);
+                    off += (size_t)af.k_n * bpr_bytes;
+                    cudaMemcpyAsync((char*)af.weight + off, v_w->data,
+                                    (size_t)af.v_n * bpr_bytes, cudaMemcpyDeviceToDevice, stream);
+                    cudaStreamSynchronize(stream);
+                }
+                half* fused_out = ab.fused_qkv_out;
+                quant_gemv(af.weight, GGML_TYPE_Q8_0, norm_out, fused_out, H, af.total_n, &gpu_qi[g], stream);
+                ab.q_proj = fused_out;
+                ab.k_proj = fused_out + af.q_n;
+                ab.v_proj = fused_out + af.q_n + af.k_n;
+                ptr_saver.active = true;
+            } else {
+                quant_gemv(q_w->data, q_w->type, norm_out, ab.q_proj, H, q_out_dim, &gpu_qi[g], stream);
+                quant_gemv(k_w->data, k_w->type, norm_out, ab.k_proj, H, kv_dim, &gpu_qi[g], stream);
+                quant_gemv(v_w->data, v_w->type, norm_out, ab.v_proj, H, kv_dim, &gpu_qi[g], stream);
+            }
             attn_dump_h("q_proj", ab.q_proj);
             attn_dump_h("k_proj", ab.k_proj);
             attn_dump_h("v_proj", ab.v_proj);
@@ -1866,34 +1960,93 @@ struct QwenModel {
         half* norm_out = buf.norm_out;
         half* qkv_out = buf.attn_out;  // [qkv_dim]
         half* z_out = buf.mlp_gate;    // reuse, [num_v * v_dim]
-        half* a_out = buf.mlp_up;      // reuse, [num_v]  
+        half* a_out = buf.mlp_up;      // reuse, [num_v]
         half* b_out = buf.mlp_down;    // reuse, [num_v]
+
+        // PROFILE_GDN sub-phase timers. Sync between phases is heavy, so kept
+        // OFF unless explicitly enabled.
+        auto pt_now_g = [](){ return std::chrono::high_resolution_clock::now(); };
+        auto pt_sync_g = [&](std::chrono::high_resolution_clock::time_point tb) {
+            cudaSetDevice(g); cudaStreamSynchronize(stream);
+            auto te = std::chrono::high_resolution_clock::now();
+            return std::chrono::duration<double, std::milli>(te - tb).count();
+        };
+        auto pg_t0 = pt_now_g();
 
         // 1. RMSNorm (FP32 hidden in)
         if (norm_w->type == GGML_TYPE_F32)
             rms_norm_f32in_f32w(norm_out, hidden, (float*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
         else
             rms_norm_f32in(norm_out, hidden, (half*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+        if (g_profile_gdn) { g_gdn_norm_ms += pt_sync_g(pg_t0); pg_t0 = pt_now_g(); }
 
         // 2. Projections: QKV, Z(gate), alpha, beta — quantize once, reuse
         gpu_qi[g].quantize(norm_out, H, stream);
-        quant_gemv(qkv_w->data, qkv_w->type, norm_out, qkv_out, H, qkv_dim, &gpu_qi[g], stream);
-        quant_gemv(gate_w->data, gate_w->type, norm_out, z_out, H, num_v * v_dim, &gpu_qi[g], stream);
-        quant_gemv(alpha_w->data, alpha_w->type, norm_out, a_out, H, num_v, &gpu_qi[g], stream);
-        quant_gemv(beta_w->data, beta_w->type, norm_out, b_out, H, num_v, &gpu_qi[g], stream);
+        static const bool use_proj_fuse = getenv("GDN_PROJ_FUSE") != nullptr;
+        bool can_fuse = use_proj_fuse
+                        && qkv_w->type   == GGML_TYPE_Q8_0
+                        && gate_w->type  == GGML_TYPE_Q8_0
+                        && alpha_w->type == GGML_TYPE_Q8_0
+                        && beta_w->type  == GGML_TYPE_Q8_0;
+        if (can_fuse) {
+            if ((int)gdn_proj_fused.size() < cfg.num_layers) gdn_proj_fused.resize(cfg.num_layers);
+            auto& pf = gdn_proj_fused[layer];
+            if (!pf.weight) {
+                int blocks_per_row = H / 32;
+                size_t bpr_bytes = (size_t)blocks_per_row * sizeof(block_q8_0_aligned);
+                pf.qkv_n   = qkv_w->dims[1];
+                pf.gate_n  = gate_w->dims[1];
+                pf.alpha_n = alpha_w->dims[1];
+                pf.beta_n  = beta_w->dims[1];
+                pf.total_n = pf.qkv_n + pf.gate_n + pf.alpha_n + pf.beta_n;
+                size_t total_bytes = (size_t)pf.total_n * bpr_bytes;
+                cudaSetDevice(g);
+                cudaMalloc(&pf.weight, total_bytes);
+                size_t off = 0;
+                cudaMemcpyAsync((char*)pf.weight + off, qkv_w->data,
+                                (size_t)pf.qkv_n * bpr_bytes, cudaMemcpyDeviceToDevice, stream);
+                off += (size_t)pf.qkv_n * bpr_bytes;
+                cudaMemcpyAsync((char*)pf.weight + off, gate_w->data,
+                                (size_t)pf.gate_n * bpr_bytes, cudaMemcpyDeviceToDevice, stream);
+                off += (size_t)pf.gate_n * bpr_bytes;
+                cudaMemcpyAsync((char*)pf.weight + off, alpha_w->data,
+                                (size_t)pf.alpha_n * bpr_bytes, cudaMemcpyDeviceToDevice, stream);
+                off += (size_t)pf.alpha_n * bpr_bytes;
+                cudaMemcpyAsync((char*)pf.weight + off, beta_w->data,
+                                (size_t)pf.beta_n * bpr_bytes, cudaMemcpyDeviceToDevice, stream);
+                cudaStreamSynchronize(stream);
+            }
+            half* fused_out = gdn_bufs[g].fused_proj_out;
+            quant_gemv(pf.weight, GGML_TYPE_Q8_0, norm_out, fused_out, H, pf.total_n, &gpu_qi[g], stream);
+            qkv_out = fused_out;
+            z_out   = fused_out + pf.qkv_n;
+            a_out   = fused_out + pf.qkv_n + pf.gate_n;
+            b_out   = fused_out + pf.qkv_n + pf.gate_n + pf.alpha_n;
+        } else {
+            quant_gemv(qkv_w->data, qkv_w->type, norm_out, qkv_out, H, qkv_dim, &gpu_qi[g], stream);
+            quant_gemv(gate_w->data, gate_w->type, norm_out, z_out, H, num_v * v_dim, &gpu_qi[g], stream);
+            quant_gemv(alpha_w->data, alpha_w->type, norm_out, a_out, H, num_v, &gpu_qi[g], stream);
+            quant_gemv(beta_w->data, beta_w->type, norm_out, b_out, H, num_v, &gpu_qi[g], stream);
+        }
+        if (g_profile_gdn) { g_gdn_proj_ms += pt_sync_g(pg_t0); pg_t0 = pt_now_g(); }
 
-        // 3. Conv1d update (FP32)
+        // 3. Conv1d update (FP32) — or fold into layer-coop kernel below.
         float* conv_out = gdn_bufs[g].conv_out;
         int kw = 4;
-        int threads_conv = min(qkv_dim, 256);
-        int blocks_conv = (qkv_dim + threads_conv - 1) / threads_conv;
-        conv1d_update_silu<<<blocks_conv, threads_conv, 0, stream>>>(
-            conv_state_slot,
-            qkv_out,
-            (float*)conv_w->data,  // conv weight is F32
-            conv_out,
-            qkv_dim, kw
-        );
+        static const bool use_layer_coop = getenv("GDN_LAYER_COOP") != nullptr;
+        bool can_coop = use_layer_coop && k_dim == 128 && v_dim == 128;
+        if (!can_coop) {
+            int threads_conv = min(qkv_dim, 256);
+            int blocks_conv = (qkv_dim + threads_conv - 1) / threads_conv;
+            conv1d_update_silu<<<blocks_conv, threads_conv, 0, stream>>>(
+                conv_state_slot,
+                qkv_out,
+                (float*)conv_w->data,
+                conv_out,
+                qkv_dim, kw
+            );
+            if (g_profile_gdn) { g_gdn_conv_ms += pt_sync_g(pg_t0); pg_t0 = pt_now_g(); }
+        }
         static const bool dump_gdn = getenv("DUMP_GDN") != nullptr;
         if (dump_gdn && layer == 0) {
             cudaDeviceSynchronize();
@@ -1905,36 +2058,91 @@ struct QwenModel {
             fflush(stderr);
         }
 
-        // 4. Recurrent GDN step
+        // 4+5. Recurrent GDN step + RMSNorm Gated (fused if GDN_LAYER_FUSE=1,
+        //      or full conv1d+recur+rmsg cooperative launch if GDN_LAYER_COOP=1)
         half* core_out = gdn_bufs[g].core_out;
-        int gdn_smem = (2 * cfg.linear_k_dim + 1) * sizeof(float);
-        gdn_recurrent_step<<<num_v, min(v_dim, 128), gdn_smem, stream>>>(
-            conv_out,
-            (float*)a_log_t->data,
-            (float*)dt_bias_t->data,
-            a_out,
-            b_out,
-            rec_state_slot,
-            core_out,
-            num_k, num_v, k_dim, v_dim
-        );
-        if (dump_gdn && layer == 0) {
-            cudaDeviceSynchronize();
-            half sample[8];
-            cudaMemcpy(sample, core_out, 8 * sizeof(half), cudaMemcpyDeviceToHost);
-            fprintf(stderr, "[GDN L0 core]  %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f\n",
-                    __half2float(sample[0]), __half2float(sample[1]), __half2float(sample[2]),
-                    __half2float(sample[3]), __half2float(sample[4]), __half2float(sample[5]),
-                    __half2float(sample[6]), __half2float(sample[7]));
-            fflush(stderr);
-        }
-
-        // 5. RMSNorm Gated
         half* normed_out = gdn_bufs[g].normed_out;
-        rms_norm_gated_kernel<<<num_v, min(v_dim, 128), 128 * sizeof(float), stream>>>(
-            core_out, z_out, (float*)ssm_norm_w->data, normed_out,
-            num_v, v_dim, 1e-6f
-        );
+        static const bool use_layer_fuse = getenv("GDN_LAYER_FUSE") != nullptr;
+        if (can_coop) {
+            int threads = 256;
+            int grid_dim = std::max((qkv_dim + threads - 1) / threads, num_v);
+            int smem_coop = (2 * 128 + 1 + threads) * sizeof(float);
+            half* qkv_in_local = qkv_out;
+            float* conv_w_data = (float*)conv_w->data;
+            float* a_log_data = (float*)a_log_t->data;
+            float* dt_bias_data = (float*)dt_bias_t->data;
+            float* ssm_norm_data = (float*)ssm_norm_w->data;
+            float eps_v = 1e-6f;
+            void* kernelArgs[] = {
+                (void*)&conv_state_slot,
+                (void*)&qkv_in_local,
+                (void*)&conv_w_data,
+                (void*)&conv_out,
+                (void*)&qkv_dim, (void*)&kw,
+                (void*)&a_log_data,
+                (void*)&dt_bias_data,
+                (void*)&a_out,
+                (void*)&b_out,
+                (void*)&rec_state_slot,
+                (void*)&z_out,
+                (void*)&ssm_norm_data,
+                (void*)&normed_out,
+                (void*)&num_k, (void*)&num_v, (void*)&eps_v
+            };
+            cudaSetDevice(g);
+            cudaLaunchCooperativeKernel(
+                (const void*)gdn_layer_fused_recur_rmsg<128, 128>,
+                dim3(grid_dim), dim3(threads),
+                kernelArgs, (size_t)smem_coop, stream
+            );
+            if (g_profile_gdn) {
+                double dt = pt_sync_g(pg_t0); pg_t0 = pt_now_g();
+                g_gdn_conv_ms  += dt * 0.0;  // (folded; charge to recur for now)
+                g_gdn_recur_ms += dt;
+            }
+        } else if (use_layer_fuse && k_dim == 128 && v_dim == 128) {
+            int fuse_smem = (2 * 128 + 1 + 128) * sizeof(float);
+            gdn_fused_recur_rmsg<128, 128><<<num_v, 128, fuse_smem, stream>>>(
+                conv_out,
+                (float*)a_log_t->data,
+                (float*)dt_bias_t->data,
+                a_out, b_out,
+                rec_state_slot,
+                z_out,
+                (float*)ssm_norm_w->data,
+                normed_out,
+                num_k, num_v, 1e-6f
+            );
+            if (g_profile_gdn) { g_gdn_recur_ms += pt_sync_g(pg_t0); pg_t0 = pt_now_g(); }
+        } else {
+            int gdn_smem = (2 * cfg.linear_k_dim + 1) * sizeof(float);
+            launch_gdn_recurrent_step(num_v, min(v_dim, 128), gdn_smem, stream,
+                conv_out,
+                (float*)a_log_t->data,
+                (float*)dt_bias_t->data,
+                a_out,
+                b_out,
+                rec_state_slot,
+                core_out,
+                num_k, num_v, k_dim, v_dim
+            );
+            if (g_profile_gdn) { g_gdn_recur_ms += pt_sync_g(pg_t0); pg_t0 = pt_now_g(); }
+            if (dump_gdn && layer == 0) {
+                cudaDeviceSynchronize();
+                half sample[8];
+                cudaMemcpy(sample, core_out, 8 * sizeof(half), cudaMemcpyDeviceToHost);
+                fprintf(stderr, "[GDN L0 core]  %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f\n",
+                        __half2float(sample[0]), __half2float(sample[1]), __half2float(sample[2]),
+                        __half2float(sample[3]), __half2float(sample[4]), __half2float(sample[5]),
+                        __half2float(sample[6]), __half2float(sample[7]));
+                fflush(stderr);
+            }
+            rms_norm_gated_kernel<<<num_v, min(v_dim, 128), 128 * sizeof(float), stream>>>(
+                core_out, z_out, (float*)ssm_norm_w->data, normed_out,
+                num_v, v_dim, 1e-6f
+            );
+            if (g_profile_gdn) { g_gdn_rmsg_ms += pt_sync_g(pg_t0); pg_t0 = pt_now_g(); }
+        }
         if (dump_gdn && layer == 0) {
             cudaDeviceSynchronize();
             half sample[8];
@@ -1950,6 +2158,7 @@ struct QwenModel {
         half* proj_out = gdn_bufs[g].proj_out;
         gpu_qi_inter[g].quantize(normed_out, num_v * v_dim, stream);
         quant_gemv(out_w->data, out_w->type, normed_out, proj_out, num_v * v_dim, H, &gpu_qi_inter[g], stream);
+        if (g_profile_gdn) { g_gdn_oproj_ms += pt_sync_g(pg_t0); pg_t0 = pt_now_g(); }
         if (dump_gdn && layer == 0) {
             cudaDeviceSynchronize();
             half sample[8];
@@ -1963,6 +2172,7 @@ struct QwenModel {
 
         // 7. Residual add into FP32 hidden
         add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(hidden, proj_out, H);
+        if (g_profile_gdn) { g_gdn_resi_ms += pt_sync_g(pg_t0); g_gdn_calls++; }
     }
 
     // ============ Chunked GDN forward (process N tokens together) ============
@@ -2675,7 +2885,7 @@ struct QwenModel {
             half* a_proj_i = gb.chunk_a_proj  + (size_t)i * num_v;
             half* b_proj_i = gb.chunk_b_proj  + (size_t)i * num_v;
             half* core_i   = gb.chunk_core_out + (size_t)i * v_total;
-            gdn_recurrent_step<<<num_v, std::min(v_dim, 128), gdn_smem, stream>>>(
+            launch_gdn_recurrent_step(num_v, std::min(v_dim, 128), gdn_smem, stream,
                 conv_in_i,
                 (float*)a_log_t->data,
                 (float*)dt_bias_t->data,
@@ -3797,7 +4007,7 @@ struct QwenModel {
             conv_state_slot, bA.attn_out, (float*)conv_w->data,
             gA.conv_out, qkv_dim, kw);
         int gdn_smem = (2 * cfg.linear_k_dim + 1) * sizeof(float);
-        gdn_recurrent_step<<<num_v, min(v_dim, 128), gdn_smem, stream>>>(
+        launch_gdn_recurrent_step(num_v, min(v_dim, 128), gdn_smem, stream,
             gA.conv_out, (float*)a_log_t->data, (float*)dt_bias_t->data,
             bA.mlp_up, bA.mlp_down,
             rec_state_slot, gA.core_out,
@@ -3823,7 +4033,7 @@ struct QwenModel {
         conv1d_update_silu<<<blocks_conv, threads_conv, 0, stream>>>(
             conv_state_slot, bB.attn_out, (float*)conv_w->data,
             gB.conv_out, qkv_dim, kw);
-        gdn_recurrent_step<<<num_v, min(v_dim, 128), gdn_smem, stream>>>(
+        launch_gdn_recurrent_step(num_v, min(v_dim, 128), gdn_smem, stream,
             gB.conv_out, (float*)a_log_t->data, (float*)dt_bias_t->data,
             bB.mlp_up, bB.mlp_down,
             rec_state_slot, gB.core_out,
@@ -4119,7 +4329,7 @@ struct QwenModel {
         conv1d_update_silu<<<blocks_conv, threads_conv, 0, stream>>>(
             conv_state_slot, bA.attn_out, (float*)conv_w->data,
             gA.conv_out, qkv_dim, kw);
-        gdn_recurrent_step<<<num_v, min(v_dim, 128), gdn_smem, stream>>>(
+        launch_gdn_recurrent_step(num_v, min(v_dim, 128), gdn_smem, stream,
             gA.conv_out, (float*)a_log_t->data, (float*)dt_bias_t->data,
             bA.mlp_up, bA.mlp_down,
             rec_state_slot, gA.core_out,
@@ -4143,7 +4353,7 @@ struct QwenModel {
         conv1d_update_silu<<<blocks_conv, threads_conv, 0, stream>>>(
             conv_state_slot, bB.attn_out, (float*)conv_w->data,
             gB.conv_out, qkv_dim, kw);
-        gdn_recurrent_step<<<num_v, min(v_dim, 128), gdn_smem, stream>>>(
+        launch_gdn_recurrent_step(num_v, min(v_dim, 128), gdn_smem, stream,
             gB.conv_out, (float*)a_log_t->data, (float*)dt_bias_t->data,
             bB.mlp_up, bB.mlp_down,
             rec_state_slot, gB.core_out,
@@ -4166,7 +4376,7 @@ struct QwenModel {
         conv1d_update_silu<<<blocks_conv, threads_conv, 0, stream>>>(
             conv_state_slot, bC.attn_out, (float*)conv_w->data,
             gC.conv_out, qkv_dim, kw);
-        gdn_recurrent_step<<<num_v, min(v_dim, 128), gdn_smem, stream>>>(
+        launch_gdn_recurrent_step(num_v, min(v_dim, 128), gdn_smem, stream,
             gC.conv_out, (float*)a_log_t->data, (float*)dt_bias_t->data,
             bC.mlp_up, bC.mlp_down,
             rec_state_slot, gC.core_out,
