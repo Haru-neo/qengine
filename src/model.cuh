@@ -4,6 +4,9 @@
 #include "ops.cuh"
 #include "gdn_kernels.cuh"
 #include "attention.cuh"
+#include "sparse_attn/sparse_config.h"
+#include "sparse_attn/sparse_index.cuh"
+#include "sparse_attn/block_sparse.cuh"
 #include <string>
 #include <cstdio>
 #include <chrono>
@@ -730,6 +733,13 @@ struct QwenModel {
         float* attn_split_m = nullptr;
         float* attn_split_l = nullptr;
         float* attn_split_o = nullptr;
+        // MInference-style block-sparse scratch (lazy-alloc when MINF_SPARSE_ATTN
+        // is on). sparse_k_pool: per-layer mean-pooled K[num_kv, N_blocks, HD].
+        // sparse_block_index: per-call top-k selection [num_kv, ATTN_NB, top_k].
+        // Sized for the worst case (max_seq, top_k_max=64) so we don't realloc
+        // mid-stream.
+        half* sparse_k_pool   = nullptr;
+        int*  sparse_block_index = nullptr;
     };
     AttnBuffers attn_bufs[4];
     AttnBuffers attn_bufs2[4];  // second-token attn buffers, for forward_attn_n2
@@ -859,6 +869,11 @@ struct QwenModel {
     };
     std::unordered_map<int, Q8KVCache> q8_kv_caches;
     bool use_q8_kv = false;
+    // MInference-style sparse attention runtime config. Loaded once from env
+    // (MINF_SPARSE_ATTN, MINF_PROFILE_PATH, MINF_BUDGET, MINF_MIN_SEQ) at
+    // init_kv_cache. When `enabled` is false the chunked attn path stays on
+    // the existing dense flash_attn_chunk_fused_split kernel.
+    SparseRuntime sparse_rt;
 
     void init_kv_cache(int slot_max_seq_arg, int num_slots_arg = 1) {
         slot_max_seq = slot_max_seq_arg;
@@ -871,6 +886,11 @@ struct QwenModel {
         int kv_size = kv_total_seq * kv_dim * sizeof(half);
         use_turboquant = (getenv("MTP_TQ") != nullptr);
         use_q8_kv      = (getenv("Q8KV")    != nullptr);
+        // Sparse-attention runtime config. Reads MINF_* env, optionally loads
+        // the offline profile. Must run BEFORE any forward_attn_chunk call.
+        // No buffers allocated here — those are lazy in forward_attn_chunk
+        // because they live on the AttnBuffers per-GPU scratch.
+        sparse_rt = parse_sparse_runtime();
         if (use_turboquant && use_q8_kv) {
             fprintf(stderr, "[KV] both MTP_TQ and Q8KV set — ignoring Q8KV (TQ wins)\n");
             use_q8_kv = false;
@@ -3148,7 +3168,11 @@ struct QwenModel {
                 // the non-split kernels still read fp16 and need the scratch
                 // populated, so keep the bulk pass.
                 static const bool q8_fused_chunk = (getenv("Q8KV_FUSED_CHUNK") != nullptr);
-                bool skip_dequant = q8_fused_chunk && (start_pos + ATTN_NB >= 4096);
+                // Sparse path reads fp16 K from k_cache_ptr (= tq_k_buf for Q8KV
+                // mode), so we must keep the bulk dequant alive when sparse_rt
+                // is enabled even if Q8KV_FUSED_CHUNK is also set.
+                bool skip_dequant = q8_fused_chunk && (start_pos + ATTN_NB >= 4096)
+                                  && !sparse_rt.enabled;
                 if (!skip_dequant) {
                     if (start_pos > 0) {
                         int hist_blocks = start_pos * bpt;
@@ -3288,6 +3312,81 @@ struct QwenModel {
                                    + 2 * BM * HD * sizeof(half)
                                    + (num_q == 24 ? 6 : 4) * BM * sizeof(float);
                     dim3 fg(num_kv, sub_n, fa_sk);
+                    // MInference-style block-sparse path. Reads fp16 K/V from
+                    // k_cache_ptr (already populated for use_q8_kv via the
+                    // legacy bulk-dequant pass — sparse mode forces that pass
+                    // to keep tq_k_buf valid). Per (kv_head, t_idx) we build
+                    // a top-k block index against the mean-pooled K cache,
+                    // then drive flash_attn_chunk_block_sparse_split with that
+                    // index. Existing flash_attn_split_merge handles K-split
+                    // log-sum-exp combine.
+                    if (sparse_rt.enabled && sub_seq_total >= sparse_rt.min_seq_for_sparse) {
+                        constexpr int BLOCK_N    = 64;
+                        constexpr int BLOCK_THR  = 256;
+                        int n_blocks = (sub_seq_total + BLOCK_N - 1) / BLOCK_N;
+                        int top_k = max(1, (int)(n_blocks * sparse_rt.flops_budget));
+                        if (top_k > 64) top_k = 64;
+                        // Lazy alloc K_pool (per-layer, max-sized) + block_index
+                        // (per-call, sub_n_max × top_k_max).
+                        int n_blocks_max = (slot_max_seq + BLOCK_N - 1) / BLOCK_N;
+                        if (!ab.sparse_k_pool) {
+                            cudaMalloc(&ab.sparse_k_pool,
+                                       (size_t)num_kv * n_blocks_max * HD * sizeof(half));
+                        }
+                        if (!ab.sparse_block_index) {
+                            cudaMalloc(&ab.sparse_block_index,
+                                       (size_t)num_kv * ATTN_NB * 64 * sizeof(int));
+                        }
+                        // 1. K_pool[num_kv, n_blocks, HD]
+                        dim3 kp_grid(num_kv, n_blocks, (HD + BLOCK_THR - 1) / BLOCK_THR);
+                        build_k_pool_kern<HD, BLOCK_N, BLOCK_THR>
+                            <<<kp_grid, BLOCK_THR, 0, stream>>>(
+                                k_cache_ptr, ab.sparse_k_pool, num_kv, sub_seq_total);
+                        // 2. block_index[num_kv, sub_n_max, top_k]
+                        dim3 bi_grid(num_kv, sub_n);
+                        size_t bi_smem = HD * sizeof(half) + (size_t)n_blocks * sizeof(float);
+                        if (num_q == 24) {
+                            build_block_index_kern<HD, 6, BLOCK_THR>
+                                <<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
+                                    q_post_sub, ab.sparse_k_pool, ab.sparse_block_index,
+                                    num_q, num_kv, sub_n, ATTN_NB, sub_start_pos,
+                                    top_k, BLOCK_N, n_blocks);
+                        } else {
+                            build_block_index_kern<HD, 4, BLOCK_THR>
+                                <<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
+                                    q_post_sub, ab.sparse_k_pool, ab.sparse_block_index,
+                                    num_q, num_kv, sub_n, ATTN_NB, sub_start_pos,
+                                    top_k, BLOCK_N, n_blocks);
+                        }
+                        auto launch_sp = [&](auto gqa_const, auto k_const) {
+                            constexpr int GQA = decltype(gqa_const)::value;
+                            constexpr int K   = decltype(k_const)::value;
+                            flash_attn_chunk_block_sparse_split<HD, GQA, BM, BLOCK, K>
+                                <<<fg, BLOCK, smem_bytes, stream>>>(
+                                    q_post_sub, k_cache_ptr, v_cache_ptr,
+                                    ab.sparse_block_index,
+                                    ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
+                                    num_q, num_kv, sub_start_pos, sub_n, ATTN_NB,
+                                    active_end_max, scale, top_k, BLOCK_N);
+                            dim3 mg(num_kv, sub_n);
+                            flash_attn_split_merge<HD, GQA, BLOCK, K>
+                                <<<mg, BLOCK, 0, stream>>>(
+                                    ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
+                                    out_sub, num_q, sub_n, ATTN_NB);
+                        };
+                        if (num_q == 24) {
+                            if      (fa_sk == 2) launch_sp(std::integral_constant<int,6>{}, std::integral_constant<int,2>{});
+                            else if (fa_sk == 4) launch_sp(std::integral_constant<int,6>{}, std::integral_constant<int,4>{});
+                            else                 launch_sp(std::integral_constant<int,6>{}, std::integral_constant<int,8>{});
+                        } else {
+                            if      (fa_sk == 2) launch_sp(std::integral_constant<int,4>{}, std::integral_constant<int,2>{});
+                            else if (fa_sk == 4) launch_sp(std::integral_constant<int,4>{}, std::integral_constant<int,4>{});
+                            else                 launch_sp(std::integral_constant<int,4>{}, std::integral_constant<int,8>{});
+                        }
+                        if (g_profile_attn) g_attn_fused_ms += pa_sync_ms(tf0);
+                        sub_processed += sub_n;
+                        continue;
+                    }
                     // Q8KV_FUSED_CHUNK=1: read directly from the Q8 cache via
                     // cooperative dequant inside the kernel, skipping the
                     // bulk-dequant + fp16-scratch round-trip the legacy Q8 path
