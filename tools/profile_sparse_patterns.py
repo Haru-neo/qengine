@@ -47,11 +47,32 @@ import numpy as np  # type: ignore
 # new model architecture this list expands.
 _ARCH_BY_HIDDEN = {
     5120: dict(num_layers=64, num_q_heads=24, head_dim=256),  # 27B
-    4096: dict(num_layers=64, num_q_heads=16, head_dim=256),  # 9B
+    4096: dict(num_layers=32, num_q_heads=16, head_dim=256),  # 9B (32 layers, not 64)
 }
 
 _MAGIC = 0x464E494D
 _VERSION = 1
+
+# Pattern enum mirrors src/sparse_attn/sparse_config.h: SparsePattern
+PATTERN_DENSE          = 0
+PATTERN_BLOCK_SPARSE   = 1
+PATTERN_VERTICAL_SLASH = 2
+PATTERN_A_SHAPE        = 3
+
+
+def write_uniform_profile(path: Path, num_layers: int, num_q_heads: int,
+                          pattern: int, *, btk: int = 0, vtk: int = 0,
+                          stk: int = 0, win: int = 0, sink: int = 0,
+                          flops_budget: float = 0.10) -> None:
+    """Synthetic profile: every head gets the same pattern + params. Used by
+    the profiler to ask the engine for a full sweep at one configuration."""
+    with path.open("wb") as f:
+        f.write(struct.pack("<IIIIfIII",
+            _MAGIC, _VERSION, num_layers, num_q_heads, flops_budget, 0, 0, 0))
+        rec = struct.pack("<B3xIIIIIIII",
+            pattern, btk, vtk, stk, win, sink, 0, 0, 0)
+        for _ in range(num_layers * num_q_heads):
+            f.write(rec)
 
 
 def wait_port(port: int, timeout: float) -> bool:
@@ -246,7 +267,9 @@ def main() -> int:
     p.add_argument("--calibration", required=True,
                    help="path to a text file ≥ MINF_MIN_SEQ tokens")
     p.add_argument("--budgets", default="0.05,0.10,0.20,0.40",
-                   help="comma-separated FLOPs budgets to sweep")
+                   help="comma-separated FLOPs budgets to sweep (block-sparse)")
+    p.add_argument("--a-shape", default="64x512,64x1024,128x2048",
+                   help="comma-separated sink x window pairs to sweep (A-shape)")
     p.add_argument("--tol", type=float, default=0.05,
                    help="max acceptable relative L2 vs dense (else stays DENSE)")
     p.add_argument("--out", required=True, help="output profile .bin path")
@@ -261,6 +284,12 @@ def main() -> int:
     num_q_heads  = arch["num_q_heads"]
     head_dim     = arch["head_dim"]
     budgets      = [float(b) for b in args.budgets.split(",") if b.strip()]
+    a_shape_pairs: list[tuple[int, int]] = []
+    for pair in args.a_shape.split(","):
+        pair = pair.strip()
+        if not pair: continue
+        s, w = pair.split("x")
+        a_shape_pairs.append((int(s), int(w)))
     prompt       = Path(args.calibration).read_text()
 
     work = Path(tempfile.mkdtemp(prefix="qengine_profile_"))
@@ -274,7 +303,9 @@ def main() -> int:
     )
     dense = load_dumps(dense_dir)
 
-    # Passes 1..N: sparse at each candidate budget.
+    # Block-sparse passes: uniform block-sparse at each budget. No profile
+    # needed — the engine falls back to uniform block-sparse when PROFILE_PATH
+    # is absent, which is exactly the candidate we want to score.
     sparse_runs: dict[float, dict[int, np.ndarray]] = {}
     for b in budgets:
         env = {
@@ -289,55 +320,94 @@ def main() -> int:
         )
         sparse_runs[b] = load_dumps(d)
 
+    # A-shape passes: write a synthetic all-A_SHAPE profile per (sink, window)
+    # candidate; engine reads it via MINF_PROFILE_PATH and routes every layer
+    # through the deterministic sink+window index. The block-sparse fallback
+    # the budget controls doesn't fire for these passes.
+    a_shape_runs: dict[tuple[int, int], dict[int, np.ndarray]] = {}
+    for sink, window in a_shape_pairs:
+        prof_path = work / f"prof_as_{sink}_{window}.bin"
+        write_uniform_profile(
+            prof_path, num_layers, num_q_heads,
+            pattern=PATTERN_A_SHAPE, win=window, sink=sink,
+        )
+        env = {
+            "MINF_SPARSE_ATTN": "1",
+            "MINF_BUDGET": "0.10",
+            "MINF_MIN_SEQ": "4096",
+            "MINF_PROFILE_PATH": str(prof_path),
+        }
+        d = collect_run(
+            engine=args.engine, model=args.model, port=args.port,
+            max_seq=args.max_seq, sparse_env=env,
+            prompt=prompt, label=f"as_S{sink}_W{window}", work=work,
+        )
+        a_shape_runs[(sink, window)] = load_dumps(d)
+
     # Score per (layer, head). For each head we want the *smallest* budget
-    # whose L2 ≤ tol; that maximises sparsity while preserving quality. If no
-    # budget meets the bar, leave the head DENSE.
+    # whose L2 ≤ tol that maximises sparsity while preserving quality. We
+    # rank candidates roughly by FLOPs cost: smaller → cheaper. A-shape's
+    # cost is a function of (sink + window) / context_len, treated as a
+    # block-sparse equivalent budget for ordering. If no candidate meets the
+    # bar, leave the head DENSE.
     head_records: list[dict] = []
-    summary_rows: list[str] = ["layer,q_head,chosen_budget,best_l2"]
-    sparse_layers = set()
-    for d in sparse_runs.values():
-        sparse_layers.update(d)
-    common_layers = set(dense) & sparse_layers
+    summary_rows: list[str] = ["layer,q_head,chosen,best_l2"]
+    candidate_layers = set(dense)
+    for d in sparse_runs.values():    candidate_layers.update(d.keys())
+    for d in a_shape_runs.values():   candidate_layers.update(d.keys())
+
+    # Build (cost, label, pattern_dict, dump_dict) candidates. Sort ascending
+    # by cost. For each head we walk the list and pick the cheapest candidate
+    # within tol; if none, head goes DENSE with the lowest-L2 fallback noted.
+    AVG_CTX_BLOCKS = 200  # rough proxy for 16K context @ block_size=64
+    candidates: list[tuple[float, str, dict, dict[int, np.ndarray]]] = []
+    for b in budgets:
+        candidates.append((
+            float(b), f"BLOCK_SPARSE@{b:.3f}",
+            {"pattern": PATTERN_BLOCK_SPARSE, "block_top_k": max(1, int(b * 100))},
+            sparse_runs[b],
+        ))
+    for sink, window in a_shape_pairs:
+        approx_budget = (sink + window) / max(1, AVG_CTX_BLOCKS * 64)
+        candidates.append((
+            approx_budget, f"A_SHAPE@s{sink}w{window}",
+            {"pattern": PATTERN_A_SHAPE, "window": window, "sink": sink},
+            a_shape_runs[(sink, window)],
+        ))
+    candidates.sort(key=lambda c: c[0])
+
     for layer in range(num_layers):
         for q in range(num_q_heads):
-            chosen_budget = None
-            best_l2_at_chosen = None
+            chosen_label = None
+            chosen_record = None
+            chosen_l2 = None
             best_overall_l2 = None
-            best_overall_b = None
-            if layer in common_layers:
-                for b in sorted(budgets):
-                    sparse = sparse_runs[b].get(layer)
+            best_overall_label = None
+            if layer in candidate_layers and layer in dense:
+                for cost, label, rec, dumps in candidates:
+                    sparse = dumps.get(layer)
                     if sparse is None:
                         continue
-                    l2 = per_head_l2(dense[layer], sparse, num_q_heads, head_dim)[q]
+                    l2 = float(per_head_l2(dense[layer], sparse, num_q_heads, head_dim)[q])
                     if best_overall_l2 is None or l2 < best_overall_l2:
-                        best_overall_l2 = float(l2)
-                        best_overall_b = b
-                    if l2 <= args.tol and chosen_budget is None:
-                        chosen_budget = b
-                        best_l2_at_chosen = float(l2)
-                        break
-            if chosen_budget is None:
-                head_records.append({
-                    "pattern": 0,  # DENSE
-                    "block_top_k": 0,
-                })
+                        best_overall_l2 = l2
+                        best_overall_label = label
+                    if l2 <= args.tol and chosen_label is None:
+                        chosen_label = label
+                        chosen_record = rec
+                        chosen_l2 = l2
+                        # Don't break — keep walking so best_overall_l2 is
+                        # accurate for the CSV. Cheaper candidates already
+                        # tried thanks to ascending sort.
+            if chosen_label is None:
+                head_records.append({"pattern": PATTERN_DENSE})
                 summary_rows.append(
-                    f"{layer},{q},DENSE,{best_overall_l2 if best_overall_l2 is not None else 'nan'}"
+                    f"{layer},{q},DENSE(best_was {best_overall_label or 'none'}),"
+                    f"{best_overall_l2 if best_overall_l2 is not None else 'nan'}"
                 )
             else:
-                # Approximate top_k from budget. The runtime cap of 64 is
-                # mirrored here so the engine and profiler stay in sync.
-                # n_blocks scales with active context; we encode budget rather
-                # than top_k so the engine can resolve it per call.
-                top_k_marker = max(1, int(chosen_budget * 100))  # scaled %
-                head_records.append({
-                    "pattern": 1,  # BLOCK_SPARSE
-                    "block_top_k": top_k_marker,
-                })
-                summary_rows.append(
-                    f"{layer},{q},BLOCK_SPARSE@{chosen_budget:.3f},{best_l2_at_chosen:.4f}"
-                )
+                head_records.append(chosen_record)
+                summary_rows.append(f"{layer},{q},{chosen_label},{chosen_l2:.4f}")
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

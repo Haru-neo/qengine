@@ -6,6 +6,7 @@
 #include "attention.cuh"
 #include "sparse_attn/sparse_config.h"
 #include "sparse_attn/sparse_index.cuh"
+#include "sparse_attn/a_shape_index.cuh"
 #include "sparse_attn/block_sparse.cuh"
 #include <string>
 #include <cstdio>
@@ -3320,24 +3321,29 @@ struct QwenModel {
                     // then drive flash_attn_chunk_block_sparse_split with that
                     // index. Existing flash_attn_split_merge handles K-split
                     // log-sum-exp combine.
-                    // Per-layer pattern routing. With a loaded SparseProfile we
-                    // honour the per-head decision the offline profiler made
-                    // and only take the sparse path when at least one q_head
-                    // in this layer asked for BLOCK_SPARSE. Heads marked DENSE
-                    // are still computed by the sparse kernel (block_index
-                    // simply selects all blocks for them) — that's a phase-2
-                    // refinement; v1 keeps the layer uniform.
-                    bool layer_sparse_ok = sparse_rt.enabled && sub_seq_total >= sparse_rt.min_seq_for_sparse;
-                    if (layer_sparse_ok && !sparse_rt.profile.empty()
+                    // Per-layer pattern routing. Phase 2A: pick one pattern
+                    // for the whole layer from the profile (or fall back to
+                    // BLOCK_SPARSE without a profile). DENSE → fall through
+                    // to the existing dense FA dispatch. BLOCK_SPARSE → score
+                    // K_pool + top-k. A_SHAPE → deterministic sink+window
+                    // index. Both index builders feed the same
+                    // flash_attn_chunk_block_sparse_split kernel.
+                    SparsePattern layer_pattern = SPARSE_BLOCK;  // default when no profile
+                    uint32_t a_sink   = 64;
+                    uint32_t a_window = 1024;
+                    if (sparse_rt.enabled && !sparse_rt.profile.empty()
                         && (uint32_t)layer < sparse_rt.profile.num_layers) {
-                        bool any_block = false;
-                        for (uint32_t qh = 0; qh < sparse_rt.profile.num_q_heads; qh++) {
-                            if (sparse_rt.profile.at((int)layer, (int)qh).pattern == SPARSE_BLOCK) {
-                                any_block = true; break;
-                            }
-                        }
-                        layer_sparse_ok = any_block;
+                        // Pattern of head 0 (representative). The profiler
+                        // writes the same pattern for every q_head in a layer
+                        // when running per-layer mode.
+                        const auto& h0 = sparse_rt.profile.at((int)layer, 0);
+                        layer_pattern = h0.pattern;
+                        if (h0.window > 0) a_window = h0.window;
+                        if (h0.sink   > 0) a_sink   = h0.sink;
                     }
+                    bool layer_sparse_ok = sparse_rt.enabled
+                        && sub_seq_total >= sparse_rt.min_seq_for_sparse
+                        && (layer_pattern == SPARSE_BLOCK || layer_pattern == SPARSE_A_SHAPE);
                     if (layer_sparse_ok) {
                         constexpr int BLOCK_N    = 64;
                         constexpr int BLOCK_THR  = 256;
@@ -3355,26 +3361,45 @@ struct QwenModel {
                             cudaMalloc(&ab.sparse_block_index,
                                        (size_t)num_kv * ATTN_NB * 64 * sizeof(int));
                         }
-                        // 1. K_pool[num_kv, n_blocks, HD]
-                        dim3 kp_grid(num_kv, n_blocks, (HD + BLOCK_THR - 1) / BLOCK_THR);
-                        build_k_pool_kern<HD, BLOCK_N, BLOCK_THR>
-                            <<<kp_grid, BLOCK_THR, 0, stream>>>(
-                                k_cache_ptr, ab.sparse_k_pool, num_kv, sub_seq_total);
-                        // 2. block_index[num_kv, sub_n_max, top_k]
-                        dim3 bi_grid(num_kv, sub_n);
-                        size_t bi_smem = HD * sizeof(half) + (size_t)n_blocks * sizeof(float);
-                        if (num_q == 24) {
-                            build_block_index_kern<HD, 6, BLOCK_THR>
-                                <<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
-                                    q_post_sub, ab.sparse_k_pool, ab.sparse_block_index,
-                                    num_q, num_kv, sub_n, ATTN_NB, sub_start_pos,
-                                    top_k, BLOCK_N, n_blocks);
+                        if (layer_pattern == SPARSE_BLOCK) {
+                            // 1. K_pool[num_kv, n_blocks, HD]
+                            dim3 kp_grid(num_kv, n_blocks, (HD + BLOCK_THR - 1) / BLOCK_THR);
+                            build_k_pool_kern<HD, BLOCK_N, BLOCK_THR>
+                                <<<kp_grid, BLOCK_THR, 0, stream>>>(
+                                    k_cache_ptr, ab.sparse_k_pool, num_kv, sub_seq_total);
+                            // 2. block_index[num_kv, sub_n_max, top_k]
+                            dim3 bi_grid(num_kv, sub_n);
+                            size_t bi_smem = HD * sizeof(half) + (size_t)n_blocks * sizeof(float);
+                            if (num_q == 24) {
+                                build_block_index_kern<HD, 6, BLOCK_THR>
+                                    <<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
+                                        q_post_sub, ab.sparse_k_pool, ab.sparse_block_index,
+                                        num_q, num_kv, sub_n, ATTN_NB, sub_start_pos,
+                                        top_k, BLOCK_N, n_blocks);
+                            } else {
+                                build_block_index_kern<HD, 4, BLOCK_THR>
+                                    <<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
+                                        q_post_sub, ab.sparse_k_pool, ab.sparse_block_index,
+                                        num_q, num_kv, sub_n, ATTN_NB, sub_start_pos,
+                                        top_k, BLOCK_N, n_blocks);
+                            }
                         } else {
-                            build_block_index_kern<HD, 4, BLOCK_THR>
-                                <<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
-                                    q_post_sub, ab.sparse_k_pool, ab.sparse_block_index,
-                                    num_q, num_kv, sub_n, ATTN_NB, sub_start_pos,
-                                    top_k, BLOCK_N, n_blocks);
+                            // SPARSE_A_SHAPE: deterministic sink+window block list,
+                            // no Q/K scoring needed. Index built directly from
+                            // (sink, window) parameters provided by the profile.
+                            int sink_blocks   = ((int)a_sink   + BLOCK_N - 1) / BLOCK_N;
+                            int window_blocks = ((int)a_window + BLOCK_N - 1) / BLOCK_N + 1;
+                            // Recompute top_k to fit the deterministic budget
+                            // (cap at 64 like the kernel-side block_index allocation).
+                            int needed = sink_blocks + window_blocks;
+                            if (needed > top_k) top_k = needed;
+                            if (top_k > 64) top_k = 64;
+                            dim3 ai_grid(num_kv, sub_n);
+                            build_a_shape_index_kern<<<ai_grid, 1, 0, stream>>>(
+                                ab.sparse_block_index,
+                                num_kv, sub_n, ATTN_NB,
+                                sub_start_pos, top_k,
+                                BLOCK_N, sink_blocks, window_blocks);
                         }
                         auto launch_sp = [&](auto gqa_const, auto k_const) {
                             constexpr int GQA = decltype(gqa_const)::value;
