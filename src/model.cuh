@@ -7,6 +7,7 @@
 #include "sparse_attn/sparse_config.h"
 #include "sparse_attn/sparse_index.cuh"
 #include "sparse_attn/a_shape_index.cuh"
+#include "sparse_attn/vertical_slash_index.cuh"
 #include "sparse_attn/block_sparse.cuh"
 #include <string>
 #include <cstdio>
@@ -736,11 +737,17 @@ struct QwenModel {
         float* attn_split_o = nullptr;
         // MInference-style block-sparse scratch (lazy-alloc when MINF_SPARSE_ATTN
         // is on). sparse_k_pool: per-layer mean-pooled K[num_kv, N_blocks, HD].
+        // sparse_k_pool_max: companion max-abs signature for mBSA. Same shape.
         // sparse_block_index: per-call top-k selection [num_kv, ATTN_NB, top_k].
         // Sized for the worst case (max_seq, top_k_max=64) so we don't realloc
         // mid-stream.
-        half* sparse_k_pool   = nullptr;
+        half* sparse_k_pool     = nullptr;
+        half* sparse_k_pool_max = nullptr;
         int*  sparse_block_index = nullptr;
+        // Vertical-slash scratch: per-kv top-V vertical block ids and top-S
+        // slash deltas. Recomputed each chunk from this chunk's queries.
+        int*  sparse_vertical_idx = nullptr;
+        int*  sparse_slash_idx    = nullptr;
     };
     AttnBuffers attn_bufs[4];
     AttnBuffers attn_bufs2[4];  // second-token attn buffers, for forward_attn_n2
@@ -3343,7 +3350,10 @@ struct QwenModel {
                     }
                     bool layer_sparse_ok = sparse_rt.enabled
                         && sub_seq_total >= sparse_rt.min_seq_for_sparse
-                        && (layer_pattern == SPARSE_BLOCK || layer_pattern == SPARSE_A_SHAPE);
+                        && (layer_pattern == SPARSE_BLOCK
+                         || layer_pattern == SPARSE_A_SHAPE
+                         || layer_pattern == SPARSE_BLOCK_MS
+                         || layer_pattern == SPARSE_VERTICAL_SLASH);
                     if (layer_sparse_ok) {
                         constexpr int BLOCK_N    = 64;
                         constexpr int BLOCK_THR  = 256;
@@ -3361,16 +3371,50 @@ struct QwenModel {
                             cudaMalloc(&ab.sparse_block_index,
                                        (size_t)num_kv * ATTN_NB * 64 * sizeof(int));
                         }
-                        if (layer_pattern == SPARSE_BLOCK) {
+                        if (layer_pattern == SPARSE_BLOCK || layer_pattern == SPARSE_BLOCK_MS) {
                             // 1. K_pool[num_kv, n_blocks, HD]
                             dim3 kp_grid(num_kv, n_blocks, (HD + BLOCK_THR - 1) / BLOCK_THR);
                             build_k_pool_kern<HD, BLOCK_N, BLOCK_THR>
                                 <<<kp_grid, BLOCK_THR, 0, stream>>>(
                                     k_cache_ptr, ab.sparse_k_pool, num_kv, sub_seq_total);
+                            // 1b. K_pool_max — only built when this layer asked for
+                            // mBSA. Lazy-alloced on first MS layer encountered. The
+                            // grid layout matches mean-pool, just a different output.
+                            if (layer_pattern == SPARSE_BLOCK_MS) {
+                                if (!ab.sparse_k_pool_max) {
+                                    cudaMalloc(&ab.sparse_k_pool_max,
+                                               (size_t)num_kv * n_blocks_max * HD * sizeof(half));
+                                }
+                                build_k_pool_max_kern<HD, BLOCK_N, BLOCK_THR>
+                                    <<<kp_grid, BLOCK_THR, 0, stream>>>(
+                                        k_cache_ptr, ab.sparse_k_pool_max, num_kv, sub_seq_total);
+                            }
                             // 2. block_index[num_kv, sub_n_max, top_k]
                             dim3 bi_grid(num_kv, sub_n);
                             size_t bi_smem = HD * sizeof(half) + (size_t)n_blocks * sizeof(float);
-                            if (num_q == 24) {
+                            // β default 0.5: max-sig contributes at half the weight
+                            // of mean-sig. Tunable via MINF_MS_BETA env if needed.
+                            static const float ms_beta = []{
+                                const char* e = getenv("MINF_MS_BETA");
+                                return e ? atof(e) : 0.5f;
+                            }();
+                            if (layer_pattern == SPARSE_BLOCK_MS) {
+                                if (num_q == 24) {
+                                    build_block_index_ms_kern<HD, 6, BLOCK_THR>
+                                        <<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
+                                            q_post_sub, ab.sparse_k_pool, ab.sparse_k_pool_max,
+                                            ab.sparse_block_index,
+                                            num_q, num_kv, sub_n, ATTN_NB, sub_start_pos,
+                                            top_k, BLOCK_N, n_blocks, ms_beta);
+                                } else {
+                                    build_block_index_ms_kern<HD, 4, BLOCK_THR>
+                                        <<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
+                                            q_post_sub, ab.sparse_k_pool, ab.sparse_k_pool_max,
+                                            ab.sparse_block_index,
+                                            num_q, num_kv, sub_n, ATTN_NB, sub_start_pos,
+                                            top_k, BLOCK_N, n_blocks, ms_beta);
+                                }
+                            } else if (num_q == 24) {
                                 build_block_index_kern<HD, 6, BLOCK_THR>
                                     <<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
                                         q_post_sub, ab.sparse_k_pool, ab.sparse_block_index,
@@ -3383,6 +3427,63 @@ struct QwenModel {
                                         num_q, num_kv, sub_n, ATTN_NB, sub_start_pos,
                                         top_k, BLOCK_N, n_blocks);
                             }
+                        } else if (layer_pattern == SPARSE_VERTICAL_SLASH) {
+                            // SPARSE_VERTICAL_SLASH: build K_pool, then aggregate
+                            // chunk-wide vertical / slash patterns and assemble
+                            // per-token block_index = vertical ∪ slash@t_idx.
+                            dim3 kp_grid(num_kv, n_blocks, (HD + BLOCK_THR - 1) / BLOCK_THR);
+                            build_k_pool_kern<HD, BLOCK_N, BLOCK_THR>
+                                <<<kp_grid, BLOCK_THR, 0, stream>>>(
+                                    k_cache_ptr, ab.sparse_k_pool, num_kv, sub_seq_total);
+                            // V_top_k + S_top_k are pulled from the profile head
+                            // record; sane defaults if both are zero.
+                            int V_topk = sparse_rt.profile.empty()
+                                ? 16 : (int)sparse_rt.profile.at((int)layer, 0).vertical_top_k;
+                            int S_topk = sparse_rt.profile.empty()
+                                ? 8  : (int)sparse_rt.profile.at((int)layer, 0).slash_top_k;
+                            if (V_topk <= 0) V_topk = 16;
+                            if (S_topk <= 0) S_topk = 8;
+                            int V_max = 64, S_max = 64;
+                            if (!ab.sparse_vertical_idx)
+                                cudaMalloc(&ab.sparse_vertical_idx,
+                                           (size_t)num_kv * V_max * sizeof(int));
+                            if (!ab.sparse_slash_idx)
+                                cudaMalloc(&ab.sparse_slash_idx,
+                                           (size_t)num_kv * S_max * sizeof(int));
+                            // Stage A: per-kv aggregation. SMEM = sub_n*HD halves
+                            // + (sub_n+2)*n_blocks floats.
+                            size_t vs_smem = (size_t)sub_n * HD * sizeof(half)
+                                           + (size_t)sub_n * n_blocks * sizeof(float)
+                                           + (size_t)2 * n_blocks * sizeof(float);
+                            dim3 vs_grid(num_kv);
+                            if (num_q == 24) {
+                                build_vs_aggregate_kern<HD, 6, BLOCK_THR>
+                                    <<<vs_grid, BLOCK_THR, vs_smem, stream>>>(
+                                        q_post_sub, ab.sparse_k_pool,
+                                        ab.sparse_vertical_idx, ab.sparse_slash_idx,
+                                        num_q, num_kv, sub_n, ATTN_NB,
+                                        sub_start_pos,
+                                        V_topk, S_topk, BLOCK_N, n_blocks);
+                            } else {
+                                build_vs_aggregate_kern<HD, 4, BLOCK_THR>
+                                    <<<vs_grid, BLOCK_THR, vs_smem, stream>>>(
+                                        q_post_sub, ab.sparse_k_pool,
+                                        ab.sparse_vertical_idx, ab.sparse_slash_idx,
+                                        num_q, num_kv, sub_n, ATTN_NB,
+                                        sub_start_pos,
+                                        V_topk, S_topk, BLOCK_N, n_blocks);
+                            }
+                            // Stage B: per-token assembly.
+                            int needed = V_topk + S_topk;
+                            if (needed > top_k) top_k = needed;
+                            if (top_k > 64) top_k = 64;
+                            dim3 vsi_grid(num_kv, sub_n);
+                            build_vs_index_kern<<<vsi_grid, 1, 0, stream>>>(
+                                ab.sparse_vertical_idx, ab.sparse_slash_idx,
+                                ab.sparse_block_index,
+                                num_kv, sub_n, ATTN_NB,
+                                sub_start_pos, top_k,
+                                BLOCK_N, V_topk, S_topk);
                         } else {
                             // SPARSE_A_SHAPE: deterministic sink+window block list,
                             // no Q/K scoring needed. Index built directly from

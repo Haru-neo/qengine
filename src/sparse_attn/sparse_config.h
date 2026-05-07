@@ -55,6 +55,7 @@ enum SparsePattern : uint8_t {
     SPARSE_BLOCK          = 1,
     SPARSE_VERTICAL_SLASH = 2,
     SPARSE_A_SHAPE        = 3,
+    SPARSE_BLOCK_MS       = 4,  // multi-signature (mean + max-abs) block-sparse
 };
 
 struct SparseHeadConfig {

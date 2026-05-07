@@ -58,6 +58,7 @@ PATTERN_DENSE          = 0
 PATTERN_BLOCK_SPARSE   = 1
 PATTERN_VERTICAL_SLASH = 2
 PATTERN_A_SHAPE        = 3
+PATTERN_BLOCK_MS       = 4  # multi-signature (mean + max-abs)
 
 
 def write_uniform_profile(path: Path, num_layers: int, num_q_heads: int,
@@ -271,8 +272,12 @@ def main() -> int:
                    help="path to a text file ≥ MINF_MIN_SEQ tokens")
     p.add_argument("--budgets", default="0.05,0.10,0.20,0.40",
                    help="comma-separated FLOPs budgets to sweep (block-sparse)")
+    p.add_argument("--ms-budgets", default="0.05,0.10,0.20",
+                   help="comma-separated FLOPs budgets to sweep (mBSA, multi-sig)")
     p.add_argument("--a-shape", default="64x512,64x1024,128x2048",
                    help="comma-separated sink x window pairs to sweep (A-shape)")
+    p.add_argument("--vs", default="16x8,32x16",
+                   help="comma-separated V_top_k x S_top_k pairs (vertical-slash)")
     p.add_argument("--tol", type=float, default=0.05,
                    help="max acceptable relative L2 vs dense (else stays DENSE)")
     p.add_argument("--out", required=True, help="output profile .bin path")
@@ -287,12 +292,19 @@ def main() -> int:
     num_q_heads  = arch["num_q_heads"]
     head_dim     = arch["head_dim"]
     budgets      = [float(b) for b in args.budgets.split(",") if b.strip()]
+    ms_budgets   = [float(b) for b in args.ms_budgets.split(",") if b.strip()]
     a_shape_pairs: list[tuple[int, int]] = []
     for pair in args.a_shape.split(","):
         pair = pair.strip()
         if not pair: continue
         s, w = pair.split("x")
         a_shape_pairs.append((int(s), int(w)))
+    vs_pairs: list[tuple[int, int]] = []
+    for pair in args.vs.split(","):
+        pair = pair.strip()
+        if not pair: continue
+        v, s = pair.split("x")
+        vs_pairs.append((int(v), int(s)))
     prompt       = Path(args.calibration).read_text()
 
     work = Path(tempfile.mkdtemp(prefix="qengine_profile_"))
@@ -320,6 +332,52 @@ def main() -> int:
             engine=args.engine, model=args.model, port=args.port,
             max_seq=args.max_seq, sparse_env=env,
             prompt=prompt, label=f"sp{int(b*100):03d}", work=work,
+        )
+
+    # mBSA passes: write an all-BLOCK_MS profile + run the engine. The MS
+    # path scores blocks with max(mean·Q, β·max_abs·Q) so anchor-heavy heads
+    # whose mean signature drowns the spike token can still pull their
+    # interesting blocks into the top-k.
+    ms_dirs: dict[float, Path] = {}
+    for b in ms_budgets:
+        prof_path = work / f"prof_ms_{int(b*100):03d}.bin"
+        write_uniform_profile(
+            prof_path, num_layers, num_q_heads,
+            pattern=PATTERN_BLOCK_MS,
+        )
+        env = {
+            "MINF_SPARSE_ATTN": "1",
+            "MINF_BUDGET": f"{b:.4f}",
+            "MINF_MIN_SEQ": "4096",
+            "MINF_PROFILE_PATH": str(prof_path),
+        }
+        ms_dirs[b] = collect_run(
+            engine=args.engine, model=args.model, port=args.port,
+            max_seq=args.max_seq, sparse_env=env,
+            prompt=prompt, label=f"ms{int(b*100):03d}", work=work,
+        )
+
+    # Vertical-slash passes: synthetic all-VS profile with the (V, S) topks
+    # baked in. The engine builds K_pool, then per-chunk aggregates vertical
+    # / slash patterns before assembling per-token block_index.
+    vs_dirs: dict[tuple[int, int], Path] = {}
+    for V_topk, S_topk in vs_pairs:
+        prof_path = work / f"prof_vs_{V_topk}_{S_topk}.bin"
+        write_uniform_profile(
+            prof_path, num_layers, num_q_heads,
+            pattern=PATTERN_VERTICAL_SLASH,
+            vtk=V_topk, stk=S_topk,
+        )
+        env = {
+            "MINF_SPARSE_ATTN": "1",
+            "MINF_BUDGET": "0.10",
+            "MINF_MIN_SEQ": "4096",
+            "MINF_PROFILE_PATH": str(prof_path),
+        }
+        vs_dirs[(V_topk, S_topk)] = collect_run(
+            engine=args.engine, model=args.model, port=args.port,
+            max_seq=args.max_seq, sparse_env=env,
+            prompt=prompt, label=f"vs_V{V_topk}_S{S_topk}", work=work,
         )
 
     # A-shape passes: write a synthetic all-A_SHAPE profile per (sink, window)
@@ -362,12 +420,33 @@ def main() -> int:
             {"pattern": PATTERN_BLOCK_SPARSE, "block_top_k": max(1, int(b * 100))},
             sparse_dirs[b],
         ))
+    for b in ms_budgets:
+        # mBSA's effective compute is the same as block-sparse at the same
+        # budget (same number of K blocks read). Storage is 2× (mean+max
+        # signatures) but we don't bill that here. Tag with a small ε in the
+        # cost so block-sparse wins ties — block-sparse is a strict subset.
+        candidates.append((
+            float(b) + 1e-4, f"BLOCK_MS@{b:.3f}",
+            {"pattern": PATTERN_BLOCK_MS, "block_top_k": max(1, int(b * 100))},
+            ms_dirs[b],
+        ))
     for sink, window in a_shape_pairs:
         approx_budget = (sink + window) / max(1, AVG_CTX_BLOCKS * 64)
         candidates.append((
             approx_budget, f"A_SHAPE@s{sink}w{window}",
             {"pattern": PATTERN_A_SHAPE, "window": window, "sink": sink},
             a_shape_dirs[(sink, window)],
+        ))
+    for V_topk, S_topk in vs_pairs:
+        # VS cost: V + S blocks per query / total blocks. Slightly higher
+        # ε than mBSA so it loses ties to the cheaper patterns (it has to
+        # do an extra aggregation kernel per chunk).
+        approx_budget = (V_topk + S_topk) / max(1, AVG_CTX_BLOCKS) + 5e-4
+        candidates.append((
+            approx_budget, f"VERT_SLASH@V{V_topk}S{S_topk}",
+            {"pattern": PATTERN_VERTICAL_SLASH,
+             "vertical_top_k": V_topk, "slash_top_k": S_topk},
+            vs_dirs[(V_topk, S_topk)],
         ))
     candidates.sort(key=lambda c: c[0])
 
