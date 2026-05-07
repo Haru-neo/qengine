@@ -3320,7 +3320,25 @@ struct QwenModel {
                     // then drive flash_attn_chunk_block_sparse_split with that
                     // index. Existing flash_attn_split_merge handles K-split
                     // log-sum-exp combine.
-                    if (sparse_rt.enabled && sub_seq_total >= sparse_rt.min_seq_for_sparse) {
+                    // Per-layer pattern routing. With a loaded SparseProfile we
+                    // honour the per-head decision the offline profiler made
+                    // and only take the sparse path when at least one q_head
+                    // in this layer asked for BLOCK_SPARSE. Heads marked DENSE
+                    // are still computed by the sparse kernel (block_index
+                    // simply selects all blocks for them) — that's a phase-2
+                    // refinement; v1 keeps the layer uniform.
+                    bool layer_sparse_ok = sparse_rt.enabled && sub_seq_total >= sparse_rt.min_seq_for_sparse;
+                    if (layer_sparse_ok && !sparse_rt.profile.empty()
+                        && (uint32_t)layer < sparse_rt.profile.num_layers) {
+                        bool any_block = false;
+                        for (uint32_t qh = 0; qh < sparse_rt.profile.num_q_heads; qh++) {
+                            if (sparse_rt.profile.at((int)layer, (int)qh).pattern == SPARSE_BLOCK) {
+                                any_block = true; break;
+                            }
+                        }
+                        layer_sparse_ok = any_block;
+                    }
+                    if (layer_sparse_ok) {
                         constexpr int BLOCK_N    = 64;
                         constexpr int BLOCK_THR  = 256;
                         int n_blocks = (sub_seq_total + BLOCK_N - 1) / BLOCK_N;
@@ -3597,6 +3615,27 @@ struct QwenModel {
         }
         int seq_len_total = start_pos + n_tokens;  // for downstream code (unused)
         (void)seq_len_total;
+
+        // Profiler attention dump. When MINF_DUMP_ATTN_OUT=<dir> is set we
+        // write the raw post-attention output (pre-gate, pre-o_proj) for this
+        // chunk to <dir>/L{layer}_S{start_pos}.bin as fp16 bytes shaped
+        // [n_tokens, num_q, HD]. The offline profiler diff's dense vs sparse
+        // dumps to choose the per-head pattern.
+        {
+            static const char* dump_dir = getenv("MINF_DUMP_ATTN_OUT");
+            if (dump_dir) {
+                cudaSetDevice(g);
+                cudaStreamSynchronize(stream);
+                size_t n_halves = (size_t)n_tokens * total_qg;
+                std::vector<half> host(n_halves);
+                cudaMemcpy(host.data(), ab.attn_chunk_out, n_halves * sizeof(half),
+                           cudaMemcpyDeviceToHost);
+                char path[512];
+                snprintf(path, sizeof(path), "%s/L%d_S%d.bin", dump_dir, layer, start_pos);
+                FILE* f = fopen(path, "wb");
+                if (f) { fwrite(host.data(), sizeof(half), n_halves, f); fclose(f); }
+            }
+        }
 
         // 8. Batched output gate (sigmoid) — single launch for all n_tokens.
         {
