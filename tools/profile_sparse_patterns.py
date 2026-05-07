@@ -173,24 +173,27 @@ def collect_run(
     return dump_dir
 
 
-def load_dumps(dump_dir: Path) -> dict[int, np.ndarray]:
-    """Concatenate per-(layer, start_pos) dump files into one [T, num_q, HD]
-    fp16 tensor per layer. Files are named L{layer}_S{start_pos}.bin holding
-    n_tokens × num_q × HD halves."""
-    grouped: dict[int, list[tuple[int, np.ndarray]]] = {}
-    for f in sorted(dump_dir.glob("L*_S*.bin")):
-        # L{layer}_S{start_pos}.bin
-        stem = f.stem  # 'L12_S256'
-        layer_str, start_str = stem.split("_")
-        layer = int(layer_str[1:])
-        start = int(start_str[1:])
-        raw = np.fromfile(f, dtype=np.float16)
-        grouped.setdefault(layer, []).append((start, raw))
-    out: dict[int, np.ndarray] = {}
-    for layer, items in grouped.items():
-        items.sort(key=lambda kv: kv[0])
-        out[layer] = np.concatenate([blob for _, blob in items], axis=0)
-    return out
+def discover_layers(dump_dir: Path) -> set[int]:
+    """Just return the set of attn layers that have dumps in this dir.
+    Loading the actual tensors is deferred to load_layer_dump so we don't
+    sit on every candidate's full dataset at once (8 GB+ for 27B)."""
+    layers: set[int] = set()
+    for f in dump_dir.glob("L*_S*.bin"):
+        layer_str = f.stem.split("_")[0]
+        layers.add(int(layer_str[1:]))
+    return layers
+
+
+def load_layer_dump(dump_dir: Path, layer: int) -> np.ndarray:
+    """Concatenate one layer's chunks into a single [T*num_q*HD] fp16 array.
+    Caller is expected to release the array before loading the next layer
+    or candidate."""
+    pieces: list[tuple[int, np.ndarray]] = []
+    for f in dump_dir.glob(f"L{layer}_S*.bin"):
+        start = int(f.stem.split("_")[1][1:])
+        pieces.append((start, np.fromfile(f, dtype=np.float16)))
+    pieces.sort(key=lambda kv: kv[0])
+    return np.concatenate([blob for _, blob in pieces], axis=0)
 
 
 def per_head_l2(
@@ -295,36 +298,35 @@ def main() -> int:
     work = Path(tempfile.mkdtemp(prefix="qengine_profile_"))
     print(f"[profiler] work dir: {work}", flush=True)
 
-    # Pass 0: dense baseline.
+    # Pass 0: dense baseline. We only remember the dump dir; tensors are
+    # loaded one layer at a time during scoring so total RSS stays bounded.
     dense_dir = collect_run(
         engine=args.engine, model=args.model, port=args.port,
         max_seq=args.max_seq, sparse_env=None,
         prompt=prompt, label="dense", work=work,
     )
-    dense = load_dumps(dense_dir)
 
     # Block-sparse passes: uniform block-sparse at each budget. No profile
     # needed — the engine falls back to uniform block-sparse when PROFILE_PATH
     # is absent, which is exactly the candidate we want to score.
-    sparse_runs: dict[float, dict[int, np.ndarray]] = {}
+    sparse_dirs: dict[float, Path] = {}
     for b in budgets:
         env = {
             "MINF_SPARSE_ATTN": "1",
             "MINF_BUDGET": f"{b:.4f}",
             "MINF_MIN_SEQ": "4096",
         }
-        d = collect_run(
+        sparse_dirs[b] = collect_run(
             engine=args.engine, model=args.model, port=args.port,
             max_seq=args.max_seq, sparse_env=env,
             prompt=prompt, label=f"sp{int(b*100):03d}", work=work,
         )
-        sparse_runs[b] = load_dumps(d)
 
     # A-shape passes: write a synthetic all-A_SHAPE profile per (sink, window)
     # candidate; engine reads it via MINF_PROFILE_PATH and routes every layer
     # through the deterministic sink+window index. The block-sparse fallback
     # the budget controls doesn't fire for these passes.
-    a_shape_runs: dict[tuple[int, int], dict[int, np.ndarray]] = {}
+    a_shape_dirs: dict[tuple[int, int], Path] = {}
     for sink, window in a_shape_pairs:
         prof_path = work / f"prof_as_{sink}_{window}.bin"
         write_uniform_profile(
@@ -337,73 +339,80 @@ def main() -> int:
             "MINF_MIN_SEQ": "4096",
             "MINF_PROFILE_PATH": str(prof_path),
         }
-        d = collect_run(
+        a_shape_dirs[(sink, window)] = collect_run(
             engine=args.engine, model=args.model, port=args.port,
             max_seq=args.max_seq, sparse_env=env,
             prompt=prompt, label=f"as_S{sink}_W{window}", work=work,
         )
-        a_shape_runs[(sink, window)] = load_dumps(d)
 
-    # Score per (layer, head). For each head we want the *smallest* budget
-    # whose L2 ≤ tol that maximises sparsity while preserving quality. We
-    # rank candidates roughly by FLOPs cost: smaller → cheaper. A-shape's
-    # cost is a function of (sink + window) / context_len, treated as a
-    # block-sparse equivalent budget for ordering. If no candidate meets the
-    # bar, leave the head DENSE.
+    # Score per (layer, head). Memory-bounded: we walk one layer at a time
+    # and only ever hold dense + one candidate's tensor for that layer. For
+    # 27B at 16 K context this caps RSS at ≈ 2 × per-layer dump size = a
+    # few hundred MB instead of all-candidates × all-layers.
     head_records: list[dict] = []
     summary_rows: list[str] = ["layer,q_head,chosen,best_l2"]
-    candidate_layers = set(dense)
-    for d in sparse_runs.values():    candidate_layers.update(d.keys())
-    for d in a_shape_runs.values():   candidate_layers.update(d.keys())
+    dense_layers = discover_layers(dense_dir)
 
-    # Build (cost, label, pattern_dict, dump_dict) candidates. Sort ascending
-    # by cost. For each head we walk the list and pick the cheapest candidate
-    # within tol; if none, head goes DENSE with the lowest-L2 fallback noted.
-    AVG_CTX_BLOCKS = 200  # rough proxy for 16K context @ block_size=64
-    candidates: list[tuple[float, str, dict, dict[int, np.ndarray]]] = []
+    # (cost, label, pattern_dict, dump_dir) ordered cheapest-first.
+    AVG_CTX_BLOCKS = 200  # rough proxy for 16 K context @ block_size=64
+    candidates: list[tuple[float, str, dict, Path]] = []
     for b in budgets:
         candidates.append((
             float(b), f"BLOCK_SPARSE@{b:.3f}",
             {"pattern": PATTERN_BLOCK_SPARSE, "block_top_k": max(1, int(b * 100))},
-            sparse_runs[b],
+            sparse_dirs[b],
         ))
     for sink, window in a_shape_pairs:
         approx_budget = (sink + window) / max(1, AVG_CTX_BLOCKS * 64)
         candidates.append((
             approx_budget, f"A_SHAPE@s{sink}w{window}",
             {"pattern": PATTERN_A_SHAPE, "window": window, "sink": sink},
-            a_shape_runs[(sink, window)],
+            a_shape_dirs[(sink, window)],
         ))
     candidates.sort(key=lambda c: c[0])
 
+    # Pre-compute every candidate's per-(layer, q_head) L2 so we can decide
+    # all heads in a layer in one shot, then drop the layer's tensors before
+    # moving on.
     for layer in range(num_layers):
+        if layer not in dense_layers:
+            for q in range(num_q_heads):
+                head_records.append({"pattern": PATTERN_DENSE})
+                summary_rows.append(f"{layer},{q},DENSE(no_dump),nan")
+            continue
+
+        d_layer = load_layer_dump(dense_dir, layer)
+        # l2_table[ci, q] = relative L2 of candidate ci at this layer and head.
+        l2_table = np.full((len(candidates), num_q_heads), np.inf, dtype=np.float64)
+        for ci, (_, _, _, dump_dir) in enumerate(candidates):
+            try:
+                s_layer = load_layer_dump(dump_dir, layer)
+            except ValueError:
+                continue
+            l2 = per_head_l2(d_layer, s_layer, num_q_heads, head_dim)
+            l2_table[ci] = l2
+            del s_layer
+        del d_layer
+
         for q in range(num_q_heads):
             chosen_label = None
             chosen_record = None
             chosen_l2 = None
-            best_overall_l2 = None
-            best_overall_label = None
-            if layer in candidate_layers and layer in dense:
-                for cost, label, rec, dumps in candidates:
-                    sparse = dumps.get(layer)
-                    if sparse is None:
-                        continue
-                    l2 = float(per_head_l2(dense[layer], sparse, num_q_heads, head_dim)[q])
-                    if best_overall_l2 is None or l2 < best_overall_l2:
-                        best_overall_l2 = l2
-                        best_overall_label = label
-                    if l2 <= args.tol and chosen_label is None:
-                        chosen_label = label
-                        chosen_record = rec
-                        chosen_l2 = l2
-                        # Don't break — keep walking so best_overall_l2 is
-                        # accurate for the CSV. Cheaper candidates already
-                        # tried thanks to ascending sort.
+            best_overall_l2 = float(l2_table[:, q].min())
+            best_overall_idx = int(np.argmin(l2_table[:, q]))
+            best_overall_label = candidates[best_overall_idx][1] if np.isfinite(best_overall_l2) else None
+            for ci, (_, label, rec, _) in enumerate(candidates):
+                l2 = float(l2_table[ci, q])
+                if l2 <= args.tol:
+                    chosen_label = label
+                    chosen_record = rec
+                    chosen_l2 = l2
+                    break
             if chosen_label is None:
                 head_records.append({"pattern": PATTERN_DENSE})
                 summary_rows.append(
                     f"{layer},{q},DENSE(best_was {best_overall_label or 'none'}),"
-                    f"{best_overall_l2 if best_overall_l2 is not None else 'nan'}"
+                    f"{best_overall_l2 if np.isfinite(best_overall_l2) else 'nan'}"
                 )
             else:
                 head_records.append(chosen_record)
