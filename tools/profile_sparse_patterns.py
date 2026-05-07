@@ -211,15 +211,6 @@ def write_profile(
 ) -> None:
     """SparseProfile binary, format documented in src/sparse_attn/sparse_config.h."""
     with out_path.open("wb") as f:
-        hdr = struct.pack(
-            "<5IfI3I",
-            _MAGIC, _VERSION,
-            num_layers, num_q_heads,
-            0,  # padding before float (kept for natural layout in the C struct)
-            flops_budget,
-            0, 0, 0,
-        )
-        # Re-pack to match the C layout exactly.
         # struct Header { uint32 magic, version, num_layers, num_q_heads;
         #                 float flops_budget; uint32 reserved[3]; }
         hdr = struct.pack(
