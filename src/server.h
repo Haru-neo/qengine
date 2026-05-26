@@ -568,7 +568,11 @@ struct ResponseFormat {
     std::string schema_json;      // raw schema body (currently unused)
 };
 
-using GenerateFunc = std::function<std::string(const std::vector<int>& prompt_ids, int max_tokens, int cached_prompt_tokens, const ResponseFormat& rf, int* out_completion_tokens)>;
+// `client_fd` (-1 if unknown) lets the producer poll for client disconnect via
+// POLLRDHUP and abort the in-flight gen — without it, a closed non-streaming
+// client keeps the slot busy until natural completion since there's no
+// per-token send to fail.
+using GenerateFunc = std::function<std::string(const std::vector<int>& prompt_ids, int max_tokens, int cached_prompt_tokens, const ResponseFormat& rf, int client_fd, int* out_completion_tokens)>;
 // StreamCallback returns true while the client is still receiving and false
 // once delivery has failed (EPIPE / closed connection). Producers should
 // stop generating as soon as it returns false.
@@ -665,9 +669,14 @@ struct HttpServer {
         // OpenAI response_format. Both `{"type":"json_object"}` and
         // `{"type":"json_schema","json_schema":{...}}` flip on JSON mode; the
         // schema body is preserved for future schema-aware validation.
+        // Default OFF: grammar-mask + force-skip-think + spec/MTP disable
+        // dragged 9B from ~50 t/s down to ~5 t/s. Clients can still ask for
+        // JSON via system prompt; only engine-side enforcement is gated. Set
+        // MINF_ENABLE_JSON_MODE=1 to re-enable the strict path.
         ResponseFormat rf;
+        static const bool json_mode_enabled = getenv("MINF_ENABLE_JSON_MODE") != nullptr;
         std::string rf_json = json_get_raw(body, "response_format");
-        if (!rf_json.empty()) {
+        if (json_mode_enabled && !rf_json.empty()) {
             std::string rf_type = json_get_str(rf_json, "type");
             if (rf_type == "json_object" || rf_type == "json_schema") {
                 rf.json_mode = true;
@@ -902,7 +911,7 @@ struct HttpServer {
         } else {
             // Non-streaming response
             int completion_tokens = 0;
-            std::string generated_text = generate_fn(prompt_ids, max_tokens, cached_prompt_tokens, rf, &completion_tokens);
+            std::string generated_text = generate_fn(prompt_ids, max_tokens, cached_prompt_tokens, rf, client_fd, &completion_tokens);
 
             // The chat encoder may prefill "<think>\n" into the prompt, in
             // which case the generated text starts mid-think with no opening

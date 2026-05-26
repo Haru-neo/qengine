@@ -1025,6 +1025,208 @@ template __global__ void gemm_q8_0_q8_1_v2<64, 128, 4, 8, 4>(const void*, const 
 template __global__ void gemm_q8_0_q8_1_v2<32, 128, 2, 8, 4>(const void*, const block_q8_1*, half*, int, int, int);
 template __global__ void gemm_q8_0_q8_1_v2<16, 128, 1, 8, 4>(const void*, const block_q8_1*, half*, int, int, int);
 
+// fused2 — two Q8_0 weights share the same Q8_1 input. Computes Yg = Wg·X
+// and Yu = Wu·X in one launch. X SMEM tile is loaded once and reused by both
+// accumulators, cutting input-side global memory traffic in half. Grid layout
+// matches v2 so dispatch can use the same (M, n_tokens) tiling.
+template<int BM, int BN, int TM, int TN, int BK_BLOCKS>
+__global__ void gemm_q8_0_q8_1_fused2(
+    const void* __restrict__ Wg,
+    const void* __restrict__ Wu,
+    const block_q8_1* __restrict__ X,
+    half* __restrict__ Yg,
+    half* __restrict__ Yu,
+    const int M, const int N, const int K
+) {
+    constexpr int ROWS_PER_BLOCK = BM / TM;
+    constexpr int COLS_PER_BLOCK = BN / TN;
+    constexpr int THREADS = ROWS_PER_BLOCK * COLS_PER_BLOCK;
+    static_assert(BM % TM == 0 && BN % TN == 0, "tile must divide block");
+
+    const int bpr = K / 32;
+    const int tid = threadIdx.x;
+    const int tx  = tid % ROWS_PER_BLOCK;
+    const int ty  = tid / ROWS_PER_BLOCK;
+
+    float acc_g[TM][TN], acc_u[TM][TN];
+    #pragma unroll
+    for (int im = 0; im < TM; im++)
+        #pragma unroll
+        for (int in = 0; in < TN; in++) { acc_g[im][in] = 0.0f; acc_u[im][in] = 0.0f; }
+
+    extern __shared__ char gemm_smem_raw[];
+    block_q8_0_aligned* sWg = (block_q8_0_aligned*)gemm_smem_raw;
+    block_q8_0_aligned* sWu = sWg + BM * BK_BLOCKS;
+    block_q8_1*         sX  = (block_q8_1*)(sWu + BM * BK_BLOCKS);
+
+    const block_q8_0_aligned* Wgp = (const block_q8_0_aligned*)Wg;
+    const block_q8_0_aligned* Wup = (const block_q8_0_aligned*)Wu;
+
+    for (int kb = 0; kb < bpr; kb += BK_BLOCKS) {
+        // Cooperative SMEM loads — gate weight, up weight, input.
+        for (int idx = tid; idx < BM * BK_BLOCKS; idx += THREADS) {
+            int row_in = idx / BK_BLOCKS;
+            int b_in   = idx - row_in * BK_BLOCKS;
+            int m_glob = blockIdx.x * BM + row_in;
+            int b_glob = kb + b_in;
+            if (m_glob < M && b_glob < bpr) {
+                sWg[idx] = Wgp[(size_t)m_glob * bpr + b_glob];
+                sWu[idx] = Wup[(size_t)m_glob * bpr + b_glob];
+            }
+        }
+        for (int idx = tid; idx < BN * BK_BLOCKS; idx += THREADS) {
+            int row_in = idx / BK_BLOCKS;
+            int b_in   = idx - row_in * BK_BLOCKS;
+            int n_glob = blockIdx.y * BN + row_in;
+            int b_glob = kb + b_in;
+            if (n_glob < N && b_glob < bpr) {
+                sX[idx] = X[(size_t)n_glob * bpr + b_glob];
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int b = 0; b < BK_BLOCKS; b++) {
+            int b_glob = kb + b;
+            if (b_glob >= bpr) break;
+
+            int isum_g[TM][TN], isum_u[TM][TN];
+            #pragma unroll
+            for (int im = 0; im < TM; im++)
+                #pragma unroll
+                for (int in = 0; in < TN; in++) { isum_g[im][in] = 0; isum_u[im][in] = 0; }
+
+            int wg_frag[TM][8], wu_frag[TM][8];
+            int x_frag[TN][8];
+            float dWg[TM], dWu[TM];
+            float dX[TN];
+
+            #pragma unroll
+            for (int im = 0; im < TM; im++) {
+                int w_row_in = tx * TM + im;
+                const block_q8_0_aligned* gb = &sWg[w_row_in * BK_BLOCKS + b];
+                const block_q8_0_aligned* ub = &sWu[w_row_in * BK_BLOCKS + b];
+                dWg[im] = __half2float(gb->d);
+                dWu[im] = __half2float(ub->d);
+                const int* gp32 = (const int*)gb->qs;
+                const int* up32 = (const int*)ub->qs;
+                #pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    wg_frag[im][j] = gp32[j];
+                    wu_frag[im][j] = up32[j];
+                }
+            }
+            #pragma unroll
+            for (int in = 0; in < TN; in++) {
+                int x_row_in = ty * TN + in;
+                const block_q8_1* xb = &sX[x_row_in * BK_BLOCKS + b];
+                dX[in] = __half2float(xb->ds.x);
+                const int* xp = (const int*)xb->qs;
+                #pragma unroll
+                for (int j = 0; j < 8; j++) x_frag[in][j] = xp[j];
+            }
+
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                #pragma unroll
+                for (int im = 0; im < TM; im++) {
+                    int wgj = wg_frag[im][j];
+                    int wuj = wu_frag[im][j];
+                    #pragma unroll
+                    for (int in = 0; in < TN; in++) {
+                        int xj = x_frag[in][j];
+                        isum_g[im][in] = __dp4a(wgj, xj, isum_g[im][in]);
+                        isum_u[im][in] = __dp4a(wuj, xj, isum_u[im][in]);
+                    }
+                }
+            }
+
+            #pragma unroll
+            for (int im = 0; im < TM; im++)
+                #pragma unroll
+                for (int in = 0; in < TN; in++) {
+                    acc_g[im][in] += dWg[im] * dX[in] * (float)isum_g[im][in];
+                    acc_u[im][in] += dWu[im] * dX[in] * (float)isum_u[im][in];
+                }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int im = 0; im < TM; im++) {
+        int gm = blockIdx.x * BM + tx * TM + im;
+        #pragma unroll
+        for (int in = 0; in < TN; in++) {
+            int gn = blockIdx.y * BN + ty * TN + in;
+            if (gm < M && gn < N) {
+                Yg[(size_t)gn * M + gm] = __float2half(acc_g[im][in]);
+                Yu[(size_t)gn * M + gm] = __float2half(acc_u[im][in]);
+            }
+        }
+    }
+}
+
+// Explicit instantiation for the mode-9 tile we plan to use (32x128 BK=4).
+template __global__ void gemm_q8_0_q8_1_fused2<32, 128, 2, 8, 4>(
+    const void*, const void*, const block_q8_1*, half*, half*, int, int, int);
+
+// Forward decl — single-weight chunked GEMV defined further down. fused2
+// dispatcher falls back to it for the BN-misaligned tail.
+inline void quant_gemv_chunk(void* weight, ggml_type type,
+                             const block_q8_1* x_q8_chunk,
+                             half* output_chunk,
+                             int K, int M, int n_tokens,
+                             cudaStream_t stream);
+
+// Dispatcher: launches gemm_q8_0_q8_1_fused2 with the mode-9 tile, with a
+// peeling tail that falls back to two single-weight quant_gemv_chunk calls
+// for any leftover tokens that don't fit a full BN=128 strip.
+inline void quant_gemv_chunk_fused2(
+    void* Wg, void* Wu, ggml_type type,
+    const block_q8_1* x_q8_chunk,
+    half* Yg_chunk, half* Yu_chunk,
+    int K, int M, int n_tokens,
+    cudaStream_t stream = 0)
+{
+    if (n_tokens <= 0) return;
+    if (type != GGML_TYPE_Q8_0) {
+        // Caller decides; just bail and let the two separate paths run.
+        quant_gemv_chunk(Wg, type, x_q8_chunk, Yg_chunk, K, M, n_tokens, stream);
+        quant_gemv_chunk(Wu, type, x_q8_chunk, Yu_chunk, K, M, n_tokens, stream);
+        return;
+    }
+
+    constexpr int BM = 32, BN = 128, TM = 2, TN = 8, BK = 4;
+    const block_q8_1* xp = x_q8_chunk;
+    half* gp = Yg_chunk;
+    half* up = Yu_chunk;
+    int remaining = n_tokens;
+
+    static const bool fused_kernel = getenv("MLP_GATEUP_FUSED_KERNEL") != nullptr;
+    if (fused_kernel && (M % BM) == 0 && remaining >= BN) {
+        int n_chunks = remaining / BN;
+        int bn_total = n_chunks * BN;
+        dim3 grid(M / BM, n_chunks);
+        int threads = (BM/TM) * (BN/TN);  // 16 * 16 = 256
+        // SMEM: 2 weights (BM*BK each) + 1 input (BN*BK)
+        int sm_bytes = (2 * BM + BN) * BK * sizeof(block_q8_0_aligned);
+        gemm_q8_0_q8_1_fused2<BM, BN, TM, TN, BK><<<grid, threads, sm_bytes, stream>>>(
+            Wg, Wu, xp, gp, up, M, bn_total, K);
+        xp += (size_t)bn_total * (K / 32);
+        gp += (size_t)bn_total * M;
+        up += (size_t)bn_total * M;
+        remaining -= bn_total;
+    }
+
+    // Peel any remaining tokens that don't fit a full BN strip — fall back
+    // to two separate quant_gemv_chunk calls for correctness (same code that
+    // the non-fused path uses on the chunk tail).
+    if (remaining > 0) {
+        quant_gemv_chunk(Wg, type, xp, gp, K, M, remaining, stream);
+        quant_gemv_chunk(Wu, type, xp, up, K, M, remaining, stream);
+    }
+}
+
 __global__ void gemv_fp16(const half* __restrict__ w,const half* __restrict__ x,half* __restrict__ y,int K,int N){
     int row=blockIdx.x;if(row>=N)return;float s=0.0f;
     for(int i=threadIdx.x;i<K;i+=blockDim.x)s+=__half2float(w[(size_t)row*K+i])*__half2float(x[i]);
