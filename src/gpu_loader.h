@@ -37,12 +37,24 @@ struct GPUModel {
         num_gpus = n_gpus;
         auto arch = gguf.get_str("general.architecture");
         num_layers = gguf.get_u32(arch + ".block_count");
-        int layers_per_gpu = (num_layers + n_gpus - 1) / n_gpus;
-        
+
         layer_gpu.resize(num_layers);
-        for (int i = 0; i < num_layers; i++) {
-            layer_gpu[i] = i / layers_per_gpu;
-            if (layer_gpu[i] >= n_gpus) layer_gpu[i] = n_gpus - 1;
+        if (n_gpus == 4 && num_layers == 65) {
+            // v2-MTP Q8_0: GPU 0 has token_embd, GPU 3 has output+MTP.
+            // Shift layers away from GPU 0/3 to avoid repack-peak OOM.
+            // 15 / 17 / 17 / 16
+            for (int i = 0; i < num_layers; i++) {
+                if      (i < 15) layer_gpu[i] = 0;
+                else if (i < 32) layer_gpu[i] = 1;
+                else if (i < 49) layer_gpu[i] = 2;
+                else             layer_gpu[i] = 3;
+            }
+        } else {
+            int layers_per_gpu = (num_layers + n_gpus - 1) / n_gpus;
+            for (int i = 0; i < num_layers; i++) {
+                layer_gpu[i] = i / layers_per_gpu;
+                if (layer_gpu[i] >= n_gpus) layer_gpu[i] = n_gpus - 1;
+            }
         }
         
         printf("\n=== GPU Assignment ===\n");

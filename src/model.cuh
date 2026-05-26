@@ -47,6 +47,22 @@ static double g_gdn_resi_ms     = 0.0;  // residual add
 static long   g_gdn_calls       = 0;
 static bool   g_profile_gdn     = false;
 
+// PROFILE_MLP=1 enables per-phase sync timers inside forward_mlp_chunk.
+// Phases: norm / q1 (Q8 quantize of normed hidden) / gate (gate_proj GEMV) /
+// up (up_proj GEMV) / silu (silu_mul) / q2 (Q8 quantize of intermediate) /
+// down (down_proj GEMV) / resi (residual add). main.cu prints them next to
+// PROFILE_PREFILL summary. Adds sync overhead so keep OFF in production.
+static double g_mlp_norm_ms     = 0.0;
+static double g_mlp_q1_ms       = 0.0;
+static double g_mlp_gate_ms     = 0.0;
+static double g_mlp_up_ms       = 0.0;
+static double g_mlp_silu_ms     = 0.0;
+static double g_mlp_q2_ms       = 0.0;
+static double g_mlp_down_ms     = 0.0;
+static double g_mlp_resi_ms     = 0.0;
+static long   g_mlp_calls       = 0;
+static bool   g_profile_mlp     = false;
+
 struct QwenConfig {
     int hidden_size;
     int intermediate_size;
@@ -83,6 +99,11 @@ struct QwenModel {
     QwenConfig cfg;
     GPUModel* gpu;
     LayerBuffers bufs[4];
+    bool layer_is_attn[256] = {};
+    bool v2_separate_qkv = false;
+    int  attn_num_q_heads = 0;
+    int  attn_num_kv_heads = 0;
+    int  attn_head_dim = 0;
     QuantInput gpu_qi[4];  // per-GPU reusable Q8 buffer (hidden_size)
     QuantInput gpu_qi_inter[4];  // per-GPU for intermediate_size  // one per GPU
     // Second-token buffer set used by the speculative-decoding path
@@ -1692,27 +1713,59 @@ struct QwenModel {
     // init_kv_cache is normally called after this and would re-set it.
     void init_gdn_states(int num_slots_arg = 1) {
         if (num_slots_arg > 0) num_slots = num_slots_arg;
+
+        // Detect layer types from tensor presence (v1 hardcoded vs v2 data-driven)
+        memset(layer_is_attn, 0, sizeof(layer_is_attn));
+        for (int layer = 0; layer < cfg.num_layers && layer < 256; layer++) {
+            std::string prefix = "blk." + std::to_string(layer) + ".";
+            bool has_ssm = (t((prefix + "ssm_alpha.weight").c_str()) != nullptr);
+            layer_is_attn[layer] = !has_ssm;
+        }
+        int attn_count_init = 0;
+        for (int l = 0; l < cfg.num_layers; l++) if (layer_is_attn[l]) attn_count_init++;
+        printf("Layer types: %d attn, %d GDN (detected from tensors)\n",
+               attn_count_init, cfg.num_layers - attn_count_init);
+
+        // Detect v2 separate Q/K/V attention (vs v1 combined attn_qkv)
+        {
+            int first_attn = -1;
+            for (int l = 0; l < cfg.num_layers; l++)
+                if (layer_is_attn[l]) { first_attn = l; break; }
+            if (first_attn >= 0) {
+                std::string pfx = "blk." + std::to_string(first_attn) + ".";
+                auto* q_w = t((pfx + "attn_q.weight").c_str());
+                auto* combined = t((pfx + "attn_qkv.weight").c_str());
+                v2_separate_qkv = (q_w != nullptr && combined == nullptr);
+                if (v2_separate_qkv) {
+                    auto* k_w = t((pfx + "attn_k.weight").c_str());
+                    attn_head_dim = cfg.head_dim;
+                    attn_num_q_heads = q_w->dims[1] / attn_head_dim;
+                    attn_num_kv_heads = k_w ? (k_w->dims[1] / attn_head_dim) : cfg.num_kv_heads;
+                    printf("Attention (v2 separate QKV): %d Q heads, %d KV heads, head_dim=%d\n",
+                           attn_num_q_heads, attn_num_kv_heads, attn_head_dim);
+                }
+            }
+        }
+
         // Get dimensions from first GDN layer
         auto* qkv = t("blk.0.attn_qkv.weight");
         auto* ssm_out = t("blk.0.ssm_out.weight");
         if (!qkv || !ssm_out) { printf("Missing GDN tensors!\n"); return; }
-        
+
         int qkv_dim = qkv->dims[1];  // output dim of QKV
         int v_total = ssm_out->dims[0]; // input dim of out_proj = num_v * v_dim
-        
+
         // Get GDN config from tensor shapes
         auto* a_t = t("blk.0.ssm_alpha.weight");
         int num_v = a_t ? a_t->dims[1] : 48;
         int v_dim = v_total / num_v;
         auto* ssm_a_t = t("blk.0.ssm_a");
-        int k_dim = 128; // head_dim for GDN keys (Qwen3.5 = 128)
-        // num_k = qkv_dim / k_dim - ... calculate from qkv
-        // qkv_dim = 2*num_k*k_dim + num_v*v_dim = 2*16*128 + 48*128 = 10240
+        int k_dim = 128;
         int num_k = (qkv_dim - num_v * v_dim) / (2 * k_dim);
-        
+
         printf("GDN config: qkv_dim=%d, num_k=%d, num_v=%d, k_dim=%d, v_dim=%d\n",
             qkv_dim, num_k, num_v, k_dim, v_dim);
-        
+
         cfg.linear_k_heads = num_k;
         cfg.linear_v_heads = num_v;
         cfg.linear_k_dim = k_dim;
@@ -1725,9 +1778,7 @@ struct QwenModel {
 
         gdn_states.resize(cfg.num_layers);
         for (int layer = 0; layer < cfg.num_layers; layer++) {
-            // Only GDN layers need state (every layer except 3,7,11,...,63)
-            bool is_attn = ((layer + 1) % 4 == 0);
-            if (is_attn) {
+            if (layer_is_attn[layer]) {
                 gdn_states[layer].conv_state = nullptr;
                 gdn_states[layer].rec_state = nullptr;
                 continue;
@@ -1767,9 +1818,12 @@ struct QwenModel {
         std::vector<int> tokens;
         int  n_pos = 0;
         bool valid = false;
-        // [layer] -> (k_copy[N*kv_dim], v_copy[N*kv_dim]) on layer's GPU
+        // Pinned host RAM (no GPU affinity for storage). Lives off-VRAM so
+        // multiple long-prefix snapshots can coexist without eating HBM. On
+        // hit we DMA-copy host->device into the layer's GPU KV/GDN buffers.
+        // [layer] -> (k_copy[N*kv_dim], v_copy[N*kv_dim])
         std::unordered_map<int, std::pair<half*, half*>> kv_copy;
-        // [layer] -> (conv_state_copy, rec_state_copy) on layer's GPU
+        // [layer] -> (conv_state_copy, rec_state_copy)
         std::unordered_map<int, std::pair<float*, float*>> gdn_copy;
         int kv_capacity = 0;  // currently allocated KV slice length
     };
@@ -1784,12 +1838,10 @@ struct QwenModel {
         if (slot < 0 || slot >= num_slots) return;
         PrefixSnapshot& pc = prefix_caches[slot];
         for (auto& [layer, kv] : pc.kv_copy) {
-            cudaSetDevice(gpu->layer_gpu[layer]);
-            cudaFree(kv.first); cudaFree(kv.second);
+            cudaFreeHost(kv.first); cudaFreeHost(kv.second);
         }
         for (auto& [layer, gd] : pc.gdn_copy) {
-            cudaSetDevice(gpu->layer_gpu[layer]);
-            cudaFree(gd.first); cudaFree(gd.second);
+            cudaFreeHost(gd.first); cudaFreeHost(gd.second);
         }
         pc.kv_copy.clear();
         pc.gdn_copy.clear();
@@ -1826,9 +1878,9 @@ struct QwenModel {
             int g = gpu->layer_gpu[layer];
             cudaSetDevice(g);
             cudaMemcpy(kv.k + slot_kv_off, it->second.first,
-                       (size_t)N * kv_dim * sizeof(half), cudaMemcpyDeviceToDevice);
+                       (size_t)N * kv_dim * sizeof(half), cudaMemcpyHostToDevice);
             cudaMemcpy(kv.v + slot_kv_off, it->second.second,
-                       (size_t)N * kv_dim * sizeof(half), cudaMemcpyDeviceToDevice);
+                       (size_t)N * kv_dim * sizeof(half), cudaMemcpyHostToDevice);
         }
         size_t conv_sz = (size_t)gdn_qkv_dim_cached * 4 * sizeof(float);
         size_t rec_sz  = (size_t)gdn_rec_per_slot * sizeof(float);
@@ -1839,9 +1891,9 @@ struct QwenModel {
             int g = gpu->layer_gpu[layer];
             cudaSetDevice(g);
             cudaMemcpy(gdn_conv_slot(layer, slot), it->second.first,
-                       conv_sz, cudaMemcpyDeviceToDevice);
+                       conv_sz, cudaMemcpyHostToDevice);
             cudaMemcpy(gdn_rec_slot(layer, slot), it->second.second,
-                       rec_sz,  cudaMemcpyDeviceToDevice);
+                       rec_sz,  cudaMemcpyHostToDevice);
         }
         return N;
     }
@@ -1862,12 +1914,10 @@ struct QwenModel {
             // free without re-locking — we already hold prefix_caches_mu and
             // free_prefix_cache_buffers does no locking.
             for (auto& [layer, kv] : pc.kv_copy) {
-                cudaSetDevice(gpu->layer_gpu[layer]);
-                cudaFree(kv.first); cudaFree(kv.second);
+                cudaFreeHost(kv.first); cudaFreeHost(kv.second);
             }
             for (auto& [layer, gd] : pc.gdn_copy) {
-                cudaSetDevice(gpu->layer_gpu[layer]);
-                cudaFree(gd.first); cudaFree(gd.second);
+                cudaFreeHost(gd.first); cudaFreeHost(gd.second);
             }
             pc.kv_copy.clear();
             pc.gdn_copy.clear();
@@ -1876,20 +1926,16 @@ struct QwenModel {
         }
         if (pc.kv_copy.empty()) {
             for (auto& [layer, kv] : kv_caches) {
-                int g = gpu->layer_gpu[layer];
-                cudaSetDevice(g);
                 half *kc = nullptr, *vc = nullptr;
-                cudaMalloc(&kc, (size_t)n_pos * kv_dim * sizeof(half));
-                cudaMalloc(&vc, (size_t)n_pos * kv_dim * sizeof(half));
+                cudaMallocHost(&kc, (size_t)n_pos * kv_dim * sizeof(half));
+                cudaMallocHost(&vc, (size_t)n_pos * kv_dim * sizeof(half));
                 pc.kv_copy[layer] = {kc, vc};
             }
             for (int layer = 0; layer < cfg.num_layers; layer++) {
                 if (!gdn_states[layer].conv_state) continue;
-                int g = gpu->layer_gpu[layer];
-                cudaSetDevice(g);
                 float *cc = nullptr, *rc = nullptr;
-                cudaMalloc(&cc, gdn_qkv_dim_cached * 4 * sizeof(float));
-                cudaMalloc(&rc, gdn_rec_per_slot * sizeof(float));
+                cudaMallocHost(&cc, gdn_qkv_dim_cached * 4 * sizeof(float));
+                cudaMallocHost(&rc, gdn_rec_per_slot * sizeof(float));
                 pc.gdn_copy[layer] = {cc, rc};
             }
             pc.kv_capacity = n_pos;
@@ -1900,9 +1946,9 @@ struct QwenModel {
             int g = gpu->layer_gpu[layer];
             cudaSetDevice(g);
             cudaMemcpy(it->second.first,  kv.k + slot_kv_off,
-                       (size_t)n_pos * kv_dim * sizeof(half), cudaMemcpyDeviceToDevice);
+                       (size_t)n_pos * kv_dim * sizeof(half), cudaMemcpyDeviceToHost);
             cudaMemcpy(it->second.second, kv.v + slot_kv_off,
-                       (size_t)n_pos * kv_dim * sizeof(half), cudaMemcpyDeviceToDevice);
+                       (size_t)n_pos * kv_dim * sizeof(half), cudaMemcpyDeviceToHost);
         }
         size_t conv_sz = (size_t)gdn_qkv_dim_cached * 4 * sizeof(float);
         size_t rec_sz  = (size_t)gdn_rec_per_slot * sizeof(float);
@@ -1913,9 +1959,9 @@ struct QwenModel {
             int g = gpu->layer_gpu[layer];
             cudaSetDevice(g);
             cudaMemcpy(it->second.first,  gdn_conv_slot(layer, slot),
-                       conv_sz, cudaMemcpyDeviceToDevice);
+                       conv_sz, cudaMemcpyDeviceToHost);
             cudaMemcpy(it->second.second, gdn_rec_slot(layer, slot),
-                       rec_sz,  cudaMemcpyDeviceToDevice);
+                       rec_sz,  cudaMemcpyDeviceToHost);
         }
         pc.tokens.assign(prompt_tokens.begin(), prompt_tokens.begin() + n_pos);
         pc.n_pos = n_pos;
@@ -1956,7 +2002,7 @@ struct QwenModel {
         reset_gdn_slot(slot);
     }
     
-    bool is_attn_layer(int layer) { return ((layer + 1) % 4 == 0); }
+    bool is_attn_layer(int layer) { return (layer >= 0 && layer < 256) ? layer_is_attn[layer] : false; }
 
 
     // GDN forward (seq_len=1, with cache).  `slot` selects the per-request
@@ -3371,12 +3417,56 @@ struct QwenModel {
                             cudaMalloc(&ab.sparse_block_index,
                                        (size_t)num_kv * ATTN_NB * 64 * sizeof(int));
                         }
+                        // Launch-error tripwire. After every sparse kernel we
+                        // peek at the last error so a fault that surfaces on
+                        // the next CUDA call (cudaPeekAtLastError) tells us
+                        // the most recent sparse kernel name + context.
+                        // MINF_DEBUG_LAUNCH=1 forces a sync-after-launch so a
+                        // kernel that asserts mid-execution shows up here
+                        // instead of corrupting state for the next call.
+                        // Default mode keeps it cheap (no sync, just peek).
+                        // Always logs on error regardless of env so a real
+                        // fault in production leaves a breadcrumb.
+                        static const bool minf_debug_launch =
+                            getenv("MINF_DEBUG_LAUNCH") != nullptr;
+                        // Drain any sticky error inherited from non-sparse code so
+                        // our per-launch checks below only attribute errors that
+                        // actually originated inside the sparse path.
+                        {
+                            cudaError_t pre = cudaGetLastError();
+                            if (pre != cudaSuccess) {
+                                fprintf(stderr,
+                                    "[sparse-pre] L%d gpu=%d slot=%d sub_start=%d sub_n=%d "
+                                    "INHERITED_STICKY_ERR -> %s\n",
+                                    layer, g, slot, sub_start_pos, sub_n,
+                                    cudaGetErrorString(pre));
+                                fflush(stderr);
+                            }
+                        }
+                        auto check_launch = [&](const char* tag) {
+                            if (minf_debug_launch) cudaStreamSynchronize(stream);
+                            // cudaGetLastError clears the error flag so the next
+                            // check only reports problems caused by the *next*
+                            // kernel — gives us an exact culprit instead of a
+                            // sticky cascade across every subsequent peek.
+                            cudaError_t err = cudaGetLastError();
+                            if (err != cudaSuccess || minf_debug_launch) {
+                                fprintf(stderr,
+                                    "[sparse-launch] L%d gpu=%d slot=%d sub_start=%d sub_n=%d "
+                                    "n_blocks=%d top_k=%d pattern=%d %s -> %s\n",
+                                    layer, g, slot, sub_start_pos, sub_n,
+                                    n_blocks, top_k, (int)layer_pattern, tag,
+                                    err == cudaSuccess ? "OK" : cudaGetErrorString(err));
+                                fflush(stderr);
+                            }
+                        };
                         if (layer_pattern == SPARSE_BLOCK || layer_pattern == SPARSE_BLOCK_MS) {
                             // 1. K_pool[num_kv, n_blocks, HD]
                             dim3 kp_grid(num_kv, n_blocks, (HD + BLOCK_THR - 1) / BLOCK_THR);
                             build_k_pool_kern<HD, BLOCK_N, BLOCK_THR>
                                 <<<kp_grid, BLOCK_THR, 0, stream>>>(
                                     k_cache_ptr, ab.sparse_k_pool, num_kv, sub_seq_total);
+                            check_launch("build_k_pool");
                             // 1b. K_pool_max — only built when this layer asked for
                             // mBSA. Lazy-alloced on first MS layer encountered. The
                             // grid layout matches mean-pool, just a different output.
@@ -3388,6 +3478,7 @@ struct QwenModel {
                                 build_k_pool_max_kern<HD, BLOCK_N, BLOCK_THR>
                                     <<<kp_grid, BLOCK_THR, 0, stream>>>(
                                         k_cache_ptr, ab.sparse_k_pool_max, num_kv, sub_seq_total);
+                                check_launch("build_k_pool_max");
                             }
                             // 2. block_index[num_kv, sub_n_max, top_k]
                             dim3 bi_grid(num_kv, sub_n);
@@ -3414,18 +3505,21 @@ struct QwenModel {
                                             num_q, num_kv, sub_n, ATTN_NB, sub_start_pos,
                                             top_k, BLOCK_N, n_blocks, ms_beta);
                                 }
+                                check_launch("build_block_index_ms");
                             } else if (num_q == 24) {
                                 build_block_index_kern<HD, 6, BLOCK_THR>
                                     <<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
                                         q_post_sub, ab.sparse_k_pool, ab.sparse_block_index,
                                         num_q, num_kv, sub_n, ATTN_NB, sub_start_pos,
                                         top_k, BLOCK_N, n_blocks);
+                                check_launch("build_block_index<6>");
                             } else {
                                 build_block_index_kern<HD, 4, BLOCK_THR>
                                     <<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
                                         q_post_sub, ab.sparse_k_pool, ab.sparse_block_index,
                                         num_q, num_kv, sub_n, ATTN_NB, sub_start_pos,
                                         top_k, BLOCK_N, n_blocks);
+                                check_launch("build_block_index<4>");
                             }
                         } else if (layer_pattern == SPARSE_VERTICAL_SLASH) {
                             // SPARSE_VERTICAL_SLASH: build K_pool, then aggregate
@@ -3435,6 +3529,7 @@ struct QwenModel {
                             build_k_pool_kern<HD, BLOCK_N, BLOCK_THR>
                                 <<<kp_grid, BLOCK_THR, 0, stream>>>(
                                     k_cache_ptr, ab.sparse_k_pool, num_kv, sub_seq_total);
+                            check_launch("build_k_pool[vs]");
                             // V_top_k + S_top_k are pulled from the profile head
                             // record; sane defaults if both are zero.
                             int V_topk = sparse_rt.profile.empty()
@@ -3473,6 +3568,7 @@ struct QwenModel {
                                         sub_start_pos,
                                         V_topk, S_topk, BLOCK_N, n_blocks);
                             }
+                            check_launch("build_vs_aggregate");
                             // Stage B: per-token assembly.
                             int needed = V_topk + S_topk;
                             if (needed > top_k) top_k = needed;
@@ -3484,6 +3580,7 @@ struct QwenModel {
                                 num_kv, sub_n, ATTN_NB,
                                 sub_start_pos, top_k,
                                 BLOCK_N, V_topk, S_topk);
+                            check_launch("build_vs_index");
                         } else {
                             // SPARSE_A_SHAPE: deterministic sink+window block list,
                             // no Q/K scoring needed. Index built directly from
@@ -3501,6 +3598,7 @@ struct QwenModel {
                                 num_kv, sub_n, ATTN_NB,
                                 sub_start_pos, top_k,
                                 BLOCK_N, sink_blocks, window_blocks);
+                            check_launch("build_a_shape_index");
                         }
                         auto launch_sp = [&](auto gqa_const, auto k_const) {
                             constexpr int GQA = decltype(gqa_const)::value;
@@ -3512,11 +3610,13 @@ struct QwenModel {
                                     ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
                                     num_q, num_kv, sub_start_pos, sub_n, ATTN_NB,
                                     active_end_max, scale, top_k, BLOCK_N);
+                            check_launch("flash_attn_block_sparse_split");
                             dim3 mg(num_kv, sub_n);
                             flash_attn_split_merge<HD, GQA, BLOCK, K>
                                 <<<mg, BLOCK, 0, stream>>>(
                                     ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
                                     out_sub, num_q, sub_n, ATTN_NB);
+                            check_launch("flash_attn_split_merge[sparse]");
                         };
                         if (num_q == 24) {
                             if      (fa_sk == 2) launch_sp(std::integral_constant<int,6>{}, std::integral_constant<int,2>{});
@@ -3823,9 +3923,15 @@ struct QwenModel {
             return;
         }
 
+        auto mlp_prof_now = [](){ return std::chrono::high_resolution_clock::now(); };
+        auto mlp_prof_sync_ms = [&](std::chrono::high_resolution_clock::time_point tb){
+            cudaStreamSynchronize(stream);
+            auto te = std::chrono::high_resolution_clock::now();
+            return std::chrono::duration<double, std::milli>(te - tb).count();
+        };
+        auto t0 = mlp_prof_now();
+
         // 1. Batched RMSNorm: rows = n_tokens, all writing into mlp_chunk_norm.
-        //    rms_norm_f32in_*_kernel uses one block per row, so this is one
-        //    launch with n_tokens blocks instead of n_tokens launches.
         if (norm_w->type == GGML_TYPE_F32) {
             rms_norm_f32in_f32w(buf.mlp_chunk_norm, hidden_chunk, (float*)norm_w->data,
                                 n_tokens, H, cfg.rms_norm_eps, stream);
@@ -3833,46 +3939,63 @@ struct QwenModel {
             rms_norm_f32in(buf.mlp_chunk_norm, hidden_chunk, (half*)norm_w->data,
                            n_tokens, H, cfg.rms_norm_eps, stream);
         }
+        if (g_profile_mlp) { g_mlp_norm_ms += mlp_prof_sync_ms(t0); t0 = mlp_prof_now(); }
 
-        // 2. Quantize all n_tokens × H normed values in one shot. The chunk
-        //    is contiguous and H is a multiple of QK8=32, so block boundaries
-        //    align with token boundaries.
+        // 2. Quantize all n_tokens × H normed values in one shot.
         gpu_qi[g].quantize_chunk(buf.mlp_chunk_norm, H, n_tokens, stream);
+        if (g_profile_mlp) { g_mlp_q1_ms += mlp_prof_sync_ms(t0); t0 = mlp_prof_now(); }
 
-        // 3. Batched ffn_gate and ffn_up projections. Both share the same
-        //    pre-quantized input chunk → weight word load is paid twice
-        //    (once per matrix), not 2*n_tokens times.
-        quant_gemv_chunk(gate_w->data, gate_w->type,
-                         gpu_qi[g].q8_buf, buf.mlp_chunk_gate,
-                         H, I, n_tokens, stream);
-        quant_gemv_chunk(up_w->data,   up_w->type,
-                         gpu_qi[g].q8_buf, buf.mlp_chunk_up,
-                         H, I, n_tokens, stream);
+        // 3. ffn_gate + ffn_up projections. MLP_GATEUP_FUSED=1 uses a fused
+        // kernel that loads the shared Q8 input tile once and computes both
+        // gate and up outputs in one launch. Default OFF (env-gated until
+        // measured).
+        static const bool fuse_gateup = getenv("MLP_GATEUP_FUSED") != nullptr;
+        if (fuse_gateup && gate_w->type == GGML_TYPE_Q8_0 && up_w->type == GGML_TYPE_Q8_0) {
+            quant_gemv_chunk_fused2(gate_w->data, up_w->data, gate_w->type,
+                                    gpu_qi[g].q8_buf,
+                                    buf.mlp_chunk_gate, buf.mlp_chunk_up,
+                                    H, I, n_tokens, stream);
+            if (g_profile_mlp) { g_mlp_gate_ms += mlp_prof_sync_ms(t0); t0 = mlp_prof_now(); }
+            // up phase rolled into gate timer when fused.
+        } else {
+            // 3a. Batched ffn_gate projection.
+            quant_gemv_chunk(gate_w->data, gate_w->type,
+                             gpu_qi[g].q8_buf, buf.mlp_chunk_gate,
+                             H, I, n_tokens, stream);
+            if (g_profile_mlp) { g_mlp_gate_ms += mlp_prof_sync_ms(t0); t0 = mlp_prof_now(); }
 
-        // 4. Fused SiLU(gate) * up across the whole chunk. silu_mul_kernel
-        //    is element-wise so we just expand n to (n_tokens * I).
+            // 3b. Batched ffn_up projection.
+            quant_gemv_chunk(up_w->data,   up_w->type,
+                             gpu_qi[g].q8_buf, buf.mlp_chunk_up,
+                             H, I, n_tokens, stream);
+            if (g_profile_mlp) { g_mlp_up_ms += mlp_prof_sync_ms(t0); t0 = mlp_prof_now(); }
+        }
+
+        // 4. Fused SiLU(gate) * up across the whole chunk.
         {
             int n_elem = n_tokens * I;
             silu_mul_kernel<<<(n_elem + 255) / 256, 256, 0, stream>>>(
                 buf.mlp_chunk_gate, buf.mlp_chunk_up, n_elem);
         }
+        if (g_profile_mlp) { g_mlp_silu_ms += mlp_prof_sync_ms(t0); t0 = mlp_prof_now(); }
 
         // 5. Quantize the (silu_mul'd) intermediate chunk for the down proj.
         gpu_qi_inter[g].quantize_chunk(buf.mlp_chunk_gate, I, n_tokens, stream);
+        if (g_profile_mlp) { g_mlp_q2_ms += mlp_prof_sync_ms(t0); t0 = mlp_prof_now(); }
 
         // 6. Batched ffn_down projection.
         quant_gemv_chunk(down_w->data, down_w->type,
                          gpu_qi_inter[g].q8_buf, buf.mlp_chunk_down,
                          I, H, n_tokens, stream);
+        if (g_profile_mlp) { g_mlp_down_ms += mlp_prof_sync_ms(t0); t0 = mlp_prof_now(); }
 
-        // 7. Residual add: hidden_chunk[t,h] += mlp_chunk_down[t,h]. Both
-        //    buffers are contiguous and the same shape, so add_kernel_f32
-        //    handles the whole thing in one launch.
+        // 7. Residual add.
         {
             int n_elem = n_tokens * H;
             add_kernel_f32<<<(n_elem + 255) / 256, 256, 0, stream>>>(
                 hidden_chunk, buf.mlp_chunk_down, n_elem);
         }
+        if (g_profile_mlp) { g_mlp_resi_ms += mlp_prof_sync_ms(t0); g_mlp_calls++; }
     }
 
 #if 0  // unused — kept for reference, signatures need updating to fp32 hidden
