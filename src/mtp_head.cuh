@@ -331,6 +331,97 @@ struct MTPHead {
         return true;
     }
 
+    // Load MTP head from GGUF-internal tensors (v2 models embed nextn in blk.N).
+    // The GPUModel already has the tensors on GPU, so we just grab pointers.
+    // `mtp_layer` is the block index (e.g. 64 for a 65-layer model).
+    bool load_from_gguf(GPUModel& gm, int mtp_layer,
+                        int hidden_size, int vocab_size,
+                        int num_q_heads, int num_kv_heads, int head_dim_,
+                        int intermediate, int rope_dim_, int max_seq_, float rms_eps) {
+        std::string pfx = "blk." + std::to_string(mtp_layer) + ".";
+        auto gt = [&](const std::string& suffix) -> GPUTensor* {
+            auto it = gm.tensors.find(pfx + suffix);
+            return (it != gm.tensors.end()) ? &it->second : nullptr;
+        };
+        auto* nextn_fc = gt("nextn.eh_proj.weight");
+        if (!nextn_fc) return false;
+
+        gpu_id = gm.layer_gpu[mtp_layer];
+        H = hidden_size; V = vocab_size;
+        num_q = num_q_heads; num_kv = num_kv_heads;
+        head_dim = head_dim_;
+        q_dim = num_q * head_dim; kv_dim = num_kv * head_dim;
+        qg_dim = 2 * q_dim; I = intermediate;
+        rope_dim = rope_dim_; max_seq = max_seq_;
+        eps = rms_eps; kv_pos = 0;
+
+        cudaSetDevice(gpu_id);
+
+        fc        = nextn_fc->data;
+        q_proj    = gt("attn_q.weight")->data;
+        k_proj    = gt("attn_k.weight")->data;
+        v_proj    = gt("attn_v.weight")->data;
+        o_proj    = gt("attn_output.weight")->data;
+        gate_proj = gt("ffn_gate.weight")->data;
+        up_proj   = gt("ffn_up.weight")->data;
+        down_proj = gt("ffn_down.weight")->data;
+
+        // Norm tensors: GGUF converter bakes +1 into F32 norms, so use directly
+        auto bind_norm = [&](const std::string& suffix) -> float* {
+            auto* t = gt(suffix);
+            if (!t) return nullptr;
+            if (t->type == GGML_TYPE_F32)
+                return (float*)t->data;
+            // F16 → need to convert to F32 + apply +1 shift
+            int n = (int)t->num_elements();
+            float* dev = nullptr;
+            cudaMalloc(&dev, n * sizeof(float));
+            std::vector<half> h16(n);
+            cudaMemcpy(h16.data(), t->data, n * sizeof(half), cudaMemcpyDeviceToHost);
+            std::vector<float> f32(n);
+            for (int i = 0; i < n; i++) f32[i] = __half2float(h16[i]) + 1.0f;
+            cudaMemcpy(dev, f32.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+            return dev;
+        };
+        pre_fc_norm_embedding    = bind_norm("nextn.enorm.weight");
+        pre_fc_norm_hidden       = bind_norm("nextn.hnorm.weight");
+        input_layernorm          = bind_norm("attn_norm.weight");
+        post_attention_layernorm = bind_norm("post_attention_norm.weight");
+        q_norm                   = bind_norm("attn_q_norm.weight");
+        k_norm                   = bind_norm("attn_k_norm.weight");
+        final_norm               = bind_norm("nextn.shared_head_norm.weight");
+
+        // Allocate temp + KV buffers (same as file-based loader)
+        cudaMalloc(&embed_tmp, H * sizeof(half));
+        cudaMalloc(&en_tmp,    H * sizeof(half));
+        cudaMalloc(&hn_tmp,    H * sizeof(half));
+        cudaMalloc(&fused_tmp, 2 * H * sizeof(half));
+        cudaMalloc(&h_tmp,      H * sizeof(half));
+        cudaMalloc(&h_norm_tmp, H * sizeof(half));
+        cudaMalloc(&qg_tmp,     qg_dim * sizeof(half));
+        cudaMalloc(&q_tmp,      q_dim * sizeof(half));
+        cudaMalloc(&gate_tmp,   q_dim * sizeof(half));
+        cudaMalloc(&k_tmp,      kv_dim * sizeof(half));
+        cudaMalloc(&v_tmp,      kv_dim * sizeof(half));
+        cudaMalloc(&attn_scores, num_q * max_seq * sizeof(float));
+        cudaMalloc(&attn_out,   q_dim * sizeof(half));
+        cudaMalloc(&attn_proj_out, H * sizeof(half));
+        cudaMalloc(&mlp_gate_tmp, I * sizeof(half));
+        cudaMalloc(&mlp_up_tmp,   I * sizeof(half));
+        cudaMalloc(&mlp_out,      H * sizeof(half));
+        cudaMalloc(&h_final,      H * sizeof(half));
+        cudaMalloc(&logits_buf,   V * sizeof(half));
+        cudaMalloc(&kv_k, (size_t)max_seq * kv_dim * sizeof(half));
+        cudaMalloc(&kv_v, (size_t)max_seq * kv_dim * sizeof(half));
+        cudaMalloc(&d_argmax, sizeof(int));
+        cudaMallocHost(&h_argmax, sizeof(int));
+        cudaMallocHost(&embed_pinned_host, H * sizeof(half));
+
+        printf("[MTP] loaded from GGUF blk.%d on GPU %d, KV cache %d slots = %.1f MB\n",
+               mtp_layer, gpu_id, max_seq, (2.0 * max_seq * kv_dim * 2) / 1e6);
+        return true;
+    }
+
     void bind_f32(const std::string& name, float* dev) {
         if      (name == "mtp.pre_fc_norm_embedding.weight")          pre_fc_norm_embedding = dev;
         else if (name == "mtp.pre_fc_norm_hidden.weight")             pre_fc_norm_hidden    = dev;

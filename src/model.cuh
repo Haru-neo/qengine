@@ -104,6 +104,7 @@ struct QwenModel {
     int  attn_num_q_heads = 0;
     int  attn_num_kv_heads = 0;
     int  attn_head_dim = 0;
+    int  mtp_layer_idx = -1;
     QuantInput gpu_qi[4];  // per-GPU reusable Q8 buffer (hidden_size)
     QuantInput gpu_qi_inter[4];  // per-GPU for intermediate_size  // one per GPU
     // Second-token buffer set used by the speculative-decoding path
@@ -388,6 +389,21 @@ struct QwenModel {
         cfg.vocab_size = out ? out->dims[1] : 0;
         
         cfg.rope_dim = gguf.get_u32(arch + ".rope.dimension_count", cfg.head_dim / 2);
+
+        // Detect v2 inline MTP: if the last block has nextn tensors, it's a
+        // dedicated MTP layer that should not participate in the main forward.
+        mtp_layer_idx = -1;
+        {
+            int last = cfg.num_layers - 1;
+            std::string probe = "blk." + std::to_string(last) + ".nextn.eh_proj.weight";
+            if (gpu->get(probe.c_str())) {
+                mtp_layer_idx = last;
+                cfg.num_layers--;
+                printf("Detected inline MTP at blk.%d — main forward uses %d layers\n",
+                       mtp_layer_idx, cfg.num_layers);
+            }
+        }
+
         printf("Config: hidden=%d, inter=%d, layers=%d, heads=%d/%d, vocab=%d, rope_dim=%d\n",
             cfg.hidden_size, cfg.intermediate_size, cfg.num_layers,
             cfg.num_q_heads, cfg.num_kv_heads, cfg.vocab_size, cfg.rope_dim);

@@ -13,6 +13,7 @@
 #include "dflash_decode.cuh"
 #include <cstdio>
 #include <csignal>
+#include <poll.h>
 // Vision hooks (shared via global pointers — see main() wiring). When the CLI
 // is invoked with --mmproj + --image-raw, main() runs the ViT on GPU 0 and
 // populates g_vision_embeds with 576 fp16 rows of LLM-hidden dim. During
@@ -987,39 +988,41 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     long long tree_reject_count = 0;
 
     // ── MTP head (Phase 0: forward + accept rate measurement) ─────────────
-    // Loaded only if /home/paru/mtp_work/mtp_head.bin exists.
     MTPHead mtp;
     bool mtp_loaded = false;
     {
-        // Load the MTP head whose hidden size matches this model. The
-        // 27B and 9B Qwen3.5 share the same MTP architecture but have
-        // different dims, so we keep one bin per hidden size and pick
-        // by name. (Falls back to legacy mtp_head.bin if the sized
-        // file is not present, for backwards compat with prior fetches.)
-        char mtp_path_buf[256];
-        snprintf(mtp_path_buf, sizeof(mtp_path_buf),
-                 "/home/paru/mtp_work/mtp_head_%d.bin", model.cfg.hidden_size);
-        const char* mtp_path = mtp_path_buf;
-        if (access(mtp_path, R_OK) != 0) {
-            mtp_path = "/home/paru/mtp_work/mtp_head.bin";
-        }
-        if (access(mtp_path, R_OK) == 0) {
-            // Pull RoPE table for last_gpu, embd source from GPU 0, lm_head from last_gpu.
-            mtp_loaded = mtp.load(
-                mtp_path, last_gpu,
+        // Try inline GGUF MTP first (v2 models embed nextn in blk.N)
+        if (model.mtp_layer_idx >= 0) {
+            mtp_loaded = mtp.load_from_gguf(
+                gpu_model, model.mtp_layer_idx,
                 model.cfg.hidden_size, V,
                 model.cfg.num_q_heads, model.cfg.num_kv_heads, model.cfg.head_dim,
                 model.cfg.intermediate_size, model.cfg.rope_dim, max_seq, model.cfg.rms_norm_eps);
-            if (mtp_loaded) {
-                auto* embd_t  = gpu_model.get("token_embd.weight");
-                auto* outw_t  = gpu_model.get("output.weight");
-                mtp.set_embed_source(embd_t->data, embd_t->type, embd_t->gpu_id);
-                mtp.set_lm_head(outw_t->data, outw_t->type);
-                mtp.set_rope_tables(model.rope.sin_table(last_gpu), model.rope.cos_table(last_gpu));
-                printf("[MTP] head ready, will measure acceptance rate during gen\n");
-            } else {
-                printf("[MTP] failed to load %s\n", mtp_path);
+        }
+        // Fallback: external mtp_head_<hidden>.bin
+        if (!mtp_loaded) {
+            char mtp_path_buf[256];
+            snprintf(mtp_path_buf, sizeof(mtp_path_buf),
+                     "/home/paru/mtp_work/mtp_head_%d.bin", model.cfg.hidden_size);
+            const char* mtp_path = mtp_path_buf;
+            if (access(mtp_path, R_OK) != 0)
+                mtp_path = "/home/paru/mtp_work/mtp_head.bin";
+            if (access(mtp_path, R_OK) == 0) {
+                mtp_loaded = mtp.load(
+                    mtp_path, last_gpu,
+                    model.cfg.hidden_size, V,
+                    model.cfg.num_q_heads, model.cfg.num_kv_heads, model.cfg.head_dim,
+                    model.cfg.intermediate_size, model.cfg.rope_dim, max_seq, model.cfg.rms_norm_eps);
+                if (!mtp_loaded) printf("[MTP] failed to load %s\n", mtp_path);
             }
+        }
+        if (mtp_loaded) {
+            auto* embd_t  = gpu_model.get("token_embd.weight");
+            auto* outw_t  = gpu_model.get("output.weight");
+            mtp.set_embed_source(embd_t->data, embd_t->type, embd_t->gpu_id);
+            mtp.set_lm_head(outw_t->data, outw_t->type);
+            mtp.set_rope_tables(model.rope.sin_table(last_gpu), model.rope.cos_table(last_gpu));
+            printf("[MTP] head ready, will measure acceptance rate during gen\n");
         }
     }
 
@@ -1032,15 +1035,18 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     spec_k2_enabled   = (spec_enabled && getenv("MTP_K2")   != nullptr && getenv("MTP_TREE") == nullptr);
     spec_tree_enabled = (spec_enabled && getenv("MTP_TREE") != nullptr);
 
-    // Continuous batching N>1 is incompatible with the MTP/DFlash spec paths:
-    // those carry single-global state (mtp.kv, gdn snapshots, dflash capture
-    // buffer) that's only safe with a single in-flight sequence on slot 0. The
-    // batched gen loop runs plain greedy across all slots. Force-disable the
-    // spec flags so the user gets a clear log instead of silent N=1-only spec.
+    // Continuous batching N>1 keeps the MTP/spec paths available because
+    // they're only ever invoked from generate_impl when slot==0, and the
+    // legacy fast path (slot 0 alone) holds forward_mutex while running so
+    // the gen-loop thread can't race the single-global mtp.kv / gdn-snapshot
+    // state. The batched-gen handoff also calls generate_impl, but breaks at
+    // step == prompt_len-1 (before any spec branch which only fires at
+    // step+1), so spec_enabled stays true with no batched-path leak.
+    // DFlash is the exception — it still needs slot-0-only ownership of its
+    // capture buffer, handled below.
     if (num_slots > 1 && (spec_enabled || spec_k2_enabled || spec_tree_enabled)) {
-        printf("[server] num_slots=%d > 1: disabling MTP/spec paths "
-               "(slot-0-only state, incompatible with batched gen)\n", num_slots);
-        spec_enabled = spec_k2_enabled = spec_tree_enabled = false;
+        printf("[server] num_slots=%d > 1: MTP/spec available on slot-0 fast path "
+               "(serialized via forward_mutex)\n", num_slots);
     }
 
     // ── DFlash speculative decoding (block-diffusion drafter + DDTree verify) ─
@@ -1268,6 +1274,12 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         g_pt_calls = 0;
         const char* prof_gdn_env = getenv("PROFILE_GDN");
         g_profile_gdn = prof_gdn_env && prof_gdn_env[0] == '1';
+        const char* prof_mlp_env = getenv("PROFILE_MLP");
+        g_profile_mlp = prof_mlp_env && prof_mlp_env[0] == '1';
+        g_mlp_norm_ms = g_mlp_q1_ms = g_mlp_gate_ms = g_mlp_up_ms
+                      = g_mlp_silu_ms = g_mlp_q2_ms = g_mlp_down_ms
+                      = g_mlp_resi_ms = 0.0;
+        g_mlp_calls = 0;
         g_gdn_norm_ms = g_gdn_proj_ms = g_gdn_conv_ms = g_gdn_recur_ms
                      = g_gdn_rmsg_ms = g_gdn_oproj_ms = g_gdn_resi_ms = 0.0;
         g_gdn_calls = 0;
@@ -2784,6 +2796,25 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                    g_pt_oproj_ms,   pt_sub > 0 ? 100.0*g_pt_oproj_ms/pt_sub   : 0);
             fflush(stdout);
         }
+        if (g_profile_mlp && g_mlp_calls > 0) {
+            double mlp_sub = g_mlp_norm_ms + g_mlp_q1_ms + g_mlp_gate_ms +
+                             g_mlp_up_ms + g_mlp_silu_ms + g_mlp_q2_ms +
+                             g_mlp_down_ms + g_mlp_resi_ms;
+            printf("[MLP PROF] calls=%ld sub_sum=%.1fms  "
+                   "norm=%.1f(%.0f%%) q1=%.1f(%.0f%%) gate=%.1f(%.0f%%) "
+                   "up=%.1f(%.0f%%) silu=%.1f(%.0f%%) q2=%.1f(%.0f%%) "
+                   "down=%.1f(%.0f%%) resi=%.1f(%.0f%%)\n",
+                   g_mlp_calls, mlp_sub,
+                   g_mlp_norm_ms, mlp_sub > 0 ? 100.0*g_mlp_norm_ms/mlp_sub : 0,
+                   g_mlp_q1_ms,   mlp_sub > 0 ? 100.0*g_mlp_q1_ms/mlp_sub   : 0,
+                   g_mlp_gate_ms, mlp_sub > 0 ? 100.0*g_mlp_gate_ms/mlp_sub : 0,
+                   g_mlp_up_ms,   mlp_sub > 0 ? 100.0*g_mlp_up_ms/mlp_sub   : 0,
+                   g_mlp_silu_ms, mlp_sub > 0 ? 100.0*g_mlp_silu_ms/mlp_sub : 0,
+                   g_mlp_q2_ms,   mlp_sub > 0 ? 100.0*g_mlp_q2_ms/mlp_sub   : 0,
+                   g_mlp_down_ms, mlp_sub > 0 ? 100.0*g_mlp_down_ms/mlp_sub : 0,
+                   g_mlp_resi_ms, mlp_sub > 0 ? 100.0*g_mlp_resi_ms/mlp_sub : 0);
+            fflush(stdout);
+        }
         if (g_profile_gdn && g_gdn_calls > 0) {
             double gdn_sub = g_gdn_norm_ms + g_gdn_proj_ms + g_gdn_conv_ms +
                              g_gdn_recur_ms + g_gdn_rmsg_ms + g_gdn_oproj_ms + g_gdn_resi_ms;
@@ -3241,9 +3272,14 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     };
 
     // Non-streaming: submit a Sequence, wait on a future for the result.
+    // While waiting we periodically poll(client_fd, POLLRDHUP) so a client
+    // that closes mid-generation flips seq->cancelled and the gen loop
+    // stops. Without this, non-streaming has no per-token send to fail and
+    // would burn the slot until natural completion.
     server.generate_fn = [&](const std::vector<int>& prompt_ids, int max_tokens,
                              int cached_prompt_tokens,
                              const ResponseFormat& rf,
+                             int client_fd,
                              int* out_completion_tokens) -> std::string {
         auto seq = std::make_shared<qwen_engine::Sequence>();
         seq->prompt_ids           = prompt_ids;
@@ -3266,14 +3302,22 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
             done_cv.notify_all();
         };
         if (!sched.submit(seq)) {
-            // Queue at cap (QWEN_MAX_QUEUE). Tell the caller; HTTP layer
-            // returns the empty body. Better than silently dropping.
             if (out_completion_tokens) *out_completion_tokens = 0;
             return std::string("[server overloaded — queue full]");
         }
         {
             std::unique_lock<std::mutex> lk(done_mu);
-            done_cv.wait(lk, [&]() { return done; });
+            while (!done) {
+                done_cv.wait_for(lk, std::chrono::milliseconds(100), [&]() { return done; });
+                if (done) break;
+                if (client_fd >= 0 && !seq->cancelled.load(std::memory_order_acquire)) {
+                    struct pollfd pfd { client_fd, POLLRDHUP | POLLHUP | POLLERR, 0 };
+                    if (poll(&pfd, 1, 0) > 0 &&
+                        (pfd.revents & (POLLRDHUP | POLLHUP | POLLERR))) {
+                        seq->cancelled.store(true, std::memory_order_release);
+                    }
+                }
+            }
         }
         if (out_completion_tokens) *out_completion_tokens = comp;
         return final_text;
@@ -3546,6 +3590,7 @@ int serve_gemma(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
     auto generate = [&](const std::vector<int>& prompt_ids, int max_tokens,
                         int /*cached_prompt_tokens*/,
                         const ResponseFormat& /*rf*/,
+                        int /*client_fd*/,
                         int* out_completion_tokens) -> std::string {
         model.reset_all();
         std::vector<int> generated;
