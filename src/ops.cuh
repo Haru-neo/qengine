@@ -941,3 +941,29 @@ __global__ void argmax_topk_half_kernel(const half* __restrict__ logits,
 
 template __global__ void argmax_topk_half_kernel<4>(const half*, int, int*, float*);
 template __global__ void argmax_topk_half_kernel<8>(const half*, int, int*, float*);
+
+// ── Activation sparsity measurement ──────────────────────────────────
+// For a fp16 activation tensor [n_tokens × I], compute the per-block-of-32
+// magnitude: for each block b in [0, n_blocks), sum |activation[tok, b*32+j]|
+// across all tokens and all 32 elements within the block.
+// Output: out_mag[b] = sum over tok,j of |act[tok*I + b*32 + j]|.
+// Launch: n_blocks threads (544 for I=17408), one block per grid.
+__global__ void block_magnitude_kernel(
+    const half* __restrict__ act,   // [n_tokens × I]
+    float* __restrict__ out_mag,    // [n_blocks]
+    int I,                          // intermediate size (17408)
+    int n_tokens,
+    int n_blocks                    // I / 32
+) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_blocks) return;
+
+    float mag = 0.0f;
+    for (int tok = 0; tok < n_tokens; tok++) {
+        const half* row = act + (size_t)tok * I + b * 32;
+        for (int j = 0; j < 32; j++) {
+            mag += fabsf(__half2float(row[j]));
+        }
+    }
+    out_mag[b] = mag;
+}

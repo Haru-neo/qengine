@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <chrono>
 #include <mutex>
+#include <algorithm>
 
 // PROFILE_ATTN=1 (set before forward_attn_chunk runs) enables per-phase sync
 // timers inside forward_attn_chunk. Accumulates score/softmax/value/other
@@ -3994,6 +3995,77 @@ struct QwenModel {
                 buf.mlp_chunk_gate, buf.mlp_chunk_up, n_elem);
         }
         if (g_profile_mlp) { g_mlp_silu_ms += mlp_prof_sync_ms(t0); t0 = mlp_prof_now(); }
+
+        // 4b. (Optional) Measure activation sparsity for the down_proj input.
+        //     MEASURE_SPARSITY=1: prints per-layer energy distribution once
+        //     (first chunk of each layer, first prefill only).
+        {
+            static const bool measure_sparsity = getenv("MEASURE_SPARSITY") != nullptr;
+            // Track which layers have been measured (up to 128 layers).
+            static bool layer_measured[128] = {};
+            if (measure_sparsity && layer < 128 && !layer_measured[layer]) {
+                layer_measured[layer] = true;
+                int n_blocks = I / 32;  // 544 for I=17408
+
+                // Lazy-allocate a small device buffer for block magnitudes.
+                static float* d_block_mag = nullptr;
+                static float* h_block_mag = nullptr;
+                if (!d_block_mag) {
+                    cudaMalloc(&d_block_mag, n_blocks * sizeof(float));
+                    h_block_mag = (float*)malloc(n_blocks * sizeof(float));
+                }
+
+                // Launch the measurement kernel.
+                int threads_mag = 256;
+                int grid_mag = (n_blocks + threads_mag - 1) / threads_mag;
+                block_magnitude_kernel<<<grid_mag, threads_mag, 0, stream>>>(
+                    buf.mlp_chunk_gate, d_block_mag, I, n_tokens, n_blocks);
+
+                // Copy results to host.
+                cudaMemcpyAsync(h_block_mag, d_block_mag,
+                                n_blocks * sizeof(float),
+                                cudaMemcpyDeviceToHost, stream);
+                cudaStreamSynchronize(stream);
+
+                // Compute statistics: sort magnitudes descending.
+                std::vector<float> mags(h_block_mag, h_block_mag + n_blocks);
+                float total_mag = 0.0f;
+                for (float m : mags) total_mag += m;
+                std::sort(mags.begin(), mags.end(), std::greater<float>());
+
+                // Cumulative energy at various keep ratios.
+                float cum = 0.0f;
+                float energy_at[5];  // energy% at keep 20/40/50/60/80
+                const float check_ratios[] = {0.20f, 0.40f, 0.50f, 0.60f, 0.80f};
+                int ci = 0;
+                for (int i = 0; i < n_blocks && ci < 5; i++) {
+                    cum += mags[i];
+                    float frac = (float)(i + 1) / n_blocks;
+                    while (ci < 5 && frac >= check_ratios[ci] - 1e-6f) {
+                        energy_at[ci] = (total_mag > 0) ? cum / total_mag * 100.0f : 0.0f;
+                        ci++;
+                    }
+                }
+                while (ci < 5) { energy_at[ci++] = 100.0f; }
+
+                // Count near-zero blocks.
+                float per_tok = (n_tokens > 0) ? (float)n_tokens : 1.0f;
+                int cnt_01 = 0;
+                for (int i = 0; i < n_blocks; i++) {
+                    float avg = h_block_mag[i] / (per_tok * 32.0f);
+                    if (avg < 0.1f) cnt_01++;
+                }
+
+                printf("[SPARSITY] L%02d ntok=%d nblk=%d | "
+                       "keep20%%=%.1f%% keep40%%=%.1f%% keep50%%=%.1f%% "
+                       "keep60%%=%.1f%% keep80%%=%.1f%% | "
+                       "near-zero(<0.1)=%d/%d(%.0f%%)\n",
+                       layer, n_tokens, n_blocks,
+                       energy_at[0], energy_at[1], energy_at[2],
+                       energy_at[3], energy_at[4],
+                       cnt_01, n_blocks, 100.0f * cnt_01 / n_blocks);
+            }
+        }
 
         // 5. Quantize the (silu_mul'd) intermediate chunk for the down proj.
         gpu_qi_inter[g].quantize_chunk(buf.mlp_chunk_gate, I, n_tokens, stream);
