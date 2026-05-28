@@ -814,13 +814,22 @@ int run_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, const SamplingPara
 
 // ============ Qwen serve mode: OpenAI-compatible HTTP API ============
 
-int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const Tokenizer& tok, const std::string& model_name, const std::string& api_key = "", int max_seq = 262144, int num_slots = 1) {
+int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const Tokenizer& tok, const std::string& model_name, const std::string& api_key = "", int max_seq = 262144, int num_slots = 1, const std::vector<int>& slot_caps = {}) {
     QwenModel model;
     model.gpu = &gpu_model;
     model.init_config(gguf);
     model.alloc_buffers();
+    // slot_caps wins over --slots if both are given: GDN state count + KV
+    // partition must agree, otherwise kv_slot_offset returns 0 for "extra"
+    // GDN slots and they silently share slot 0's KV. Override num_slots in
+    // the local scope so scheduler / batched-gen loop / /stats see one value.
+    if (!slot_caps.empty()) num_slots = (int)slot_caps.size();
     model.init_gdn_states(num_slots);
-    model.init_attention(max_seq, num_slots);
+    if (!slot_caps.empty()) {
+        model.init_attention_caps(slot_caps);
+    } else {
+        model.init_attention(max_seq, num_slots);
+    }
 
     int H = model.cfg.hidden_size;
     int V = model.cfg.vocab_size;
@@ -1214,9 +1223,10 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         // KV context (minus a safety margin for the in-loop bound). It
         // will still stop on EOS or one of the other stop tags. Caller
         // can still set an explicit max_tokens to clip earlier.
+        int slot_cap = model.slot_capacity(slot);
         int max_gen = max_tokens > 0
                       ? max_tokens
-                      : std::max(64, max_seq - (int)prompt_ids.size() - 64);
+                      : std::max(64, slot_cap - (int)prompt_ids.size() - 64);
         auto t0 = std::chrono::high_resolution_clock::now();
         auto t_first = t0;
         bool got_first_tok = false;
@@ -2880,11 +2890,11 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                                     int* out_tokens) {
         if (N <= 0) return;
         // Build per-GPU host index buffers for slot_ids / slot_pos / dst_kv_pos.
-        // dst_kv_pos[i] = slot_ids[i] * slot_max_seq + slot_pos[i]  (physical
-        // KV index for the new token's K/V).
+        // dst_kv_pos[i] = kv_slot_offset(slot) + slot_pos[i]  (physical
+        // KV index for the new token's K/V — cumulative for asymmetric caps).
         std::vector<int> dst_kv_host(N);
         for (int i = 0; i < N; i++) {
-            dst_kv_host[i] = slot_ids[i] * model.slot_max_seq + slot_pos[i];
+            dst_kv_host[i] = (int)model.kv_slot_offset(slot_ids[i]) + slot_pos[i];
         }
         for (int g = 0; g < n_gpus; g++) {
             cudaSetDevice(g);
@@ -3127,7 +3137,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 int prompt_len = (int)seq.prompt_ids.size();
                 st.max_gen = seq.max_tokens > 0
                              ? seq.max_tokens
-                             : std::max(64, max_seq - prompt_len - 64);
+                             : std::max(64, model.slot_capacity(slot) - prompt_len - 64);
             }
             // first_tok already pushed into generate_impl's local `generated`
             // and on_token fired. Replicate the bookkeeping here so our
@@ -3228,7 +3238,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                                 std::string ts = tok.decode(tail);
                                 if (ts.find("</tool_call>") != std::string::npos) stop = true;
                             }
-                            if (!stop && st.slot_pos >= max_seq - 1) stop = true;
+                            if (!stop && st.slot_pos >= model.slot_capacity(s) - 1) stop = true;
                         }
                         if (stop) {
                             st.active = false;
@@ -3280,11 +3290,13 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                              int cached_prompt_tokens,
                              const ResponseFormat& rf,
                              int client_fd,
+                             int requested_slot,
                              int* out_completion_tokens) -> std::string {
         auto seq = std::make_shared<qwen_engine::Sequence>();
         seq->prompt_ids           = prompt_ids;
         seq->max_tokens           = max_tokens;
         seq->cached_prompt_tokens = cached_prompt_tokens;
+        seq->requested_slot       = requested_slot;
         if (rf.json_mode) seq->grammar = std::make_shared<qwen_engine::JsonGrammar>();
 
         std::mutex done_mu;
@@ -3336,11 +3348,13 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     server.stream_generate_fn = [&](const std::vector<int>& prompt_ids, int max_tokens,
                                     int cached_prompt_tokens,
                                     const ResponseFormat& rf,
+                                    int requested_slot,
                                     StreamCallback cb) {
         auto seq = std::make_shared<qwen_engine::Sequence>();
         seq->prompt_ids           = prompt_ids;
         seq->max_tokens           = max_tokens;
         seq->cached_prompt_tokens = cached_prompt_tokens;
+        seq->requested_slot       = requested_slot;
         if (rf.json_mode) seq->grammar = std::make_shared<qwen_engine::JsonGrammar>();
 
         // utf8_buf is owned by the lambda captures — the worker thread runs
@@ -3591,6 +3605,7 @@ int serve_gemma(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
                         int /*cached_prompt_tokens*/,
                         const ResponseFormat& /*rf*/,
                         int /*client_fd*/,
+                        int /*requested_slot*/,
                         int* out_completion_tokens) -> std::string {
         model.reset_all();
         std::vector<int> generated;
@@ -3736,6 +3751,10 @@ int main(int argc, char** argv) {
     // tokens of context (so total physical KV is N×max_seq).
     int num_slots = 1;
     if (const char* e = getenv("QWEN_SLOTS")) num_slots = std::max(1, atoi(e));
+    // Asymmetric per-slot context caps. Comma-separated list overrides --slots
+    // and --max-seq when set (e.g. --slot-caps "262144,65536"). Each entry is
+    // that slot's max context in tokens; KV/GDN buffers allocate the sum.
+    std::vector<int> slot_caps;
     std::string prompt_text, api_key;
     std::string vision_mmproj_path, vision_test_image, image_raw_path;
     for (int i = 2; i < argc; i++) {
@@ -3751,6 +3770,22 @@ int main(int argc, char** argv) {
             max_seq = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--slots") == 0 && i + 1 < argc) {
             num_slots = std::max(1, atoi(argv[++i]));
+        } else if (strcmp(argv[i], "--slot-caps") == 0 && i + 1 < argc) {
+            slot_caps.clear();
+            std::string s = argv[++i];
+            size_t pos = 0;
+            while (pos < s.size()) {
+                size_t comma = s.find(',', pos);
+                std::string tok = s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                if (!tok.empty()) slot_caps.push_back(std::max(1, atoi(tok.c_str())));
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+            if (!slot_caps.empty()) {
+                num_slots = (int)slot_caps.size();
+                int max_c = 0; for (int c : slot_caps) if (c > max_c) max_c = c;
+                max_seq = max_c;
+            }
         } else if (strcmp(argv[i], "--vision-mmproj") == 0 && i + 1 < argc) {
             vision_mmproj_path = argv[++i];
         } else if (strcmp(argv[i], "--vision-test") == 0 && i + 1 < argc) {
@@ -3964,7 +3999,7 @@ int main(int argc, char** argv) {
       size_t d = model_name.find(".gguf"); if (d != std::string::npos) model_name = model_name.substr(0, d); }
 
     if (serve_port > 0 && arch == "qwen35") {
-        ret = serve_qwen(gguf, gpu_model, n_gpus, serve_port, tokenizer, model_name, api_key, max_seq, num_slots);
+        ret = serve_qwen(gguf, gpu_model, n_gpus, serve_port, tokenizer, model_name, api_key, max_seq, num_slots, slot_caps);
     } else if (serve_port > 0) {
         ret = serve_gemma(gguf, gpu_model, n_gpus, serve_port);
     } else if (chat_mode && arch == "qwen35") {

@@ -572,12 +572,12 @@ struct ResponseFormat {
 // POLLRDHUP and abort the in-flight gen — without it, a closed non-streaming
 // client keeps the slot busy until natural completion since there's no
 // per-token send to fail.
-using GenerateFunc = std::function<std::string(const std::vector<int>& prompt_ids, int max_tokens, int cached_prompt_tokens, const ResponseFormat& rf, int client_fd, int* out_completion_tokens)>;
+using GenerateFunc = std::function<std::string(const std::vector<int>& prompt_ids, int max_tokens, int cached_prompt_tokens, const ResponseFormat& rf, int client_fd, int requested_slot, int* out_completion_tokens)>;
 // StreamCallback returns true while the client is still receiving and false
 // once delivery has failed (EPIPE / closed connection). Producers should
 // stop generating as soon as it returns false.
 using StreamCallback = std::function<bool(const std::string& token_text, bool is_done)>;
-using StreamGenerateFunc = std::function<void(const std::vector<int>& prompt_ids, int max_tokens, int cached_prompt_tokens, const ResponseFormat& rf, StreamCallback cb)>;
+using StreamGenerateFunc = std::function<void(const std::vector<int>& prompt_ids, int max_tokens, int cached_prompt_tokens, const ResponseFormat& rf, int requested_slot, StreamCallback cb)>;
 
 struct HttpServer {
     int port;
@@ -662,6 +662,17 @@ struct HttpServer {
         // and on the next call with the same first N tokens skips re-prefill
         // up to N. 0 (default) = no caching.
         int cached_prompt_tokens = json_get_int(body, "cached_prompt_tokens", 0);
+        // Optional slot pinning: "slot": 0..N-1 forces the scheduler to wait
+        // for that specific slot. Lets clients run two sessions (e.g. agent
+        // + monitor) without prefix-cache thrash. -1 (default) = any slot.
+        // Search only the body prefix BEFORE "messages":[ so a user message
+        // containing the literal "slot" doesn't get picked up as the key.
+        int requested_slot = -1;
+        {
+            size_t msg_pos = body.find("\"messages\"");
+            std::string head = (msg_pos == std::string::npos) ? body : body.substr(0, msg_pos);
+            requested_slot = json_get_int(head, "slot", -1);
+        }
         bool stream = body.find("\"stream\"") != std::string::npos &&
                       (body.find("\"stream\":true") != std::string::npos ||
                        body.find("\"stream\": true") != std::string::npos);
@@ -935,7 +946,7 @@ struct HttpServer {
                     + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<think>\\n\"},\"finish_reason\":null}]}");
             }
             bool client_alive = true;
-            stream_generate_fn(prompt_ids, max_tokens, cached_prompt_tokens, rf, [&](const std::string& token, bool done) -> bool {
+            stream_generate_fn(prompt_ids, max_tokens, cached_prompt_tokens, rf, requested_slot, [&](const std::string& token, bool done) -> bool {
                 if (!client_alive) return false;  // already dead, stop calling
                 if (done) {
                     auto parsed_calls = parse_tool_calls(stream_accum);
@@ -966,7 +977,7 @@ struct HttpServer {
         } else {
             // Non-streaming response
             int completion_tokens = 0;
-            std::string generated_text = generate_fn(prompt_ids, max_tokens, cached_prompt_tokens, rf, client_fd, &completion_tokens);
+            std::string generated_text = generate_fn(prompt_ids, max_tokens, cached_prompt_tokens, rf, client_fd, requested_slot, &completion_tokens);
 
             // The chat encoder may prefill "<think>\n" into the prompt, in
             // which case the generated text starts mid-think with no opening

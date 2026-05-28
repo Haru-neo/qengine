@@ -67,6 +67,11 @@ struct Sequence {
     std::function<void(int /*token_id*/)>                    on_token;
     std::function<void(std::string /*final_text*/, int /*completion_tokens*/)> on_done;
 
+    // If >=0 and < num_slots, the scheduler waits for this specific slot
+    // to be free instead of taking the first available one. Lets clients
+    // pin a "session" to a slot for prefix-cache reuse across requests.
+    int requested_slot = -1;
+
     // Filled by the scheduler once a slot is allocated.
     int slot_id = -1;
     // Set true when run_fn finishes — observers can poll without the
@@ -99,6 +104,16 @@ public:
         return -1;  // unreachable
     }
 
+    // Wait for a specific slot to become free, then claim it. Used for
+    // client-pinned sessions. Returns -1 if the slot index is out of range.
+    int allocate_specific(int slot) {
+        if (slot < 0 || slot >= (int)free_.size()) return -1;
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [&]() { return free_[slot]; });
+        free_[slot] = false;
+        return slot;
+    }
+
     // Return a slot to the pool.
     void release(int slot) {
         if (slot < 0 || slot >= (int)free_.size()) return;
@@ -106,7 +121,12 @@ public:
             std::lock_guard<std::mutex> lk(mu_);
             free_[slot] = true;
         }
-        cv_.notify_one();
+        // notify_all (not notify_one) because waiters have heterogeneous
+        // predicates: `allocate()` waits on "any slot free", `allocate_specific(N)`
+        // waits on "slot N free". A notify_one can wake the wrong waiter,
+        // starving a specific-slot waiter while a generic waiter consumes
+        // the freed slot.
+        cv_.notify_all();
     }
 
 private:
@@ -190,7 +210,13 @@ private:
                 seq->finished.store(true, std::memory_order_release);
                 continue;
             }
-            int slot = slots_.allocate();
+            int slot;
+            if (seq->requested_slot >= 0 && seq->requested_slot < slots_.num_slots()) {
+                slot = slots_.allocate_specific(seq->requested_slot);
+                if (slot < 0) slot = slots_.allocate();
+            } else {
+                slot = slots_.allocate();
+            }
             seq->slot_id = slot;
             try {
                 run_fn_(*seq, slot);
