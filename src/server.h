@@ -832,11 +832,13 @@ struct HttpServer {
             if (!has_system) msg_pairs.insert(msg_pairs.begin(), {"system", hint});
         }
 
-        // Qwen3 /no_think and /think directives: scan the last user message.
-        // /no_think  → force_think = -1 (skip thinking, insert <think></think>)
-        // /think     → force_think =  1 (default, prefill <think>\n)
-        // Both directives are stripped from the message text before encoding
-        // so the model doesn't see them as content.
+        // Qwen3 thinking control. Three trigger sources, in priority order
+        // (later overrides earlier):
+        //   1. /no_think or /think directive anywhere in user OR system msgs
+        //   2. extra_body.chat_template_kwargs.enable_thinking (vLLM standard)
+        //   3. top-level chat_template_kwargs.enable_thinking
+        // force_think: -1=skip (insert <think></think>), 0=auto, 1=prefill
+        // Directives are stripped from message text before encoding.
         int force_think = rf.json_mode ? -1 : 0;
         auto strip_directive = [](std::string& s, const std::string& tag) {
             size_t p;
@@ -849,18 +851,41 @@ struct HttpServer {
             }
             while (!s.empty() && (s.back() == ' ' || s.back() == '\n' || s.back() == '\r' || s.back() == '\t')) s.pop_back();
         };
-        for (auto it = msg_pairs.rbegin(); it != msg_pairs.rend(); ++it) {
-            if (it->first == "user") {
-                if (it->second.find("/no_think") != std::string::npos) {
-                    force_think = -1;
-                    strip_directive(it->second, "/no_think");
-                } else if (it->second.find("/think") != std::string::npos) {
-                    force_think = 1;
-                    strip_directive(it->second, "/think");
-                }
-                break;
+        // Scan all messages (system + user) for /no_think and /think directives.
+        // Last match wins; strip from text either way.
+        for (auto& [role, content] : msg_pairs) {
+            if (role != "user" && role != "system") continue;
+            if (content.find("/no_think") != std::string::npos) {
+                force_think = -1;
+                strip_directive(content, "/no_think");
+            }
+            if (content.find("/think") != std::string::npos) {
+                force_think = 1;
+                strip_directive(content, "/think");
             }
         }
+        // vLLM-compatible: chat_template_kwargs.enable_thinking. Look in
+        // both extra_body and the top-level request body.
+        auto extract_enable_thinking = [&](const std::string& obj) -> int {
+            std::string ctk = json_get_raw(obj, "chat_template_kwargs");
+            if (ctk.empty()) return 0;  // no override
+            // Match "enable_thinking":true|false with optional whitespace
+            size_t kp = ctk.find("\"enable_thinking\"");
+            if (kp == std::string::npos) return 0;
+            kp = ctk.find(':', kp);
+            if (kp == std::string::npos) return 0;
+            kp++;
+            while (kp < ctk.size() && (ctk[kp] == ' ' || ctk[kp] == '\t')) kp++;
+            if (ctk.compare(kp, 5, "false") == 0) return -1;
+            if (ctk.compare(kp, 4, "true")  == 0) return 1;
+            return 0;
+        };
+        int ctk_override = extract_enable_thinking(body);
+        if (ctk_override == 0) {
+            std::string extra = json_get_raw(body, "extra_body");
+            if (!extra.empty()) ctk_override = extract_enable_thinking(extra);
+        }
+        if (ctk_override != 0) force_think = ctk_override;
 
         std::vector<int> prompt_ids;
         if (chat_encode_fn) prompt_ids = chat_encode_fn(msg_pairs, force_think);
