@@ -16,11 +16,14 @@ A custom CUDA inference engine for **Qwen3.5 / Qwen3.6 hybrid (GDN + Attention) 
 ## What it does
 
 - Serves **Qwen3.5 / Qwen3.6** dense hybrid models in **27B** and **9B** sizes (GGUF Q8_0). MoE variants (Qwen3-Moe etc.) **not supported**.
+- **v2-MTP inline GGUF support** (2026-05-27): nextn head packed as `blk.N.nextn.*` in the GGUF is auto-detected and used as the spec drafter — no external `mtp_head_*.bin` needed. Accept rate jumped 73 → 83 % on Qwopus3.6-27B vs the legacy external head.
 - Vision input via **Qwen3-VL mmproj** (ViT + M-RoPE + spatial reshape).
 - **OpenAI-compatible HTTP API** (`/v1/chat/completions`, `/v1/models`, streaming, tool calls).
+- **Qwen3 thinking control**: `/no_think` (and `/think`) directives in user **or** system messages, plus vLLM-style `extra_body.chat_template_kwargs.enable_thinking` — all resolve to the same `force_think` switch in the chat template.
 - **Continuous batching** across N concurrent slots, with per-slot prefix caching.
 - **MTP draft speculative decoding (K=1)** — works. DFlash + DDTree code is in the repo but **not currently functional** (drafter mismatch — see Limitations).
 - **3-bit KV cache (MTP_TQ)** — Walsh-Hadamard rotation + Lloyd-Max scalar quant. Same family of idea as llama.cpp [#21038](https://github.com/ggml-org/llama.cpp/pull/21038), but 3-bit Lloyd-Max instead of 4-bit RTN.
+- **Fused gate+up GEMM** (`MLP_GATEUP_FUSED_KERNEL=1`, default off): two Q8_0 weights share one Q8_1 input tile in SMEM, +5–10 % prefill on v2 models.
 - Multi-GPU layer-parallel split with pinned-host activation bridge (no P2P required).
 
 ## Why this exists
@@ -134,12 +137,20 @@ make -j$(nproc)
 
 ### 27B server with vision (256 K context, 3-bit KV)
 
+Recommended config — **3 GPUs** (12 % faster prefill than 4 since transfer is one hop shorter; the v2 Q8_0 28 GB model fits in 3×16 GB with the rebalanced split) + fused gate+up + sparse-attention profile:
+
 ```bash
-MTP_TQ=1 ./build/qwen-engine \
-  /path/to/Qwen3.6-27B-Q8_0.gguf \
+CUDA_VISIBLE_DEVICES=0,1,2 \
+MTP_TQ=1 MLP_GATEUP_FUSED=1 MLP_GATEUP_FUSED_KERNEL=1 \
+MINF_SPARSE_ATTN=1 MINF_BUDGET=0.10 \
+MINF_PROFILE_PATH=./profiles/27B_block_sparse.bin \
+./build/qwen-engine \
+  /path/to/Qwopus3.6-27B-v2-MTP-Q8_0.gguf \
   --serve 8000 --max-seq 262144 --slots 1 \
-  --vision-mmproj /path/to/Qwen3.6-27B-mmproj.gguf
+  --vision-mmproj /path/to/Qwopus3.6-27B-v2-mmproj.gguf
 ```
+
+For v1 models (external MTP head): drop `MLP_GATEUP_FUSED_KERNEL=1` (the fused kernel only matches the v2 numerics in our testing) and place `mtp_head_<hidden>.bin` under `/home/paru/mtp_work/`.
 
 ### 9B server with 4-way continuous batching
 
@@ -155,9 +166,24 @@ QWEN_SLOTS=4 ./build/qwen-engine \
 CUDA_VISIBLE_DEVICES=0,1 ./build/qwen-engine ... --serve 8001
 ```
 
-### Optional MTP draft head
+### MTP draft head (speculative decoding)
 
-If `mtp_head_<hidden>.bin` exists (set with `--mtp-head <path>` or default `./mtp_work/mtp_head_<hidden>.bin`), the engine will load it for K=1 speculative decoding. Without it the engine runs plain greedy / continuous-batched.
+The engine looks for the MTP nextn head in two places, in priority order:
+
+1. **Inline GGUF (v2 models)** — if the last block (e.g. `blk.64.nextn.eh_proj.weight`) carries nextn tensors, they're used directly from the already-GPU-resident weights. Matches the model's training distribution exactly; no external file needed. Measured accept rate **~83 %** on Qwopus3.6-27B-v2-MTP.
+2. **External binary (v1 fallback)** — `mtp_head_<hidden>.bin` at `--mtp-head <path>` (default `/home/paru/mtp_work/mtp_head_<hidden>.bin`). Use this only when the GGUF has no inline nextn (e.g. legacy v1 GGUFs).
+
+If neither is found, the engine runs plain greedy / continuous-batched.
+
+### Thinking control (Qwen3 `/no_think`)
+
+All three trigger forms work; later wins on conflict:
+
+- Literal `/no_think` or `/think` anywhere in user OR system messages (the directive text is stripped from the prompt before encoding so the model doesn't see it).
+- vLLM-compatible `extra_body.chat_template_kwargs.enable_thinking: false`.
+- Top-level `chat_template_kwargs.enable_thinking: false` (some clients).
+
+Internally these all set the same `force_think` argument on the chat template (`-1` = insert empty `<think></think>` block, `0` = let the model decide, `1` = prefill `<think>\n`).
 
 ### Call it
 
@@ -191,6 +217,11 @@ curl http://localhost:8000/v1/chat/completions \
 | Var | Default | Effect |
 |---|---|---|
 | `MTP_TQ` | `0` | 3-bit KV cache (WHT + Lloyd-Max). Required for 27B at 256 K. Tradeoff: gen TG drops at long context (18 K: 11.4 → 7.6 t/s on 27B 3-GPU) because per-token attention pays the dequant cost. Set when you need >32 K context; leave off for fastest gen at smaller windows. |
+| `MLP_GATEUP_FUSED` | `0` | Route ffn_gate + ffn_up through a single dispatcher (no behavior change; sets up the fused-kernel path). Pair with `MLP_GATEUP_FUSED_KERNEL=1`. |
+| `MLP_GATEUP_FUSED_KERNEL` | `0` | Run the actual fused Q8_0 GEMM that shares one Q8_1 input tile in SMEM across both weights. +5–10 % prefill on v2 models. Verified bit-stable on Qwopus3.6-27B-v2; older v1 models showed argmax drift in earlier testing — leave OFF unless your model is v2-MTP. |
+| `MINF_SPARSE_ATTN` | `0` | Block-sparse FA path (MInference port). Requires a profile binary at `MINF_PROFILE_PATH` describing per-layer sparsity patterns. ~10 % prefill win at 23 K on 27B with no measurable quality loss. |
+| `MINF_BUDGET` | `0.10` | Block budget for `MINF_SPARSE_ATTN` (fraction of K/V blocks kept per Q row). |
+| `MINF_PROFILE_PATH` | unset | Path to the offline sparsity profile (e.g. `profiles/27B_block_sparse.bin`). Without this, `MINF_SPARSE_ATTN=1` is a no-op. |
 | `FLASH_ATTN` | `1` | FA fused score+softmax+value. `0` falls back to the strict block-per-score path (bit-exact with per-token, ~2× slower prefill). |
 | `BIT_EXACT_GEMM_ON` | `0` | Use the strict column-wise GEMV reduction path instead of the GEMM tile (regression / bit-exact testing, ~2.4× slower prefill). |
 | `FA_BM` | `32` | FA tile width. `64` halves K/V tile-load iterations (96 KB SMEM opt-in). Marginal on the prompts we measured. |

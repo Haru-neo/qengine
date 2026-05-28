@@ -11,11 +11,14 @@ vLLM, llama.cpp MMQ, FlashAttention, bitsandbytes — 전부 cuBLAS Tensor Core 
 ## 무엇을 하나요
 
 - **Qwen3.5 / Qwen3.6 dense hybrid 27B / 9B** GGUF Q8_0 서빙. MoE (Qwen3-Moe 등) **미지원**입니다.
+- **v2-MTP 내장 GGUF 지원 (2026-05-27)** — `blk.N.nextn.*` 으로 패킹된 MTP nextn head 를 자동 감지해서 spec drafter 로 사용합니다. 외부 `mtp_head_*.bin` 불필요. accept rate 가 73 → 83 % 로 올라갔습니다.
 - **Qwen3-VL 멀티모달** (mmproj — ViT + M-RoPE + spatial reshape). llama.cpp 도 mtmd 로 지원하므로 우리만의 강점은 아닙니다.
 - **OpenAI 호환 HTTP API** (chat/completions, streaming, tool calls)
+- **Qwen3 thinking 제어** — `/no_think` (와 `/think`) 디렉티브를 user **또는** system 메시지에 넣거나, vLLM 방식 `extra_body.chat_template_kwargs.enable_thinking` 도 지원합니다.
 - **Continuous batching** N 슬롯 동시 + per-slot prefix cache
 - **Speculative decoding** — MTP K=1 (동작합니다). DFlash + DDTree 코드도 있지만 **현재 동작하지 않습니다** (drafter mismatch).
 - **3-bit KV cache (MTP_TQ)** — Walsh-Hadamard 회전 + Lloyd-Max 양자화. 27B 256K 컨텍스트가 fp16 기준 17GB 인데 3.5GB 로 줄어듭니다. llama.cpp [#21038](https://github.com/ggml-org/llama.cpp/pull/21038) 에 같은 방향 (rotation + 4-bit RTN) 이 머지됐습니다.
+- **Fused gate+up GEMM** (`MLP_GATEUP_FUSED_KERNEL=1`, 기본 OFF) — gate/up 두 Q8_0 weight 가 SMEM 에서 같은 Q8_1 input tile 을 공유합니다. v2 모델에서 prefill +5–10 %.
 - 멀티 GPU layer-parallel split, P2P 없이 pinned-host activation bridge 로 통신합니다.
 
 ## 왜 만들었나요
@@ -87,24 +90,36 @@ cmake .. && make -j$(nproc)
 
 ## 실행
 
-**27B 256K + 비전:**
+**27B 256K + 비전 (권장 설정):** **3 GPU** 가 4 GPU 보다 prefill 12 % 빠릅니다 (transfer hop 이 한 번 적음). v2 Q8_0 28 GB 모델은 3×16 GB 에 들어갑니다 (분배 자동 조정).
+
 ```bash
-MTP_TQ=1 ./build/qwen-engine \
-  /path/to/Qwen3.6-27B-Q8_0.gguf \
+CUDA_VISIBLE_DEVICES=0,1,2 \
+MTP_TQ=1 MLP_GATEUP_FUSED=1 MLP_GATEUP_FUSED_KERNEL=1 \
+MINF_SPARSE_ATTN=1 MINF_BUDGET=0.10 \
+MINF_PROFILE_PATH=./profiles/27B_block_sparse.bin \
+./build/qwen-engine \
+  /path/to/Qwopus3.6-27B-v2-MTP-Q8_0.gguf \
   --serve 8000 --max-seq 262144 --slots 1 \
-  --vision-mmproj /path/to/Qwen3.6-27B-mmproj.gguf
+  --vision-mmproj /path/to/Qwopus3.6-27B-v2-mmproj.gguf
 ```
+
+v1 모델은 `MLP_GATEUP_FUSED_KERNEL` 을 빼고 `mtp_head_<hidden>.bin` 을 `/home/paru/mtp_work/` 에 두세요.
 
 **9B 4-way batching:**
 ```bash
 QWEN_SLOTS=4 ./build/qwen-engine \
-  /path/to/Qwen3.5-9B-Q8_0.gguf \
+  /path/to/Qwopus3.5-9B-Q8_0.gguf \
   --serve 8001 --max-seq 32768
 ```
 
-**특정 GPU 만:**
-```bash
-CUDA_VISIBLE_DEVICES=0,1 ./build/qwen-engine ... --serve 8001
+**Qwen3 thinking 끄기 (`/no_think`)**: user/system 메시지에 `/no_think` 한 줄 넣거나, 다음 중 하나 — vLLM 호환:
+
+```python
+client.chat.completions.create(
+    model="qwen",
+    messages=[{"role":"user","content":"What is 1+1?"}],
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+)
 ```
 
 자세한 옵션 / API / 아키텍처는 [README.md](README.md) 를 참고해주세요.
