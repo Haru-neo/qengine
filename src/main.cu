@@ -814,7 +814,7 @@ int run_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, const SamplingPara
 
 // ============ Qwen serve mode: OpenAI-compatible HTTP API ============
 
-int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const Tokenizer& tok, const std::string& model_name, const std::string& api_key = "", int max_seq = 262144, int num_slots = 1, const std::vector<int>& slot_caps = {}) {
+int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const Tokenizer& tok, const std::string& model_name, const std::string& api_key = "", int max_seq = 262144, int num_slots = 1, const std::vector<int>& slot_caps = {}, const std::string& proxy_embed_url = "", const std::string& proxy_rerank_url = "") {
     QwenModel model;
     model.gpu = &gpu_model;
     model.init_config(gguf);
@@ -3264,6 +3264,8 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     server.port = port;
     server.model_name = model_name;
     server.api_key = api_key;
+    server.proxy_embed_url  = proxy_embed_url;
+    server.proxy_rerank_url = proxy_rerank_url;
     server.stats_fn = [&]() {
         int active = 0;
         if (num_slots > 1) {
@@ -3566,6 +3568,254 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     return ok ? 0 : 1;
 }
 
+// ============ Qwen3 dense Embedding/Reranker serve mode ============
+// Loads a Qwen3 dense model (4B Q8_0 typical) for one of two services:
+//   embed  → /v1/embeddings (last-token pool + L2 normalize)
+//   rerank → /v1/rerank (query+doc score via lm_head logit softmax)
+//
+// Both sit on a single GPU (4B Q8_0 ≈ 4 GB → fits 16 GB CMP comfortably,
+// even with the small KV cache for the input sequence). The forward path
+// mirrors run_qwen's per-token prefill loop: walk tokens 0..N-1 through
+// forward_attn + forward_mlp, then read the final position's hidden, apply
+// output_norm, and either L2-normalize (embed) or run lm_head + yes/no
+// softmax (rerank).
+//
+// Shared helper that returns the post-output_norm hidden vector for the
+// LAST token of `prompt_ids`. Caller then handles the embed/rerank-specific
+// post-processing.
+struct EmbedForwardCtx {
+    QwenModel*       model = nullptr;
+    GPUModel*        gpu_model = nullptr;
+    int              n_gpus = 0;
+    int              H = 0, V = 0;
+    int              last_gpu = 0;
+    half*            gpu_hidden_half[4] = {};
+    float*           gpu_hidden_fp32[4] = {};
+    half*            host_transfer = nullptr;
+    half*            norm_buf = nullptr;
+    half*            logits_buf = nullptr;
+    GPUTensor*       embd_t = nullptr;
+    GPUTensor*       out_norm_t = nullptr;
+    GPUTensor*       out_w = nullptr;
+    QuantInput       qi_logits;
+};
+
+// Run a single-pass prefill and return the post-output_norm hidden for the
+// last token (length H, fp32 on host).
+static bool run_embed_forward(EmbedForwardCtx& C,
+                              const std::vector<int>& prompt_ids,
+                              std::vector<float>& out_hidden) {
+    QwenModel& model = *C.model;
+    GPUModel& gpu_model = *C.gpu_model;
+    int H = C.H;
+    int last_gpu = C.last_gpu;
+    if (prompt_ids.empty()) return false;
+
+    // Fresh KV per request — single slot, no continuous batching for sidecars.
+    model.reset_all_states();
+    for (int step = 0; step < (int)prompt_ids.size(); step++) {
+        int tok = prompt_ids[step];
+        cudaSetDevice(0);
+        if (C.embd_t->type == GGML_TYPE_Q8_0)
+            dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(C.embd_t->data, C.gpu_hidden_half[0], tok, H);
+        else if (C.embd_t->type == GGML_TYPE_Q5_K)
+            dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(C.embd_t->data, C.gpu_hidden_half[0], tok, H);
+        else if (C.embd_t->type == GGML_TYPE_Q6_K)
+            dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(C.embd_t->data, C.gpu_hidden_half[0], tok, H);
+        else { fprintf(stderr, "[embed] unsupported embd type %d\n", C.embd_t->type); return false; }
+        half_to_float_kernel<<<(H+255)/256, 256>>>(C.gpu_hidden_half[0], C.gpu_hidden_fp32[0], H);
+
+        float* h = C.gpu_hidden_fp32[0];
+        for (int layer = 0; layer < model.cfg.num_layers; layer++) {
+            int g = gpu_model.layer_gpu[layer];
+            int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
+            if (g != prev_g) {
+                cudaSetDevice(prev_g); cudaDeviceSynchronize();
+                cudaMemcpy(C.host_transfer, h, H * sizeof(float), cudaMemcpyDeviceToHost);
+                cudaSetDevice(g);
+                cudaMemcpy(C.gpu_hidden_fp32[g], C.host_transfer, H * sizeof(float), cudaMemcpyHostToDevice);
+                h = C.gpu_hidden_fp32[g];
+            }
+            cudaSetDevice(g);
+            // Every layer is attention in the Qwen3 dense embed/rerank models.
+            model.forward_attn(layer, h, step, /*stream=*/0);
+            model.forward_mlp_chunk(layer, h, /*n_tokens=*/1, /*stream=*/0);
+        }
+    }
+
+    // After last token: convert fp32 hidden → fp16, apply output_norm,
+    // copy back to host.
+    cudaSetDevice(last_gpu); cudaDeviceSynchronize();
+    float_to_half_kernel<<<(H+255)/256, 256>>>(C.gpu_hidden_fp32[last_gpu], C.gpu_hidden_half[last_gpu], H);
+    if (C.out_norm_t->type == GGML_TYPE_F32)
+        rms_norm_f32w(C.norm_buf, C.gpu_hidden_half[last_gpu],
+                      (float*)C.out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
+    else
+        rms_norm(C.norm_buf, C.gpu_hidden_half[last_gpu],
+                 (half*)C.out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
+    cudaDeviceSynchronize();
+    std::vector<half> host_h(H);
+    cudaMemcpy(host_h.data(), C.norm_buf, H * sizeof(half), cudaMemcpyDeviceToHost);
+    out_hidden.resize(H);
+    for (int i = 0; i < H; i++) out_hidden[i] = __half2float(host_h[i]);
+    return true;
+}
+
+static void l2_normalize(std::vector<float>& v) {
+    double ss = 0.0;
+    for (float x : v) ss += (double)x * (double)x;
+    float inv = (ss > 0.0) ? (float)(1.0 / std::sqrt(ss)) : 0.0f;
+    for (float& x : v) x *= inv;
+}
+
+// Allocate all per-process buffers needed by run_embed_forward.
+static void init_embed_ctx(EmbedForwardCtx& C, QwenModel& model, GPUModel& gpu_model, int n_gpus) {
+    C.model = &model;
+    C.gpu_model = &gpu_model;
+    C.n_gpus = n_gpus;
+    C.H = model.cfg.hidden_size;
+    C.V = model.cfg.vocab_size;
+    C.last_gpu = gpu_model.layer_gpu[model.cfg.num_layers - 1];
+    C.embd_t     = gpu_model.get("token_embd.weight");
+    C.out_norm_t = gpu_model.get("output_norm.weight");
+    C.out_w      = gpu_model.get("output.weight");  // may be null (tied embeddings)
+
+    for (int g = 0; g < n_gpus; g++) {
+        cudaSetDevice(g);
+        cudaMalloc(&C.gpu_hidden_half[g], C.H * sizeof(half));
+        cudaMalloc(&C.gpu_hidden_fp32[g], C.H * sizeof(float));
+    }
+    cudaSetDevice(C.last_gpu);
+    cudaMalloc(&C.norm_buf, C.H * sizeof(half));
+    cudaMalloc(&C.logits_buf, C.V * sizeof(half));
+    cudaMallocHost(&C.host_transfer, C.H * sizeof(float));
+}
+
+int serve_embed(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port,
+                const Tokenizer& tok, const std::string& model_name) {
+    QwenModel model;
+    model.gpu = &gpu_model;
+    model.init_config(gguf);
+    model.alloc_buffers();
+    model.init_gdn_states(1);                  // no-op for dense (no ssm tensors)
+    model.init_attention(8192, 1);             // 8K context plenty for embed inputs
+    printf("[embed] model loaded: H=%d, layers=%d, V=%d\n",
+           model.cfg.hidden_size, model.cfg.num_layers, model.cfg.vocab_size);
+
+    EmbedForwardCtx C;
+    init_embed_ctx(C, model, gpu_model, n_gpus);
+
+    std::mutex fwd_mu;  // single-flight forward (sidecar = low QPS)
+    auto embed_fn = [&](const std::vector<std::string>& inputs) -> std::vector<std::vector<float>> {
+        std::lock_guard<std::mutex> lk(fwd_mu);
+        std::vector<std::vector<float>> out;
+        out.reserve(inputs.size());
+        for (const auto& s : inputs) {
+            auto ids = tok.encode(s);
+            std::vector<float> h;
+            if (!run_embed_forward(C, ids, h)) { out.push_back({}); continue; }
+            l2_normalize(h);
+            out.push_back(std::move(h));
+        }
+        return out;
+    };
+
+    HttpServer server;
+    server.port = port;
+    server.model_name = model_name;
+    server.embed_fn = embed_fn;
+    printf("[embed] listening on :%d\n", port);
+    return server.start(port) ? 0 : 1;
+}
+
+int serve_rerank(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port,
+                 const Tokenizer& tok, const std::string& model_name) {
+    QwenModel model;
+    model.gpu = &gpu_model;
+    model.init_config(gguf);
+    model.alloc_buffers();
+    model.init_gdn_states(1);
+    model.init_attention(8192, 1);
+    printf("[rerank] model loaded: H=%d, layers=%d, V=%d\n",
+           model.cfg.hidden_size, model.cfg.num_layers, model.cfg.vocab_size);
+
+    EmbedForwardCtx C;
+    init_embed_ctx(C, model, gpu_model, n_gpus);
+
+    // Look up the "yes" and "no" token IDs in the tokenizer vocab. Qwen3-Reranker
+    // is trained to emit one of these as the next token after the query+doc
+    // template; score = softmax([logit_yes, logit_no])[0].
+    int yes_id = -1, no_id = -1;
+    {
+        // Common variants — Qwen tokenizer is BPE so leading space matters.
+        for (const char* w : {"yes", " yes", "Yes", " Yes"}) {
+            auto ids = tok.encode(w);
+            if (ids.size() == 1) { yes_id = ids[0]; break; }
+        }
+        for (const char* w : {"no", " no", "No", " No"}) {
+            auto ids = tok.encode(w);
+            if (ids.size() == 1) { no_id = ids[0]; break; }
+        }
+    }
+    if (yes_id < 0 || no_id < 0) {
+        fprintf(stderr, "[rerank] failed to find yes/no token IDs (yes=%d no=%d)\n", yes_id, no_id);
+        return 1;
+    }
+    printf("[rerank] yes_id=%d, no_id=%d\n", yes_id, no_id);
+
+    // Official Qwen3-Reranker template (from the HF model card / arXiv:2506.05176):
+    //   <Instruct>: Given a web search query, retrieve relevant passages that answer the query
+    //   <Query>: {query}
+    //   <Document>: {document}
+    //   Note that the answer can only be "yes" or "no".
+    auto build_prompt = [](const std::string& q, const std::string& d) {
+        return std::string(
+            "<Instruct>: Given a web search query, retrieve relevant passages that answer the query\n"
+            "<Query>: ") + q +
+            "\n<Document>: " + d +
+            "\nNote that the answer can only be \"yes\" or \"no\".";
+    };
+
+    std::mutex fwd_mu;
+    auto rerank_fn = [&](const std::string& query, const std::vector<std::string>& docs) -> std::vector<float> {
+        std::lock_guard<std::mutex> lk(fwd_mu);
+        std::vector<float> scores;
+        scores.reserve(docs.size());
+        for (const auto& d : docs) {
+            auto ids = tok.encode(build_prompt(query, d));
+            std::vector<float> h;
+            if (!run_embed_forward(C, ids, h)) { scores.push_back(0.0f); continue; }
+            // h is post-output_norm. Run lm_head to get logits.
+            cudaSetDevice(C.last_gpu);
+            std::vector<half> h16(C.H);
+            for (int i = 0; i < C.H; i++) h16[i] = __float2half(h[i]);
+            cudaMemcpy(C.norm_buf, h16.data(), C.H * sizeof(half), cudaMemcpyHostToDevice);
+            C.qi_logits.quantize(C.norm_buf, C.H, 0);
+            auto* lmh = C.out_w ? C.out_w : C.embd_t;  // tied embeddings fallback
+            quant_gemv(lmh->data, lmh->type, C.norm_buf, C.logits_buf, C.H, C.V, &C.qi_logits, 0);
+            cudaDeviceSynchronize();
+            // Read just the two logits we care about.
+            half lyes_h, lno_h;
+            cudaMemcpy(&lyes_h, C.logits_buf + yes_id, sizeof(half), cudaMemcpyDeviceToHost);
+            cudaMemcpy(&lno_h,  C.logits_buf + no_id,  sizeof(half), cudaMemcpyDeviceToHost);
+            float lyes = __half2float(lyes_h);
+            float lno  = __half2float(lno_h);
+            float m = std::max(lyes, lno);
+            float pyes = std::exp(lyes - m);
+            float pno  = std::exp(lno  - m);
+            scores.push_back(pyes / (pyes + pno));
+        }
+        return scores;
+    };
+
+    HttpServer server;
+    server.port = port;
+    server.model_name = model_name;
+    server.rerank_fn = rerank_fn;
+    printf("[rerank] listening on :%d\n", port);
+    return server.start(port) ? 0 : 1;
+}
+
 // ============ Gemma serve mode ============
 
 int serve_gemma(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
@@ -3755,6 +4005,13 @@ int main(int argc, char** argv) {
     // and --max-seq when set (e.g. --slot-caps "262144,65536"). Each entry is
     // that slot's max context in tokens; KV/GDN buffers allocate the sum.
     std::vector<int> slot_caps;
+    // Service mode for the Qwen3 dense sidecar models. "chat" (default) goes
+    // through serve_qwen / run_qwen as before; "embed" loads a Qwen3 dense
+    // model and serves /v1/embeddings; "rerank" likewise for /v1/rerank.
+    std::string service_mode = "chat";
+    // Proxy targets for the chat server to forward embedding/rerank requests
+    // to (e.g. localhost:8001 + localhost:8002). Empty = endpoint disabled.
+    std::string proxy_embed_url, proxy_rerank_url;
     std::string prompt_text, api_key;
     std::string vision_mmproj_path, vision_test_image, image_raw_path;
     for (int i = 2; i < argc; i++) {
@@ -3792,6 +4049,12 @@ int main(int argc, char** argv) {
             vision_test_image = argv[++i];
         } else if (strcmp(argv[i], "--image-raw") == 0 && i + 1 < argc) {
             image_raw_path = argv[++i];
+        } else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
+            service_mode = argv[++i];
+        } else if (strcmp(argv[i], "--proxy-embed") == 0 && i + 1 < argc) {
+            proxy_embed_url = argv[++i];
+        } else if (strcmp(argv[i], "--proxy-rerank") == 0 && i + 1 < argc) {
+            proxy_rerank_url = argv[++i];
         }
     }
 
@@ -3998,8 +4261,13 @@ int main(int argc, char** argv) {
     { size_t s = model_name.rfind('/'); if (s != std::string::npos) model_name = model_name.substr(s+1);
       size_t d = model_name.find(".gguf"); if (d != std::string::npos) model_name = model_name.substr(0, d); }
 
-    if (serve_port > 0 && arch == "qwen35") {
-        ret = serve_qwen(gguf, gpu_model, n_gpus, serve_port, tokenizer, model_name, api_key, max_seq, num_slots, slot_caps);
+    if (serve_port > 0 && service_mode == "embed") {
+        ret = serve_embed(gguf, gpu_model, n_gpus, serve_port, tokenizer, model_name);
+    } else if (serve_port > 0 && service_mode == "rerank") {
+        ret = serve_rerank(gguf, gpu_model, n_gpus, serve_port, tokenizer, model_name);
+    } else if (serve_port > 0 && arch == "qwen35") {
+        ret = serve_qwen(gguf, gpu_model, n_gpus, serve_port, tokenizer, model_name, api_key, max_seq, num_slots, slot_caps,
+                         proxy_embed_url, proxy_rerank_url);
     } else if (serve_port > 0) {
         ret = serve_gemma(gguf, gpu_model, n_gpus, serve_port);
     } else if (chat_mode && arch == "qwen35") {

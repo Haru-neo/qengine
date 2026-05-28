@@ -591,6 +591,7 @@ struct QwenModel {
         int I = cfg.intermediate_size;
 
         auto* norm_w = t(blk(layer, "post_attention_norm.weight"));
+        if (!norm_w) norm_w = t(blk(layer, "ffn_norm.weight"));
         auto* gate_w = t(blk(layer, "ffn_gate.weight"));
         auto* up_w   = t(blk(layer, "ffn_up.weight"));
         auto* down_w = t(blk(layer, "ffn_down.weight"));
@@ -631,6 +632,7 @@ struct QwenModel {
         int I = cfg.intermediate_size;
 
         auto* norm_w = t(blk(layer, "post_attention_norm.weight"));
+        if (!norm_w) norm_w = t(blk(layer, "ffn_norm.weight"));
         auto* gate_w = t(blk(layer, "ffn_gate.weight"));
         auto* up_w   = t(blk(layer, "ffn_up.weight"));
         auto* down_w = t(blk(layer, "ffn_down.weight"));
@@ -689,6 +691,7 @@ struct QwenModel {
         int I = cfg.intermediate_size;
 
         auto* norm_w = t(blk(layer, "post_attention_norm.weight"));
+        if (!norm_w) norm_w = t(blk(layer, "ffn_norm.weight"));
         auto* gate_w = t(blk(layer, "ffn_gate.weight"));
         auto* up_w   = t(blk(layer, "ffn_up.weight"));
         auto* down_w = t(blk(layer, "ffn_down.weight"));
@@ -1353,11 +1356,20 @@ struct QwenModel {
         }
         // else: caller has already populated ab.q_proj / ab.k_proj / ab.v_proj.
 
-        // 3. Deinterleave Q and gate
-        half* q_buf = ab.attn_out;
-        half* gate_buf = ab.gate_buf;
-        deinterleave_qg_kernel<<<(total_qg+255)/256, 256, 0, stream>>>(
-            ab.q_proj, q_buf, gate_buf, num_q, hd);
+        // 3. Deinterleave Q and gate (Qwopus3.6 hybrid) OR pass Q through
+        //    unchanged (Qwen3 dense — no Q-gate). Detect via Q projection
+        //    output width: 2 * num_q * hd → gated; num_q * hd → ungated.
+        half* q_buf;
+        half* gate_buf = nullptr;
+        const bool has_q_gate = (q_out_dim == 2 * total_qg);
+        if (has_q_gate) {
+            q_buf = ab.attn_out;
+            gate_buf = ab.gate_buf;
+            deinterleave_qg_kernel<<<(total_qg+255)/256, 256, 0, stream>>>(
+                ab.q_proj, q_buf, gate_buf, num_q, hd);
+        } else {
+            q_buf = ab.q_proj;  // dense: use Q projection output directly
+        }
         attn_dump_h("q_deint", q_buf);
 
         // 4. Head RMSNorm
@@ -1742,9 +1754,11 @@ struct QwenModel {
 
         if (g_profile_attn) { g_pt_attn_ms += pt_sync_ms(pt_t0); pt_t0 = pt_now(); }
 
-        // 8. Output gate: out *= sigmoid(gate)
-        apply_gate_sigmoid<<<(total_qg+255)/256, 256, 0, stream>>>(
-            q_buf, gate_buf, total_qg);
+        // 8. Output gate (only for Qwopus hybrid): out *= sigmoid(gate)
+        if (gate_buf) {
+            apply_gate_sigmoid<<<(total_qg+255)/256, 256, 0, stream>>>(
+                q_buf, gate_buf, total_qg);
+        }
         attn_dump_h("after_gate", q_buf);
 
         // 9. Output projection
@@ -2048,9 +2062,10 @@ struct QwenModel {
     }
 
     void reset_gdn_states_inner() {
+        if (gdn_states.empty()) return;  // dense model (no SSM): nothing to reset
         size_t conv_bytes = (size_t)num_slots * gdn_qkv_dim_cached * 4 * sizeof(float);
         size_t rec_bytes  = (size_t)num_slots * gdn_rec_per_slot * sizeof(float);
-        for (int layer = 0; layer < cfg.num_layers; layer++) {
+        for (int layer = 0; layer < cfg.num_layers && layer < (int)gdn_states.size(); layer++) {
             if (!gdn_states[layer].conv_state) continue;
             int g = gpu->layer_gpu[layer];
             cudaSetDevice(g);
@@ -3980,7 +3995,10 @@ struct QwenModel {
         int H = cfg.hidden_size;
         int I = cfg.intermediate_size;
 
+        // Qwopus3.6 hybrid uses `post_attention_norm`; Qwen3 dense uses
+        // `ffn_norm`. Try the hybrid name first then fall back.
         auto* norm_w = t(blk(layer, "post_attention_norm.weight"));
+        if (!norm_w) norm_w = t(blk(layer, "ffn_norm.weight"));
         auto* gate_w = t(blk(layer, "ffn_gate.weight"));
         auto* up_w   = t(blk(layer, "ffn_up.weight"));
         auto* down_w = t(blk(layer, "ffn_down.weight"));

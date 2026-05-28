@@ -616,6 +616,17 @@ struct HttpServer {
     std::function<void(const std::vector<int>&)> vision_setup_mrope_fn;
     std::function<void()> vision_reset_fn;
 
+    // Sidecar service hooks. Set on the embed/rerank standalone process; the
+    // chat process leaves these empty and instead sets proxy_embed_url /
+    // proxy_rerank_url to forward those endpoints to a backend.
+    std::function<std::vector<std::vector<float>>(const std::vector<std::string>&)> embed_fn;
+    std::function<std::vector<float>(const std::string& /*query*/,
+                                     const std::vector<std::string>& /*docs*/)> rerank_fn;
+    // Reverse-proxy targets ("host:port") on the chat server. Empty = the
+    // chat process will return 501 / no endpoint for that service.
+    std::string proxy_embed_url;   // e.g. "127.0.0.1:8001"
+    std::string proxy_rerank_url;  // e.g. "127.0.0.1:8002"
+
     void send_response(int client_fd, int status, const std::string& content_type, const std::string& body) {
         std::string status_text = (status == 200) ? "OK" : "Bad Request";
         std::ostringstream resp;
@@ -637,6 +648,156 @@ struct HttpServer {
         json << "{\"object\":\"list\",\"data\":[{\"id\":\"" << model_name
              << "\",\"object\":\"model\",\"owned_by\":\"local\"}]}";
         send_response(client_fd, 200, "application/json", json.str());
+    }
+
+    // Extract a string array out of the JSON value for `key`. Supports both
+    // a single string ("input":"foo") and a string array ("input":["a","b"]).
+    static std::vector<std::string> json_extract_string_or_array(const std::string& json, const std::string& key) {
+        std::vector<std::string> out;
+        std::string search = "\"" + key + "\"";
+        size_t pos = json.find(search);
+        if (pos == std::string::npos) return out;
+        pos = json.find(':', pos + search.size());
+        if (pos == std::string::npos) return out;
+        pos++;
+        while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n')) pos++;
+        if (pos >= json.size()) return out;
+        auto read_str = [&](size_t& p) -> std::string {
+            if (p >= json.size() || json[p] != '"') return "";
+            p++;
+            std::string s;
+            while (p < json.size() && json[p] != '"') {
+                if (json[p] == '\\' && p + 1 < json.size()) {
+                    char c = json[p + 1];
+                    if      (c == 'n') s += '\n';
+                    else if (c == 't') s += '\t';
+                    else if (c == 'r') s += '\r';
+                    else if (c == '"') s += '"';
+                    else if (c == '\\') s += '\\';
+                    else if (c == '/') s += '/';
+                    else s += c;
+                    p += 2;
+                } else { s += json[p++]; }
+            }
+            if (p < json.size()) p++;  // closing quote
+            return s;
+        };
+        if (json[pos] == '"') {
+            out.push_back(read_str(pos));
+        } else if (json[pos] == '[') {
+            pos++;
+            while (pos < json.size()) {
+                while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n' || json[pos] == ',')) pos++;
+                if (pos >= json.size() || json[pos] == ']') break;
+                if (json[pos] != '"') break;
+                out.push_back(read_str(pos));
+            }
+        }
+        return out;
+    }
+
+    void handle_embeddings(int client_fd, const std::string& body) {
+        auto inputs = json_extract_string_or_array(body, "input");
+        if (inputs.empty()) {
+            send_response(client_fd, 400, "application/json",
+                "{\"error\":{\"message\":\"missing or empty 'input'\"}}");
+            return;
+        }
+        auto vecs = embed_fn(inputs);
+        // OpenAI embedding response format.
+        std::ostringstream out;
+        out << "{\"object\":\"list\",\"data\":[";
+        size_t total_tokens = 0;
+        for (size_t i = 0; i < vecs.size(); i++) {
+            if (i) out << ",";
+            out << "{\"object\":\"embedding\",\"index\":" << i << ",\"embedding\":[";
+            const auto& v = vecs[i];
+            for (size_t j = 0; j < v.size(); j++) {
+                if (j) out << ",";
+                out << v[j];
+            }
+            out << "]}";
+            total_tokens += inputs[i].size() / 4;  // rough estimate (no tokenizer here)
+        }
+        out << "],\"model\":\"" << model_name << "\",\"usage\":{\"prompt_tokens\":"
+            << total_tokens << ",\"total_tokens\":" << total_tokens << "}}";
+        send_response(client_fd, 200, "application/json", out.str());
+    }
+
+    void handle_rerank(int client_fd, const std::string& body) {
+        std::string query = json_get_str(body, "query");
+        auto docs = json_extract_string_or_array(body, "documents");
+        if (query.empty() || docs.empty()) {
+            send_response(client_fd, 400, "application/json",
+                "{\"error\":{\"message\":\"missing 'query' or 'documents'\"}}");
+            return;
+        }
+        int top_n = json_get_int(body, "top_n", (int)docs.size());
+        auto scores = rerank_fn(query, docs);
+        // Index-sort by score descending, take top_n.
+        std::vector<int> order(scores.size());
+        for (size_t i = 0; i < order.size(); i++) order[i] = (int)i;
+        std::sort(order.begin(), order.end(),
+                  [&](int a, int b) { return scores[a] > scores[b]; });
+        if ((int)order.size() > top_n) order.resize(top_n);
+        std::ostringstream out;
+        out << "{\"results\":[";
+        for (size_t i = 0; i < order.size(); i++) {
+            if (i) out << ",";
+            int idx = order[i];
+            out << "{\"index\":" << idx
+                << ",\"relevance_score\":" << scores[idx]
+                << ",\"document\":\"" << json_escape(docs[idx]) << "\"}";
+        }
+        out << "],\"model\":\"" << model_name << "\"}";
+        send_response(client_fd, 200, "application/json", out.str());
+    }
+
+    // Minimal forward proxy. Opens a TCP connection to `target` (host:port),
+    // writes the request, streams back the response into the client_fd.
+    void proxy_forward(int client_fd, const std::string& target,
+                       const std::string& method, const std::string& path,
+                       const std::string& body) {
+        size_t colon = target.find(':');
+        std::string host = (colon == std::string::npos) ? target : target.substr(0, colon);
+        int port = (colon == std::string::npos) ? 80 : atoi(target.c_str() + colon + 1);
+        int bfd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (bfd < 0) {
+            send_response(client_fd, 502, "application/json",
+                          "{\"error\":{\"message\":\"proxy socket failed\"}}");
+            return;
+        }
+        struct sockaddr_in addr = {};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        if (host == "localhost" || host == "127.0.0.1") {
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        } else {
+            inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+        }
+        if (::connect(bfd, (sockaddr*)&addr, sizeof(addr)) < 0) {
+            ::close(bfd);
+            send_response(client_fd, 502, "application/json",
+                          "{\"error\":{\"message\":\"proxy connect failed\"}}");
+            return;
+        }
+        std::ostringstream req;
+        req << method << " " << path << " HTTP/1.1\r\n"
+            << "Host: " << host << "\r\n"
+            << "Content-Type: application/json\r\n"
+            << "Content-Length: " << body.size() << "\r\n"
+            << "Connection: close\r\n\r\n"
+            << body;
+        std::string r = req.str();
+        ::send(bfd, r.data(), r.size(), MSG_NOSIGNAL);
+        // Stream response back.
+        char buf[4096];
+        while (true) {
+            ssize_t n = ::recv(bfd, buf, sizeof(buf), 0);
+            if (n <= 0) break;
+            ::send(client_fd, buf, n, MSG_NOSIGNAL);
+        }
+        ::close(bfd);
     }
 
     // Returns true if the chunk was delivered (or at least kernel accepted
@@ -1105,6 +1266,22 @@ struct HttpServer {
         // POST /v1/chat/completions
         else if (method == "POST" && (path == "/v1/chat/completions" || path == "/api/chat")) {
             handle_completions(client_fd, body);
+        }
+        // POST /v1/embeddings — local sidecar OR proxy to backend
+        else if (method == "POST" && path == "/v1/embeddings") {
+            if (embed_fn)              handle_embeddings(client_fd, body);
+            else if (!proxy_embed_url.empty())
+                                       proxy_forward(client_fd, proxy_embed_url, "POST", path, body);
+            else send_response(client_fd, 501, "application/json",
+                               "{\"error\":{\"message\":\"embedding endpoint disabled\"}}");
+        }
+        // POST /v1/rerank — local sidecar OR proxy to backend
+        else if (method == "POST" && (path == "/v1/rerank" || path == "/rerank")) {
+            if (rerank_fn)             handle_rerank(client_fd, body);
+            else if (!proxy_rerank_url.empty())
+                                       proxy_forward(client_fd, proxy_rerank_url, "POST", path, body);
+            else send_response(client_fd, 501, "application/json",
+                               "{\"error\":{\"message\":\"rerank endpoint disabled\"}}");
         }
         // Health check
         else if (method == "GET" && (path == "/" || path == "/health")) {
