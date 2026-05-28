@@ -835,11 +835,29 @@ struct HttpServer {
         // Qwen3 /no_think and /think directives: scan the last user message.
         // /no_think  → force_think = -1 (skip thinking, insert <think></think>)
         // /think     → force_think =  1 (default, prefill <think>\n)
+        // Both directives are stripped from the message text before encoding
+        // so the model doesn't see them as content.
         int force_think = rf.json_mode ? -1 : 0;
+        auto strip_directive = [](std::string& s, const std::string& tag) {
+            size_t p;
+            while ((p = s.find(tag)) != std::string::npos) {
+                size_t end = p + tag.size();
+                while (end < s.size() && (s[end] == ' ' || s[end] == '\t' || s[end] == '\n' || s[end] == '\r')) end++;
+                size_t start = p;
+                while (start > 0 && (s[start - 1] == ' ' || s[start - 1] == '\t')) start--;
+                s.erase(start, end - start);
+            }
+            while (!s.empty() && (s.back() == ' ' || s.back() == '\n' || s.back() == '\r' || s.back() == '\t')) s.pop_back();
+        };
         for (auto it = msg_pairs.rbegin(); it != msg_pairs.rend(); ++it) {
             if (it->first == "user") {
-                if (it->second.find("/no_think") != std::string::npos) force_think = -1;
-                else if (it->second.find("/think") != std::string::npos) force_think = 1;
+                if (it->second.find("/no_think") != std::string::npos) {
+                    force_think = -1;
+                    strip_directive(it->second, "/no_think");
+                } else if (it->second.find("/think") != std::string::npos) {
+                    force_think = 1;
+                    strip_directive(it->second, "/think");
+                }
                 break;
             }
         }
