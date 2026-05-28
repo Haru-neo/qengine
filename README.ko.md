@@ -122,6 +122,28 @@ client.chat.completions.create(
 )
 ```
 
+**임베딩 + 리랭커 사이드카** (Qwen3 4B dense, 같은 binary, GPU 3 공유):
+
+```bash
+# 임베딩 사이드카 (8001 포트, GPU 3)
+CUDA_VISIBLE_DEVICES=3 ./build/qwen-engine \
+  /path/to/Qwen3-Embedding-4B-Q8_0.gguf --serve 8001 --mode embed
+
+# 리랭커 사이드카 (8002 포트, GPU 3 공유)
+CUDA_VISIBLE_DEVICES=3 ./build/qwen-engine \
+  /path/to/Qwen3-Reranker-4B-Q8_0.gguf --serve 8002 --mode rerank
+
+# 채팅 서버에 proxy 연결 (클라이언트는 8000번만 알면 됨)
+./build/qwen-engine /path/to/27B.gguf --serve 8000 \
+  --proxy-embed  127.0.0.1:8001 \
+  --proxy-rerank 127.0.0.1:8002 \
+  ...
+```
+
+`scripts/launch_all.sh` 한 줄로 3개 다 띄울 수 있어요.
+
+`POST /v1/embeddings` (OpenAI 호환, 2560 dim) 와 `POST /v1/rerank` (`relevance_score` = yes 토큰의 softmax 확률) 둘 다 채팅 서버를 통해 자동 라우팅됩니다.
+
 자세한 옵션 / API / 아키텍처는 [README.md](README.md) 를 참고해주세요.
 
 ## 한계

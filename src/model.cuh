@@ -385,9 +385,14 @@ struct QwenModel {
         auto* gate = gpu->get("blk.0.ffn_gate.weight");
         cfg.intermediate_size = gate ? gate->dims[1] : 0;
         
-        // Get vocab size from output weight
+        // Get vocab size from output weight; fall back to token_embd for
+        // tied-embedding models (Qwen3 dense ships without output.weight).
         auto* out = gpu->get("output.weight");
         cfg.vocab_size = out ? out->dims[1] : 0;
+        if (cfg.vocab_size == 0) {
+            auto* embd = gpu->get("token_embd.weight");
+            if (embd) cfg.vocab_size = embd->dims[1];
+        }
         
         cfg.rope_dim = gguf.get_u32(arch + ".rope.dimension_count", cfg.head_dim / 2);
 

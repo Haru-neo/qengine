@@ -166,6 +166,53 @@ QWEN_SLOTS=4 ./build/qwen-engine \
 CUDA_VISIBLE_DEVICES=0,1 ./build/qwen-engine ... --serve 8001
 ```
 
+### Embedding + reranker sidecars
+
+The same binary serves Qwen3 dense 4B embedding and reranker models via
+`--mode embed` and `--mode rerank`. Both 4B Q8_0 GGUFs fit on one GPU
+(~4 GB each), so a spare CMP card can host both sidecars. The chat server
+reverse-proxies `/v1/embeddings` and `/v1/rerank` to the sidecars so
+clients only need to know about the chat port:
+
+```bash
+# embed sidecar (port 8001, GPU 3)
+CUDA_VISIBLE_DEVICES=3 ./build/qwen-engine \
+  /path/to/Qwen3-Embedding-4B-Q8_0.gguf --serve 8001 --mode embed
+
+# rerank sidecar (port 8002, GPU 3 — shared with embed)
+CUDA_VISIBLE_DEVICES=3 ./build/qwen-engine \
+  /path/to/Qwen3-Reranker-4B-Q8_0.gguf --serve 8002 --mode rerank
+
+# chat with proxy (clients hit only :8000)
+./build/qwen-engine /path/to/27B-Q8_0.gguf --serve 8000 \
+  --proxy-embed  127.0.0.1:8001 \
+  --proxy-rerank 127.0.0.1:8002 \
+  ...
+```
+
+A turnkey launcher that brings up all three is at `scripts/launch_all.sh`.
+
+OpenAI-compatible embedding request:
+```bash
+curl http://localhost:8000/v1/embeddings -H "Content-Type: application/json" \
+  -d '{"model":"qwen-embed","input":["the cat sat","a feline rested"]}'
+# → {"object":"list","data":[{"embedding":[…2560 floats…], …}, …]}
+```
+
+Rerank request (returns documents sorted by relevance):
+```bash
+curl http://localhost:8000/v1/rerank -H "Content-Type: application/json" \
+  -d '{"query":"capital of Korea",
+       "documents":["Seoul is the capital of South Korea.",
+                    "Paris is in France.",
+                    "Beijing is in China."]}'
+# → {"results":[{"index":0,"relevance_score":0.39,"document":"Seoul …"}, …]}
+```
+
+Reranker uses the official Qwen3-Reranker template internally
+(`Instruct/Query/Document/yes-or-no`); `relevance_score` is the softmax-
+normalized probability of the model emitting "yes" as the next token.
+
 ### MTP draft head (speculative decoding)
 
 The engine looks for the MTP nextn head in two places, in priority order:
