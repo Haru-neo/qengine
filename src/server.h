@@ -832,8 +832,20 @@ struct HttpServer {
             if (!has_system) msg_pairs.insert(msg_pairs.begin(), {"system", hint});
         }
 
+        // Qwen3 /no_think and /think directives: scan the last user message.
+        // /no_think  → force_think = -1 (skip thinking, insert <think></think>)
+        // /think     → force_think =  1 (default, prefill <think>\n)
+        int force_think = rf.json_mode ? -1 : 0;
+        for (auto it = msg_pairs.rbegin(); it != msg_pairs.rend(); ++it) {
+            if (it->first == "user") {
+                if (it->second.find("/no_think") != std::string::npos) force_think = -1;
+                else if (it->second.find("/think") != std::string::npos) force_think = 1;
+                break;
+            }
+        }
+
         std::vector<int> prompt_ids;
-        if (chat_encode_fn) prompt_ids = chat_encode_fn(msg_pairs, rf.json_mode ? -1 : 0);
+        if (chat_encode_fn) prompt_ids = chat_encode_fn(msg_pairs, force_think);
 
         // Vision: rebuild M-RoPE per-token position arrays now that we know
         // exactly where each image_pad token landed in prompt_ids.
