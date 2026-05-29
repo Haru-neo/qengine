@@ -620,7 +620,8 @@ struct HttpServer {
     // chat process leaves these empty and instead sets proxy_embed_url /
     // proxy_rerank_url to forward those endpoints to a backend.
     std::function<std::vector<std::vector<float>>(const std::vector<std::string>&)> embed_fn;
-    std::function<std::vector<float>(const std::string& /*query*/,
+    std::function<std::vector<float>(const std::string& /*instruction*/,
+                                     const std::string& /*query*/,
                                      const std::vector<std::string>& /*docs*/)> rerank_fn;
     // Reverse-proxy targets ("host:port") on the chat server. Empty = the
     // chat process will return 501 / no endpoint for that service.
@@ -732,8 +733,14 @@ struct HttpServer {
                 "{\"error\":{\"message\":\"missing 'query' or 'documents'\"}}");
             return;
         }
+        // Optional task instruction. Qwen3-Reranker is instruction-aware:
+        // a clear instruction sharpens judgments, especially for non-English
+        // docs (the model was trained on English instructions). Accept both
+        // "instruction" and "instruct" keys.
+        std::string instruction = json_get_str(body, "instruction");
+        if (instruction.empty()) instruction = json_get_str(body, "instruct");
         int top_n = json_get_int(body, "top_n", (int)docs.size());
-        auto scores = rerank_fn(query, docs);
+        auto scores = rerank_fn(instruction, query, docs);
         // Index-sort by score descending, take top_n.
         std::vector<int> order(scores.size());
         for (size_t i = 0; i < order.size(); i++) order[i] = (int)i;

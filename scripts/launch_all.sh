@@ -52,6 +52,20 @@ CUDA_VISIBLE_DEVICES=3 nohup "$BIN" "$EMBED_MODEL" \
   > /tmp/embed.log 2>&1 &
 EMBED_PID=$!
 
+# Stagger: embed + rerank share GPU 3. Bringing both CUDA contexts up at the
+# SAME instant intermittently corrupts the reranker's context (it dies on its
+# first forward, and the chat proxy then silently falls back to embedding-
+# cosine rerank, which looks like "instruction ignored / scores ~0.001").
+# Wait for embed to finish loading + start listening before launching rerank.
+echo "Waiting for embed (:$EMBED_PORT) to come up before launching rerank..."
+for _ in $(seq 1 60); do
+  if grep -q "listening on :$EMBED_PORT" /tmp/embed.log 2>/dev/null; then break; fi
+  if ! kill -0 "$EMBED_PID" 2>/dev/null; then
+    echo "WARNING: embed died during load — see /tmp/embed.log"; break
+  fi
+  sleep 2
+done
+
 # Reranker server (GPU 3, shared). Qwen3-Reranker-4B Q8_0 built from the
 # official safetensors with cls.output kept F16; uses the classifier head.
 CUDA_VISIBLE_DEVICES=3 nohup "$BIN" "$RERANK_MODEL" \

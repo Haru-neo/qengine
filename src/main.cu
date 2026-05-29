@@ -3853,12 +3853,13 @@ int serve_rerank(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port,
            no_id,  tok.decode({no_id}).c_str());
 
     std::mutex fwd_mu;
-    auto rerank_fn = [&](const std::string& query, const std::vector<std::string>& docs) -> std::vector<float> {
+    auto rerank_fn = [&](const std::string& instruction, const std::string& query,
+                         const std::vector<std::string>& docs) -> std::vector<float> {
         std::lock_guard<std::mutex> lk(fwd_mu);
         std::vector<float> scores;
         scores.reserve(docs.size());
         for (const auto& d : docs) {
-            auto ids = tok.encode(build_prompt(/*instruct=*/"", query, d));
+            auto ids = tok.encode(build_prompt(instruction, query, d));
             static const bool dbg_tok = getenv("RERANK_DEBUG") != nullptr;
             if (dbg_tok) {
                 fprintf(stderr, "[rerank-tok] n=%zu head:", ids.size());
