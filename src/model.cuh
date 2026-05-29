@@ -755,6 +755,20 @@ struct QwenModel {
         auto* gate_exps = t(blk(layer, "ffn_gate_exps.weight"));
         auto* up_exps   = t(blk(layer, "ffn_up_exps.weight"));
         auto* down_exps = t(blk(layer, "ffn_down_exps.weight"));
+        if (!gate_exps || !up_exps || !down_exps) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                printf("[MoE] L%d missing separate expert tensors "
+                       "(gate=%p up=%p down=%p). This build expects "
+                       "ffn_gate_exps/ffn_up_exps/ffn_down_exps; if the GGUF "
+                       "fuses gate+up (ffn_gate_up_exps) the forward path needs "
+                       "the fused variant.\n",
+                       layer, (void*)gate_exps, (void*)up_exps, (void*)down_exps);
+                fflush(stdout);
+            }
+            return;
+        }
         size_t g_bytes = (size_t)mI * ggml_row_bytes(gate_exps->type, H);
         size_t u_bytes = (size_t)mI * ggml_row_bytes(up_exps->type, H);
         size_t d_bytes = (size_t)H  * ggml_row_bytes(down_exps->type, mI);
