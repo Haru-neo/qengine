@@ -3619,6 +3619,8 @@ struct EmbedForwardCtx {
     int              last_gpu = 0;
     half*            gpu_hidden_half[4] = {};
     float*           gpu_hidden_fp32[4] = {};
+    float*           gpu_hidden_chunk[4] = {};   // [CHUNK_SIZE * H] per GPU (chunked prefill)
+    float*           host_chunk_transfer = nullptr; // [CHUNK_SIZE * H] pinned cross-GPU bridge
     half*            host_transfer = nullptr;
     half*            norm_buf = nullptr;
     half*            logits_buf = nullptr;
@@ -3640,41 +3642,64 @@ static bool run_embed_forward(EmbedForwardCtx& C,
     if (prompt_ids.empty()) return false;
 
     // Fresh KV per request — single slot, no continuous batching for sidecars.
+    // Chunked prefill (CHUNK_SIZE tokens per pass through the layer stack)
+    // instead of one-token-at-a-time: amortises the per-layer cross-GPU host
+    // bridge and uses the batched chunk kernels, the same path the chat server
+    // uses for prompt processing. For an N-token rerank/embed prompt this turns
+    // N sequential single-token forwards into ceil(N/256) batched ones.
+    constexpr int CHUNK = QwenModel::CHUNK_SIZE;
     model.reset_all_states();
-    for (int step = 0; step < (int)prompt_ids.size(); step++) {
-        int tok = prompt_ids[step];
+    int plen = (int)prompt_ids.size();
+    int chunk_pos = 0;
+    float* last_h = nullptr;   // chunk buffer holding the final chunk (on last_gpu)
+    int    last_n = 0;
+    while (chunk_pos < plen) {
+        int chunk_n = std::min(CHUNK, plen - chunk_pos);
         cudaSetDevice(0);
-        if (C.embd_t->type == GGML_TYPE_Q8_0)
-            dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(C.embd_t->data, C.gpu_hidden_half[0], tok, H);
-        else if (C.embd_t->type == GGML_TYPE_Q5_K)
-            dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(C.embd_t->data, C.gpu_hidden_half[0], tok, H);
-        else if (C.embd_t->type == GGML_TYPE_Q6_K)
-            dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(C.embd_t->data, C.gpu_hidden_half[0], tok, H);
-        else { fprintf(stderr, "[embed] unsupported embd type %d\n", C.embd_t->type); return false; }
-        half_to_float_kernel<<<(H+255)/256, 256>>>(C.gpu_hidden_half[0], C.gpu_hidden_fp32[0], H);
+        for (int t = 0; t < chunk_n; t++) {
+            int tok = prompt_ids[chunk_pos + t];
+            if (C.embd_t->type == GGML_TYPE_Q8_0)
+                dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(C.embd_t->data, C.gpu_hidden_half[0], tok, H);
+            else if (C.embd_t->type == GGML_TYPE_Q5_K)
+                dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(C.embd_t->data, C.gpu_hidden_half[0], tok, H);
+            else if (C.embd_t->type == GGML_TYPE_Q6_K)
+                dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(C.embd_t->data, C.gpu_hidden_half[0], tok, H);
+            else { fprintf(stderr, "[embed] unsupported embd type %d\n", C.embd_t->type); return false; }
+            half_to_float_kernel<<<(H+255)/256, 256>>>(
+                C.gpu_hidden_half[0], C.gpu_hidden_chunk[0] + (size_t)t * H, H);
+        }
 
-        float* h = C.gpu_hidden_fp32[0];
+        float* h_chunk = C.gpu_hidden_chunk[0];
         for (int layer = 0; layer < model.cfg.num_layers; layer++) {
             int g = gpu_model.layer_gpu[layer];
             int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
             if (g != prev_g) {
                 cudaSetDevice(prev_g); cudaDeviceSynchronize();
-                cudaMemcpy(C.host_transfer, h, H * sizeof(float), cudaMemcpyDeviceToHost);
+                cudaMemcpy(C.host_chunk_transfer, h_chunk,
+                           (size_t)chunk_n * H * sizeof(float), cudaMemcpyDeviceToHost);
                 cudaSetDevice(g);
-                cudaMemcpy(C.gpu_hidden_fp32[g], C.host_transfer, H * sizeof(float), cudaMemcpyHostToDevice);
-                h = C.gpu_hidden_fp32[g];
+                cudaMemcpy(C.gpu_hidden_chunk[g], C.host_chunk_transfer,
+                           (size_t)chunk_n * H * sizeof(float), cudaMemcpyHostToDevice);
+                h_chunk = C.gpu_hidden_chunk[g];
             }
             cudaSetDevice(g);
-            // Every layer is attention in the Qwen3 dense embed/rerank models.
-            model.forward_attn(layer, h, step, /*stream=*/0);
-            model.forward_mlp_chunk(layer, h, /*n_tokens=*/1, /*stream=*/0);
+            if (model.is_attn_layer(layer))
+                model.forward_attn_chunk(layer, h_chunk, chunk_pos, chunk_n, /*stream=*/0);
+            else
+                model.forward_gdn_chunk(layer, h_chunk, chunk_n, /*stream=*/0);
+            model.forward_mlp_chunk(layer, h_chunk, chunk_n, /*stream=*/0);
         }
+        cudaSetDevice(last_gpu); cudaDeviceSynchronize();
+        last_h = h_chunk;
+        last_n = chunk_n;
+        chunk_pos += chunk_n;
     }
 
-    // After last token: convert fp32 hidden → fp16, apply output_norm,
-    // copy back to host.
+    // Last token's hidden is the final row of the final chunk. Convert fp32 →
+    // fp16, apply output_norm, copy back to host.
     cudaSetDevice(last_gpu); cudaDeviceSynchronize();
-    float_to_half_kernel<<<(H+255)/256, 256>>>(C.gpu_hidden_fp32[last_gpu], C.gpu_hidden_half[last_gpu], H);
+    float_to_half_kernel<<<(H+255)/256, 256>>>(
+        last_h + (size_t)(last_n - 1) * H, C.gpu_hidden_half[last_gpu], H);
     if (C.out_norm_t->type == GGML_TYPE_F32)
         rms_norm_f32w(C.norm_buf, C.gpu_hidden_half[last_gpu],
                       (float*)C.out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
@@ -3712,11 +3737,13 @@ static void init_embed_ctx(EmbedForwardCtx& C, QwenModel& model, GPUModel& gpu_m
         cudaSetDevice(g);
         cudaMalloc(&C.gpu_hidden_half[g], C.H * sizeof(half));
         cudaMalloc(&C.gpu_hidden_fp32[g], C.H * sizeof(float));
+        cudaMalloc(&C.gpu_hidden_chunk[g], (size_t)QwenModel::CHUNK_SIZE * C.H * sizeof(float));
     }
     cudaSetDevice(C.last_gpu);
     cudaMalloc(&C.norm_buf, C.H * sizeof(half));
     cudaMalloc(&C.logits_buf, C.V * sizeof(half));
     cudaMallocHost(&C.host_transfer, C.H * sizeof(float));
+    cudaMallocHost(&C.host_chunk_transfer, (size_t)QwenModel::CHUNK_SIZE * C.H * sizeof(float));
 }
 
 int serve_embed(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port,
