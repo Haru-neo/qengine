@@ -438,7 +438,8 @@ int run_chat(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, const SamplingPara
                     model.forward_attn(layer, h, step, 0);
                 else
                     model.forward_gdn(layer, h, 0);
-                model.forward_mlp(layer, h, 0);
+                if (model.layer_is_moe[layer]) model.forward_moe(layer, h, 0);
+                else                           model.forward_mlp(layer, h, 0);
             }
 
             // Decode only after prefill
@@ -629,7 +630,8 @@ int run_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, const SamplingPara
                     if (is_attn) t_attn += ms_al; else t_gdn += ms_al;
 
                     auto tm0 = prof_now();
-                    model.forward_mlp_chunk(layer, h_chunk, chunk_n, 0);
+                    if (model.layer_is_moe[layer]) model.forward_moe_chunk(layer, h_chunk, chunk_n, 0);
+                    else                           model.forward_mlp_chunk(layer, h_chunk, chunk_n, 0);
                     t_mlp += sync_ms(tm0, g);
                 }
                 cudaSetDevice(last_gpu); cudaDeviceSynchronize();
@@ -750,7 +752,8 @@ int run_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, const SamplingPara
                 model.forward_attn(layer, h, step, 0);
             else
                 model.forward_gdn(layer, h, 0);
-            model.forward_mlp(layer, h, 0);
+            if (model.layer_is_moe[layer]) model.forward_moe(layer, h, 0);
+            else                           model.forward_mlp(layer, h, 0);
         }
 
         if (step >= (int)prompt_ids.size() - 1) {
@@ -1463,7 +1466,8 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         } else {
                             model.forward_gdn_chunk(layer, h_chunk, chunk_n, cs, slot);
                         }
-                        model.forward_mlp_chunk(layer, h_chunk, chunk_n, cs);
+                        if (model.layer_is_moe[layer]) model.forward_moe_chunk(layer, h_chunk, chunk_n, cs);
+                        else                           model.forward_mlp_chunk(layer, h_chunk, chunk_n, cs);
                         model.dflash_capture_chunk(layer, h_chunk, chunk_pos, chunk_n, g, cs);
                     }
                     cudaEventRecord(pp_seg_done[s][buf], cs);
@@ -1627,7 +1631,9 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     }
 
                     auto tm0 = prof_now();
-                    if (force_pt_mlp) {
+                    if (model.layer_is_moe[layer]) {
+                        model.forward_moe_chunk(layer, h_chunk, chunk_n, 0);
+                    } else if (force_pt_mlp) {
                         for (int tt = 0; tt < chunk_n; tt++) {
                             float* h_t = h_chunk + (size_t)tt * H;
                             model.forward_mlp(layer, h_t, 0);

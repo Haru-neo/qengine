@@ -79,6 +79,12 @@ struct QwenConfig {
     float rms_norm_eps;
     int rope_dim;
     float rope_freq_base = 10000000.0f;  // theta; 27B hybrid=1e7, Qwen3 dense=1e6
+    // MoE (Qwen3.x-A3B). is_moe is a model-level flag; per-layer routing uses
+    // layer_is_moe[] (a dense model leaves all of these zero/false).
+    bool is_moe = false;
+    int  num_experts = 0;          // total experts (router output dim)
+    int  num_experts_per_tok = 0;  // top-k active experts
+    int  moe_intermediate_size = 0;// per-expert SwiGLU intermediate dim
 };
 
 struct LayerBuffers {
@@ -97,11 +103,57 @@ struct LayerBuffers {
     half* mlp_chunk_down = nullptr;  // [CHUNK_SIZE * H]  ffn_down proj
 };
 
+// ============ MoE helper kernels (qmoe_ prefix to avoid clashing with the
+// identically-purposed kernels in gemma_model.cuh, which shares this TU) ====
+
+// Router GEMV: F32 weight [N x K] row-major, fp16 input [K], float output [N].
+__global__ void qmoe_router_gemv_f32(const float* __restrict__ weight,
+                                     const half* __restrict__ input,
+                                     float* __restrict__ output, int K, int N) {
+    int row = blockIdx.x;
+    if (row >= N) return;
+    const float* w = weight + (size_t)row * K;
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < K; i += blockDim.x)
+        sum += w[i] * __half2float(input[i]);
+    for (int off = 16; off > 0; off >>= 1)
+        sum += __shfl_xor_sync(0xffffffff, sum, off);
+    if (threadIdx.x == 0) output[row] = sum;
+}
+
+__global__ void qmoe_zero_f32(float* __restrict__ x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = 0.0f;
+}
+
+// out_f32[i] += w * (float)in_half[i]
+__global__ void qmoe_acc_f32(float* __restrict__ out, const half* __restrict__ in,
+                             float w, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] += w * __half2float(in[i]);
+}
+
+__global__ void qmoe_f32_to_f16(const float* __restrict__ in, half* __restrict__ out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __float2half(in[i]);
+}
+
 struct QwenModel {
     QwenConfig cfg;
     GPUModel* gpu;
+    GGUFFile* gguf_p = nullptr;   // set in init_config, for late metadata reads
+    std::string gguf_arch;        // general.architecture
     LayerBuffers bufs[4];
     bool layer_is_attn[256] = {};
+    bool layer_is_moe[256]  = {};
+    // Per-GPU MoE scratch (single-token; chunk path loops tokens through it).
+    // Allocated in alloc_buffers only when cfg.is_moe.
+    half*  moe_gate[4]   = {};   // [moe_intermediate_size]
+    half*  moe_up[4]     = {};   // [moe_intermediate_size]
+    half*  moe_down[4]   = {};   // [hidden_size]
+    float* moe_acc[4]    = {};   // [hidden_size] fp32 accumulator
+    float* moe_logits[4] = {};   // [num_experts] router logits (device)
+    QuantInput gpu_qi_moe[4];    // input quantizer for the moe_intermediate dim
     bool v2_separate_qkv = false;
     int  attn_num_q_heads = 0;
     int  attn_num_kv_heads = 0;
@@ -375,6 +427,8 @@ struct QwenModel {
 
     void init_config(GGUFFile& gguf) {
         auto arch = gguf.get_str("general.architecture");
+        gguf_p = &gguf;
+        gguf_arch = arch;
         cfg.hidden_size = gguf.get_u32(arch + ".embedding_length");
         cfg.num_layers = gguf.get_u32(arch + ".block_count");
         cfg.num_q_heads = gguf.get_u32(arch + ".attention.head_count");
@@ -634,6 +688,107 @@ struct QwenModel {
 
         // Residual add into FP32 hidden
         add_kernel_f32<<<(H+255)/256, 256, 0, stream>>>(hidden, buf.mlp_down, H);
+    }
+
+    // ── MoE (Qwen3.x-A3B) ────────────────────────────────────────────────────
+    void ensure_moe_buffers(int g) {
+        if (moe_gate[g]) return;
+        int H = cfg.hidden_size, mI = cfg.moe_intermediate_size, E = cfg.num_experts;
+        cudaSetDevice(g);
+        cudaMalloc(&moe_gate[g], (size_t)mI * sizeof(half));
+        cudaMalloc(&moe_up[g],   (size_t)mI * sizeof(half));
+        cudaMalloc(&moe_down[g], (size_t)H  * sizeof(half));
+        cudaMalloc(&moe_acc[g],  (size_t)H  * sizeof(float));
+        cudaMalloc(&moe_logits[g], (size_t)E * sizeof(float));
+    }
+
+    // Single-token MoE FFN over `hidden` [H] (fp32, in/out via residual add).
+    // Router → top-k softmax (normalized, norm_topk_prob) → per-expert SwiGLU
+    // → weighted fp32 accumulate → residual. Sparse-expert GEMVs reuse the
+    // norm_out Q8 quantization (one input, many expert weights).
+    void moe_token_core(int layer, float* hidden, int g, cudaStream_t stream) {
+        auto& buf = bufs[g];
+        int H = cfg.hidden_size, E = cfg.num_experts;
+        int topk = cfg.num_experts_per_tok, mI = cfg.moe_intermediate_size;
+
+        auto* norm_w = t(blk(layer, "ffn_norm.weight"));
+        if (norm_w->type == GGML_TYPE_F32)
+            rms_norm_f32in_f32w(buf.norm_out, hidden, (float*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+        else
+            rms_norm_f32in(buf.norm_out, hidden, (half*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
+        gpu_qi[g].quantize(buf.norm_out, H, stream);
+
+        // Router logits → host
+        auto* router_w = t(blk(layer, "ffn_gate_inp.weight"));
+        std::vector<float> logits(E);
+        if (router_w->type == GGML_TYPE_F32) {
+            qmoe_router_gemv_f32<<<E, 32, 0, stream>>>((float*)router_w->data,
+                                                       buf.norm_out, moe_logits[g], H, E);
+            cudaMemcpyAsync(logits.data(), moe_logits[g], E * sizeof(float),
+                            cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+        } else {
+            quant_gemv(router_w->data, router_w->type, buf.norm_out, buf.mlp_down,
+                       H, E, &gpu_qi[g], stream);
+            std::vector<half> hl(E);
+            cudaMemcpyAsync(hl.data(), buf.mlp_down, E * sizeof(half),
+                            cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+            for (int i = 0; i < E; i++) logits[i] = __half2float(hl[i]);
+        }
+
+        // Top-k + softmax over the selected logits (norm_topk_prob).
+        std::vector<int> order(E);
+        for (int i = 0; i < E; i++) order[i] = i;
+        std::partial_sort(order.begin(), order.begin() + topk, order.end(),
+                          [&](int a, int b) { return logits[a] > logits[b]; });
+        float maxl = logits[order[0]], sum = 0.f;
+        std::vector<float> w(topk);
+        for (int i = 0; i < topk; i++) { w[i] = expf(logits[order[i]] - maxl); sum += w[i]; }
+        for (int i = 0; i < topk; i++) w[i] /= sum;
+
+        // Expert tensors (separate gate/up; fused gate_up handled as fallback).
+        auto* gate_exps = t(blk(layer, "ffn_gate_exps.weight"));
+        auto* up_exps   = t(blk(layer, "ffn_up_exps.weight"));
+        auto* down_exps = t(blk(layer, "ffn_down_exps.weight"));
+        size_t g_bytes = (size_t)mI * ggml_row_bytes(gate_exps->type, H);
+        size_t u_bytes = (size_t)mI * ggml_row_bytes(up_exps->type, H);
+        size_t d_bytes = (size_t)H  * ggml_row_bytes(down_exps->type, mI);
+
+        qmoe_zero_f32<<<(H + 255) / 256, 256, 0, stream>>>(moe_acc[g], H);
+        for (int t_ = 0; t_ < topk; t_++) {
+            int e = order[t_];
+            void* gp = (uint8_t*)gate_exps->data + (size_t)e * g_bytes;
+            void* up = (uint8_t*)up_exps->data   + (size_t)e * u_bytes;
+            quant_gemv(gp, gate_exps->type, buf.norm_out, moe_gate[g], H, mI, &gpu_qi[g], stream);
+            quant_gemv(up, up_exps->type,   buf.norm_out, moe_up[g],   H, mI, &gpu_qi[g], stream);
+            silu_mul_kernel<<<(mI + 255) / 256, 256, 0, stream>>>(moe_gate[g], moe_up[g], mI);
+            gpu_qi_moe[g].quantize(moe_gate[g], mI, stream);
+            void* dp = (uint8_t*)down_exps->data + (size_t)e * d_bytes;
+            quant_gemv(dp, down_exps->type, moe_gate[g], moe_down[g], mI, H, &gpu_qi_moe[g], stream);
+            qmoe_acc_f32<<<(H + 255) / 256, 256, 0, stream>>>(moe_acc[g], moe_down[g], w[t_], H);
+        }
+
+        qmoe_f32_to_f16<<<(H + 255) / 256, 256, 0, stream>>>(moe_acc[g], moe_down[g], H);
+        add_kernel_f32<<<(H + 255) / 256, 256, 0, stream>>>(hidden, moe_down[g], H);
+    }
+
+    void forward_moe(int layer, float* hidden, cudaStream_t stream) {
+        int g = gpu->layer_gpu[layer];
+        ensure_moe_buffers(g);
+        moe_token_core(layer, hidden, g, stream);
+    }
+
+    // Chunked-prefill MoE: token-major [n_tokens × H]. First version loops
+    // tokens through the single-token core (correct; per-token routing). Each
+    // token needs a host sync for its top-k, so prefill is slower than the
+    // dense chunked MLP — optimize with a batched router + expert binning later.
+    void forward_moe_chunk(int layer, float* hidden_chunk, int n_tokens, cudaStream_t stream) {
+        int g = gpu->layer_gpu[layer];
+        ensure_moe_buffers(g);
+        int H = cfg.hidden_size;
+        for (int t_ = 0; t_ < n_tokens; t_++)
+            moe_token_core(layer, hidden_chunk + (size_t)t_ * H, g, stream);
     }
 
     // N=2 batched MLP. Processes two hidden states sharing the same weight
@@ -1835,6 +1990,44 @@ struct QwenModel {
         for (int l = 0; l < cfg.num_layers; l++) if (layer_is_attn[l]) attn_count_init++;
         printf("Layer types: %d attn, %d GDN (detected from tensors)\n",
                attn_count_init, cfg.num_layers - attn_count_init);
+
+        // ── MoE detection (Qwen3.x-A3B) ──────────────────────────────────────
+        // A layer is MoE iff it carries a router (ffn_gate_inp). Per-layer so a
+        // hybrid with leading dense blocks is handled automatically. Dims come
+        // from the stacked expert tensors; metadata keys are a fallback.
+        memset(layer_is_moe, 0, sizeof(layer_is_moe));
+        int moe_count = 0, first_moe = -1;
+        for (int layer = 0; layer < cfg.num_layers && layer < 256; layer++) {
+            if (t(blk(layer, "ffn_gate_inp.weight"))) {
+                layer_is_moe[layer] = true;
+                if (first_moe < 0) first_moe = layer;
+                moe_count++;
+            }
+        }
+        if (first_moe >= 0) {
+            cfg.is_moe = true;
+            auto* router = t(blk(first_moe, "ffn_gate_inp.weight"));
+            cfg.num_experts = router->dims[1];  // [hidden, num_experts]
+            std::string arch = gguf_arch;
+            cfg.num_experts_per_tok = gguf_p
+                ? (int)gguf_p->get_u32(arch + ".expert_used_count",
+                      gguf_p->get_u32(arch + ".expert_count_used", 8))
+                : 8;
+            // per-expert intermediate from the stacked gate tensor (separate
+            // gate/up). Fall back to fused gate_up (dims/2) then metadata.
+            auto* gate_exps = t(blk(first_moe, "ffn_gate_exps.weight"));
+            if (gate_exps) {
+                cfg.moe_intermediate_size = gate_exps->dims[1] / cfg.num_experts;
+            } else if (auto* gu = t(blk(first_moe, "ffn_gate_up_exps.weight"))) {
+                cfg.moe_intermediate_size = (gu->dims[1] / cfg.num_experts) / 2;
+            } else if (gguf_p) {
+                cfg.moe_intermediate_size =
+                    gguf_p->get_u32(arch + ".expert_feed_forward_length", 0);
+            }
+            printf("MoE: %d/%d layers, %d experts, top-%d, expert_inter=%d\n",
+                   moe_count, cfg.num_layers, cfg.num_experts,
+                   cfg.num_experts_per_tok, cfg.moe_intermediate_size);
+        }
 
         // Detect v2 separate Q/K/V attention (vs v1 combined attn_qkv)
         {
