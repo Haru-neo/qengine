@@ -78,6 +78,7 @@ struct QwenConfig {
     int linear_v_dim;
     float rms_norm_eps;
     int rope_dim;
+    float rope_freq_base = 10000000.0f;  // theta; 27B hybrid=1e7, Qwen3 dense=1e6
 };
 
 struct LayerBuffers {
@@ -394,7 +395,18 @@ struct QwenModel {
             if (embd) cfg.vocab_size = embd->dims[1];
         }
         
-        cfg.rope_dim = gguf.get_u32(arch + ".rope.dimension_count", cfg.head_dim / 2);
+        // RoPE rotary dim. Qwopus3.6 hybrid (qwen35) uses partial rotary
+        // (head_dim/2 = 64). Qwen3 dense (embed/reranker, arch="qwen3") uses
+        // FULL rotary = head_dim, and ships no rope.dimension_count key, so
+        // the head_dim/2 default would silently halve the rotary span.
+        int rope_default = (arch == "qwen3") ? cfg.head_dim : cfg.head_dim / 2;
+        cfg.rope_dim = gguf.get_u32(arch + ".rope.dimension_count", rope_default);
+
+        // RoPE theta. 27B hybrid bakes 1e7; Qwen3 dense uses freq_base from
+        // the GGUF (1e6 for the 4B embed/reranker). Reading the wrong theta
+        // detunes every RoPE frequency and quietly corrupts attention.
+        cfg.rope_freq_base = gguf.get_f32(arch + ".rope.freq_base",
+                                          (arch == "qwen3") ? 1000000.0f : 10000000.0f);
 
         // Detect v2 inline MTP: if the last block has nextn tensors, it's a
         // dedicated MTP layer that should not participate in the main forward.
@@ -817,7 +829,7 @@ struct QwenModel {
         int num_q = cfg.num_q_heads;
         int num_kv = cfg.num_kv_heads;
         int hd = cfg.head_dim;
-        float theta = 10000000.0f;
+        float theta = cfg.rope_freq_base;
         int score_max_len = max_cap;
 
         for (int g = 0; g < gpu->num_gpus; g++) {

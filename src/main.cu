@@ -3742,6 +3742,40 @@ int serve_rerank(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port,
     EmbedForwardCtx C;
     init_embed_ctx(C, model, gpu_model, n_gpus);
 
+    // Classifier head path. ggml-org's reranker GGUFs ship a [H, 2] classifier
+    // (`cls.output.weight`) trained on the reranker's yes/no objective — much
+    // more discriminative than reading raw yes/no token logits from the
+    // generic LM head. We prefer it when present; otherwise we fall back to
+    // the yes/no logit path further down.
+    GPUTensor* cls_w = gpu_model.get("cls.output.weight");
+    half* cls_out_buf = nullptr;
+    int cls_dim = 0;
+    std::vector<half> cls_w_host_f16;  // [H * cls_dim] row-major [cls_dim, H]
+    if (cls_w) {
+        // Expect [H, num_classes]. dims[0] = H (input), dims[1] = num_classes.
+        // For Qwen3-Reranker 0.6B this is [1024, 2]. We score on the "yes"
+        // class — convention from llama.cpp's reranker path: index 0=false,
+        // index 1=true (sigmoid-or-softmax over both).
+        cls_dim = (int)cls_w->dims[1];
+        cudaSetDevice(C.last_gpu);
+        cudaMalloc(&cls_out_buf, cls_dim * sizeof(half));
+        printf("[rerank] classifier head detected: %s [%d, %d]\n",
+               "cls.output.weight", (int)cls_w->dims[0], cls_dim);
+        // Mirror the (tiny [H, cls_dim]) classifier head to host so we can do
+        // the 2-class projection on CPU. The on-GPU gemv path was hitting an
+        // intermittent CUDA fault for this F16 [2560,2] shape; a host dot
+        // product over cls_dim=2 rows is trivially cheap and removes that
+        // failure mode entirely.
+        if (cls_w->type == GGML_TYPE_F16) {
+            cls_w_host_f16.resize((size_t)cls_w->dims[0] * cls_dim);
+            cudaMemcpy(cls_w_host_f16.data(), cls_w->data,
+                       cls_w_host_f16.size() * sizeof(half), cudaMemcpyDeviceToHost);
+        }
+    } else {
+        printf("[rerank] no cls.output.weight — using yes/no logit path "
+               "(less reliable for 4B GGUFs whose fine-tune didn't survive)\n");
+    }
+
     // Qwen3-Reranker uses the standard Qwen3 chat template; the model is
     // trained to emit "yes" or "no" as the FIRST assistant token (after the
     // assistant prefix + empty <think> block). Score = softmax([yes, no])[0]
@@ -3825,9 +3859,52 @@ int serve_rerank(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port,
         scores.reserve(docs.size());
         for (const auto& d : docs) {
             auto ids = tok.encode(build_prompt(/*instruct=*/"", query, d));
+            static const bool dbg_tok = getenv("RERANK_DEBUG") != nullptr;
+            if (dbg_tok) {
+                fprintf(stderr, "[rerank-tok] n=%zu head:", ids.size());
+                for (size_t i = 0; i < ids.size() && i < 12; i++) fprintf(stderr, " %d", ids[i]);
+                fprintf(stderr, " tail:");
+                for (size_t i = (ids.size()>6?ids.size()-6:0); i < ids.size(); i++) fprintf(stderr, " %d", ids[i]);
+                fprintf(stderr, "\n"); fflush(stderr);
+            }
             std::vector<float> h;
             if (!run_embed_forward(C, ids, h)) { scores.push_back(0.0f); continue; }
-            // h is post-output_norm. Run lm_head to get logits.
+
+            // Prefer the classifier head when present (the converted Qwen3
+            // reranker GGUFs include it). The projection is [cls_dim, H] @ h
+            // computed on host — cls_dim is 2, so this is two dot products,
+            // and it sidesteps an intermittent CUDA fault we saw running the
+            // F16 gemv for this tiny shape. No device round-trip needed.
+            if (cls_w && !cls_w_host_f16.empty()) {
+                std::vector<float> cls_logits(cls_dim, 0.0f);
+                for (int c = 0; c < cls_dim; c++) {
+                    const half* row = cls_w_host_f16.data() + (size_t)c * C.H;
+                    double s = 0.0;
+                    for (int k = 0; k < C.H; k++)
+                        s += (double)__half2float(row[k]) * (double)h[k];
+                    cls_logits[c] = (float)s;
+                }
+                // Row 0 = "yes"/true, row 1 = "no"/false (convert_hf_to_gguf.py
+                // `_get_cls_out_tensor` stacks [true_row, false_row]).
+                // RERANK_CLS_YES overrides which row is yes for GGUFs built
+                // with the opposite stack order.
+                static const int yes_row = []{ const char* e = getenv("RERANK_CLS_YES"); return e ? atoi(e) : 0; }();
+                float lyes = cls_logits[yes_row == 0 ? 0 : (cls_dim > 1 ? 1 : 0)];
+                float lno  = cls_logits[yes_row == 0 ? (cls_dim > 1 ? 1 : 0) : 0];
+                static const bool dbg = getenv("RERANK_DEBUG") != nullptr;
+                if (dbg) {
+                    fprintf(stderr, "[rerank-dbg cls] lyes=%.3f lno=%.3f doc='%.40s'\n",
+                            lyes, lno, d.c_str()); fflush(stderr);
+                }
+                float m = std::max(lyes, lno);
+                float pyes = std::exp(lyes - m);
+                float pno  = std::exp(lno  - m);
+                scores.push_back(pyes / (pyes + pno));
+                continue;
+            }
+
+            // Fallback: lm_head + yes/no token logits. Needs the hidden on
+            // device + quantized for the big vocab GEMV.
             cudaSetDevice(C.last_gpu);
             std::vector<half> h16(C.H);
             for (int i = 0; i < C.H; i++) h16[i] = __float2half(h[i]);
