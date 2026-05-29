@@ -670,14 +670,33 @@ struct HttpServer {
             while (p < json.size() && json[p] != '"') {
                 if (json[p] == '\\' && p + 1 < json.size()) {
                     char c = json[p + 1];
-                    if      (c == 'n') s += '\n';
-                    else if (c == 't') s += '\t';
-                    else if (c == 'r') s += '\r';
-                    else if (c == '"') s += '"';
-                    else if (c == '\\') s += '\\';
-                    else if (c == '/') s += '/';
-                    else s += c;
-                    p += 2;
+                    if      (c == 'n') { s += '\n'; p += 2; }
+                    else if (c == 't') { s += '\t'; p += 2; }
+                    else if (c == 'r') { s += '\r'; p += 2; }
+                    else if (c == '"') { s += '"';  p += 2; }
+                    else if (c == '\\') { s += '\\'; p += 2; }
+                    else if (c == '/') { s += '/';  p += 2; }
+                    else if (c == 'u' && p + 5 < json.size()) {
+                        // \uXXXX → UTF-8. Critical for non-ASCII docs: Python
+                        // requests serializes JSON with ensure_ascii=True, so
+                        // Korean/CJK arrives as \uXXXX. Without decoding, the
+                        // reranker scores literal "uc11c..." gibberish.
+                        uint32_t cp = strtoul(json.substr(p + 2, 4).c_str(), nullptr, 16);
+                        p += 6;  // consume \uXXXX
+                        if (cp >= 0xD800 && cp <= 0xDBFF && p + 1 < json.size()
+                            && json[p] == '\\' && json[p + 1] == 'u') {
+                            uint32_t lo = strtoul(json.substr(p + 2, 4).c_str(), nullptr, 16);
+                            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                p += 6;  // consume the low surrogate \uXXXX
+                            }
+                        }
+                        if (cp < 0x80) { s += (char)cp; }
+                        else if (cp < 0x800) { s += (char)(0xC0|(cp>>6)); s += (char)(0x80|(cp&0x3F)); }
+                        else if (cp < 0x10000) { s += (char)(0xE0|(cp>>12)); s += (char)(0x80|((cp>>6)&0x3F)); s += (char)(0x80|(cp&0x3F)); }
+                        else { s += (char)(0xF0|(cp>>18)); s += (char)(0x80|((cp>>12)&0x3F)); s += (char)(0x80|((cp>>6)&0x3F)); s += (char)(0x80|(cp&0x3F)); }
+                    }
+                    else { s += c; p += 2; }
                 } else { s += json[p++]; }
             }
             if (p < json.size()) p++;  // closing quote
