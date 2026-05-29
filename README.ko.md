@@ -14,6 +14,7 @@ vLLM, llama.cpp MMQ, FlashAttention, bitsandbytes — 전부 cuBLAS Tensor Core 
 - **v2-MTP 내장 GGUF 지원 (2026-05-27)** — `blk.N.nextn.*` 으로 패킹된 MTP nextn head 를 자동 감지해서 spec drafter 로 사용합니다. 외부 `mtp_head_*.bin` 불필요. accept rate 가 73 → 83 % 로 올라갔습니다.
 - **Qwen3-VL 멀티모달** (mmproj — ViT + M-RoPE + spatial reshape). llama.cpp 도 mtmd 로 지원하므로 우리만의 강점은 아닙니다.
 - **OpenAI 호환 HTTP API** (chat/completions, streaming, tool calls)
+- **임베딩 + 리랭킹** 을 같은 binary 로 제공 (`--mode embed` / `--mode rerank`): Qwen3-Embedding-4B (last-token pool + L2 정규화) 와 Qwen3-Reranker-4B (`cls.output` 분류 헤드 기반 cross-encoder, instruction 인식). 채팅 서버가 `/v1/embeddings` · `/v1/rerank` 를 사이드카로 자동 리버스 프록시합니다.
 - **Qwen3 thinking 제어** — `/no_think` (와 `/think`) 디렉티브를 user **또는** system 메시지에 넣거나, vLLM 방식 `extra_body.chat_template_kwargs.enable_thinking` 도 지원합니다.
 - **Continuous batching** N 슬롯 동시 + per-slot prefix cache
 - **Speculative decoding** — MTP K=1 (동작합니다). DFlash + DDTree 코드도 있지만 **현재 동작하지 않습니다** (drafter mismatch).
@@ -130,6 +131,8 @@ CUDA_VISIBLE_DEVICES=3 ./build/qwen-engine \
   /path/to/Qwen3-Embedding-4B-Q8_0.gguf --serve 8001 --mode embed
 
 # 리랭커 사이드카 (8002 포트, GPU 3 공유)
+# 스태거: 임베딩 사이드카가 로딩을 끝낼 때까지 기다린 뒤 띄우세요. 같은 GPU 에
+# 두 CUDA 컨텍스트를 동시에 올리면 CMP 100-210 에서 두 번째가 간헐적으로 깨집니다.
 CUDA_VISIBLE_DEVICES=3 ./build/qwen-engine \
   /path/to/Qwen3-Reranker-4B-Q8_0.gguf --serve 8002 --mode rerank
 
@@ -140,9 +143,25 @@ CUDA_VISIBLE_DEVICES=3 ./build/qwen-engine \
   ...
 ```
 
-`scripts/launch_all.sh` 한 줄로 3개 다 띄울 수 있어요.
+`scripts/launch_all.sh` 한 줄로 3개 다 띄울 수 있어요 (임베딩→리랭커 스태거 포함).
 
-`POST /v1/embeddings` (OpenAI 호환, 2560 dim) 와 `POST /v1/rerank` (`relevance_score` = yes 토큰의 softmax 확률) 둘 다 채팅 서버를 통해 자동 라우팅됩니다.
+`POST /v1/embeddings` (OpenAI 호환, 2560 dim) 와 `POST /v1/rerank` 둘 다 채팅 서버를 통해 자동 라우팅됩니다.
+
+리랭커는 진짜 **cross-encoder** 입니다. 각 `query`+`document` 쌍을 공식 Qwen3-Reranker 템플릿(`<Instruct>/<Query>/<Document>`)으로 모델에 넣고 **`cls.output` 분류 헤드**를 읽어 `relevance_score = softmax([yes_logit, no_logit])[yes]` 를 냅니다. llama.cpp `--reranking` 과 같은 경로이고, LM head 의 raw yes/no 토큰 logit 을 읽는 것보다 훨씬 변별력이 좋습니다.
+
+선택적 **instruction** 필드도 받습니다 (Qwen3-Reranker 는 instruction 인식 — 명확한 작업 설명이 특히 비영어 문서 판단을 날카롭게 합니다):
+
+```bash
+curl http://localhost:8000/v1/rerank -H "Content-Type: application/json" \
+  -d '{"instruction":"질문에 답이 되는 문서를 찾아라",
+       "query":"자비스 같은 AI 비서 어떻게 만들어?",
+       "documents":["LLM 에 음성인식과 TTS 를 결합한다.",
+                    "자비스는 아이언맨에 나오는 캐릭터다."]}'
+```
+
+> **4B 리랭커 GGUF 만들기:** 커뮤니티 Qwen3-Reranker-4B GGUF 대부분이 변환 과정에서 `cls.output.weight` 분류 헤드를 빠뜨려 이 경로가 깨집니다(모델이 그냥 "Okay" 를 뱉음). 공식 `Qwen/Qwen3-Reranker-4B` safetensors 를 최신 `convert_hf_to_gguf.py` 로 변환(리랭커 자동 감지 + cls head 합성)한 뒤, `--tensor-type "cls.output=f16"` 로 양자화하면 작은 헤드는 fp16 정밀도를 유지하고 나머지는 Q8_0 가 됩니다.
+
+> **비ASCII 주의:** JSON 을 `ensure_ascii=True` 로 직렬화하는 클라이언트(Python `requests` 기본값)는 한글/CJK 를 `\uXXXX` 이스케이프로 보냅니다. 서버는 모든 문자열 추출 경로에서 이걸 UTF-8 로 디코드합니다 — 예전 빌드는 `query` 만 디코드해서 비ASCII **document** 가 쓰레기로 채점됐습니다. 수정 완료, 클라이언트 우회 불필요.
 
 자세한 옵션 / API / 아키텍처는 [README.md](README.md) 를 참고해주세요.
 

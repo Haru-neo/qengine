@@ -19,6 +19,7 @@ A custom CUDA inference engine for **Qwen3.5 / Qwen3.6 hybrid (GDN + Attention) 
 - **v2-MTP inline GGUF support** (2026-05-27): nextn head packed as `blk.N.nextn.*` in the GGUF is auto-detected and used as the spec drafter — no external `mtp_head_*.bin` needed. Accept rate jumped 73 → 83 % on Qwopus3.6-27B vs the legacy external head.
 - Vision input via **Qwen3-VL mmproj** (ViT + M-RoPE + spatial reshape).
 - **OpenAI-compatible HTTP API** (`/v1/chat/completions`, `/v1/models`, streaming, tool calls).
+- **Embeddings + reranking** from the same binary (`--mode embed` / `--mode rerank`): Qwen3-Embedding-4B (last-token pool, L2-normalized) and Qwen3-Reranker-4B (cross-encoder via the `cls.output` classifier head, instruction-aware). The chat server reverse-proxies `/v1/embeddings` and `/v1/rerank` to these sidecars.
 - **Qwen3 thinking control**: `/no_think` (and `/think`) directives in user **or** system messages, plus vLLM-style `extra_body.chat_template_kwargs.enable_thinking` — all resolve to the same `force_think` switch in the chat template.
 - **Continuous batching** across N concurrent slots, with per-slot prefix caching.
 - **MTP draft speculative decoding (K=1)** — works. DFlash + DDTree code is in the repo but **not currently functional** (drafter mismatch — see Limitations).
@@ -179,7 +180,10 @@ clients only need to know about the chat port:
 CUDA_VISIBLE_DEVICES=3 ./build/qwen-engine \
   /path/to/Qwen3-Embedding-4B-Q8_0.gguf --serve 8001 --mode embed
 
-# rerank sidecar (port 8002, GPU 3 — shared with embed)
+# rerank sidecar (port 8002, GPU 3 — shared with embed).
+# Stagger: wait for the embed sidecar to finish loading before launching
+# this one. Bringing up two CUDA contexts on the SAME GPU simultaneously
+# intermittently corrupts the second one on CMP 100-210.
 CUDA_VISIBLE_DEVICES=3 ./build/qwen-engine \
   /path/to/Qwen3-Reranker-4B-Q8_0.gguf --serve 8002 --mode rerank
 
@@ -190,7 +194,8 @@ CUDA_VISIBLE_DEVICES=3 ./build/qwen-engine \
   ...
 ```
 
-A turnkey launcher that brings up all three is at `scripts/launch_all.sh`.
+A turnkey launcher that brings up all three (with the embed→rerank stagger
+baked in) is at `scripts/launch_all.sh`.
 
 OpenAI-compatible embedding request:
 ```bash
@@ -206,12 +211,40 @@ curl http://localhost:8000/v1/rerank -H "Content-Type: application/json" \
        "documents":["Seoul is the capital of South Korea.",
                     "Paris is in France.",
                     "Beijing is in China."]}'
-# → {"results":[{"index":0,"relevance_score":0.39,"document":"Seoul …"}, …]}
+# → {"results":[{"index":0,"relevance_score":0.997,"document":"Seoul …"}, …]}
 ```
 
-Reranker uses the official Qwen3-Reranker template internally
-(`Instruct/Query/Document/yes-or-no`); `relevance_score` is the softmax-
-normalized probability of the model emitting "yes" as the next token.
+The reranker is a true **cross-encoder**: it feeds each `query`+`document`
+pair through the model under the official Qwen3-Reranker template
+(`<Instruct>/<Query>/<Document>`) and reads the **`cls.output` classifier
+head** — `relevance_score = softmax([yes_logit, no_logit])[yes]`. This is
+the same path llama.cpp's `--reranking` uses, and it's far more
+discriminative than reading raw yes/no token logits off the LM head.
+
+Optional **instruction** field (Qwen3-Reranker is instruction-aware — a
+clear task description sharpens judgments, especially for non-English docs):
+
+```bash
+curl http://localhost:8000/v1/rerank -H "Content-Type: application/json" \
+  -d '{"instruction":"Given a question, find the document that answers it",
+       "query":"How do I build a voice assistant?",
+       "documents":["Combine an LLM with speech-to-text and TTS.",
+                    "JARVIS is a character from Iron Man."]}'
+```
+
+> **Building the 4B reranker GGUF:** most community Qwen3-Reranker-4B GGUFs
+> drop the `cls.output.weight` classifier head during conversion, which
+> breaks this path (the model just emits "Okay"). Convert from the official
+> `Qwen/Qwen3-Reranker-4B` safetensors with a recent `convert_hf_to_gguf.py`
+> (it auto-detects the reranker and synthesizes the cls head), then quantize
+> with `--tensor-type "cls.output=f16"` so the tiny head keeps full
+> precision while the rest goes Q8_0.
+
+> **Non-ASCII note:** clients that serialize JSON with `ensure_ascii=True`
+> (Python `requests` does by default) send Korean/CJK as `\uXXXX` escapes.
+> The server decodes these to UTF-8 in all string-extraction paths — earlier
+> builds only decoded the `query`, so non-ASCII *documents* scored as
+> gibberish. Fixed; no client-side workaround needed.
 
 ### MTP draft head (speculative decoding)
 
