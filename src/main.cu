@@ -1195,11 +1195,25 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         // Prefix cache: if caller asked for caching AND a snapshot matches
         // the requested prefix, restore state instead of resetting. Otherwise
         // do a normal full reset.
+        // Automatic prefix caching: default ON. The client doesn't need to
+        // send cached_prompt_tokens — we transparently reuse the slot's last
+        // snapshot if it's still a bit-exact prefix of this prompt, and re-
+        // snapshot at the largest chunk boundary each turn so the cache rides
+        // the append-only chat history forward. PREFIX_CACHE_AUTO=0 disables.
+        static const bool auto_cache = []{
+            const char* e = getenv("PREFIX_CACHE_AUTO"); return !e || e[0] != '0';
+        }();
         int prefix_skip = 0;
         if (cached_prompt_tokens > 0) {
             prefix_skip = model.try_restore_prefix_cache(prompt_ids, cached_prompt_tokens, slot);
             if (prefix_skip > 0) {
                 printf("[CACHE slot=%d] hit: skipped %d tok of prefill\n", slot, prefix_skip);
+                fflush(stdout);
+            }
+        } else if (auto_cache) {
+            prefix_skip = model.try_restore_prefix_cache_auto(prompt_ids, slot);
+            if (prefix_skip > 0) {
+                printf("[CACHE slot=%d] auto hit: skipped %d tok of prefill\n", slot, prefix_skip);
                 fflush(stdout);
             }
         }
@@ -1210,9 +1224,14 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         }
         // Chunk-aligned snapshot point for THIS request. Only save when the
         // chunked prefill crosses this exact boundary. Capped to prompt_len-1
-        // (chunked prefill stops one short of the last prompt token).
-        int snapshot_target = (cached_prompt_tokens > 0)
-            ? (cached_prompt_tokens / QwenModel::CHUNK_SIZE) * QwenModel::CHUNK_SIZE
+        // (chunked prefill stops one short of the last prompt token). In auto
+        // mode we target the largest boundary below the last token so the next
+        // turn can reuse as much as possible.
+        int eff_cached = (cached_prompt_tokens > 0)
+            ? cached_prompt_tokens
+            : (auto_cache ? (int)prompt_ids.size() : 0);
+        int snapshot_target = (eff_cached > 0)
+            ? (eff_cached / QwenModel::CHUNK_SIZE) * QwenModel::CHUNK_SIZE
             : 0;
         if (snapshot_target > (int)prompt_ids.size() - 1) {
             snapshot_target = ((int)prompt_ids.size() - 1) / QwenModel::CHUNK_SIZE * QwenModel::CHUNK_SIZE;
@@ -1493,7 +1512,10 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
 
                 // Snapshot needs all in-flight pipeline stages to be done so
                 // the saved KV state is consistent. Drain & restart cycle.
-                if (snapshot_target > 0 && prefix_skip == 0
+                // Save when we cross the target boundary AND it extends past
+                // whatever prefix we restored (snapshot_target > prefix_skip),
+                // so an auto-cache hit still advances the snapshot forward.
+                if (snapshot_target > prefix_skip
                     && chunk_pos == snapshot_target) {
                     for (auto& seg : gpu_segs) {
                         cudaSetDevice(seg.g);
@@ -1653,7 +1675,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
 
                 chunk_pos += chunk_n;
 
-                if (snapshot_target > 0 && prefix_skip == 0
+                if (snapshot_target > prefix_skip
                     && chunk_pos == snapshot_target) {
                     model.save_prefix_snapshot(prompt_ids, snapshot_target, slot);
                     printf("[CACHE] snapshot saved at pos=%d\n", snapshot_target);

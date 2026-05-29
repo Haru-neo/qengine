@@ -1931,8 +1931,13 @@ struct QwenModel {
         // Pinned host RAM (no GPU affinity for storage). Lives off-VRAM so
         // multiple long-prefix snapshots can coexist without eating HBM. On
         // hit we DMA-copy host->device into the layer's GPU KV/GDN buffers.
-        // [layer] -> (k_copy[N*kv_dim], v_copy[N*kv_dim])
+        // [layer] -> (k_copy[N*kv_dim], v_copy[N*kv_dim]). fp16 KV path.
         std::unordered_map<int, std::pair<half*, half*>> kv_copy;
+        // [layer] -> raw block_tq3 bytes (k,v) for the MTP_TQ path, and raw
+        // block_q8_0_aligned bytes for the Q8KV path. Only one of the three
+        // KV maps is populated, matching the live KV format.
+        std::unordered_map<int, std::pair<char*, char*>> tqkv_copy;
+        std::unordered_map<int, std::pair<char*, char*>> q8kv_copy;
         // [layer] -> (conv_state_copy, rec_state_copy)
         std::unordered_map<int, std::pair<float*, float*>> gdn_copy;
         int kv_capacity = 0;  // currently allocated KV slice length
@@ -1950,10 +1955,18 @@ struct QwenModel {
         for (auto& [layer, kv] : pc.kv_copy) {
             cudaFreeHost(kv.first); cudaFreeHost(kv.second);
         }
+        for (auto& [layer, kv] : pc.tqkv_copy) {
+            cudaFreeHost(kv.first); cudaFreeHost(kv.second);
+        }
+        for (auto& [layer, kv] : pc.q8kv_copy) {
+            cudaFreeHost(kv.first); cudaFreeHost(kv.second);
+        }
         for (auto& [layer, gd] : pc.gdn_copy) {
             cudaFreeHost(gd.first); cudaFreeHost(gd.second);
         }
         pc.kv_copy.clear();
+        pc.tqkv_copy.clear();
+        pc.q8kv_copy.clear();
         pc.gdn_copy.clear();
         pc.kv_capacity = 0;
         pc.valid = false;
@@ -1977,20 +1990,88 @@ struct QwenModel {
         for (int i = 0; i < N; i++) {
             if (prompt_tokens[i] != pc.tokens[i]) return 0;
         }
-        // Hit: reset slot state, then copy snapshot into the slot's KV[0, N)
-        // and the slot's GDN state.
+        restore_snapshot_into_slot(pc, slot, N);
+        return N;
+    }
+
+    // Automatic prefix reuse (no client-specified length). Reuses whatever
+    // was snapshotted on this slot last turn, as long as those pc.n_pos tokens
+    // are still a bit-exact prefix of the current prompt and leave at least
+    // one token to decode. This is what makes prefix caching transparent: the
+    // append-only chat history means turn N's snapshot is a valid prefix of
+    // turn N+1, so the persona + prior turns are restored instead of
+    // reprefilled. Caveat: any volatile content (current time, per-query RAG
+    // hits) placed BEFORE this boundary breaks the bit-exact match — keep it
+    // at the tail of the prompt. Returns tokens restored (pc.n_pos) or 0.
+    int try_restore_prefix_cache_auto(const std::vector<int>& prompt_tokens, int slot = 0) {
+        ensure_prefix_caches();
+        if (slot < 0 || slot >= num_slots) return 0;
+        std::lock_guard<std::mutex> lk(prefix_caches_mu);
+        // Search every slot's snapshot, not just this one: a single session
+        // can bounce between physical slots across turns (the scheduler picks
+        // a free slot), so the matching snapshot may live elsewhere. Restoring
+        // another slot's snapshot into this slot is correct — KV/GDN state at
+        // position i depends only on tokens[0..i], not on which slot held it.
+        int best = -1, best_N = 0;
+        for (int s = 0; s < num_slots; s++) {
+            PrefixSnapshot& pc = prefix_caches[s];
+            if (!pc.valid) continue;
+            int N = pc.n_pos;  // already chunk-aligned at save time
+            if (N <= best_N || N > (int)prompt_tokens.size() - 1) continue;
+            bool match = true;
+            for (int i = 0; i < N; i++) {
+                if (prompt_tokens[i] != pc.tokens[i]) { match = false; break; }
+            }
+            if (match) { best = s; best_N = N; }
+        }
+        if (best < 0) return 0;
+        restore_snapshot_into_slot(prefix_caches[best], slot, best_N);
+        return best_N;
+    }
+
+    // Copy a validated snapshot (pc, first N tokens) into the slot's KV[0,N)
+    // and GDN state. Caller holds prefix_caches_mu and has verified the match.
+    void restore_snapshot_into_slot(PrefixSnapshot& pc, int slot, int N) {
         reset_slot_states(slot);
         int num_kv = cfg.num_kv_heads, hd = cfg.head_dim, kv_dim = num_kv * hd;
         size_t slot_kv_off = kv_slot_offset(slot) * kv_dim;
-        for (auto& [layer, kv] : kv_caches) {
-            auto it = pc.kv_copy.find(layer);
-            if (it == pc.kv_copy.end()) continue;
-            int g = gpu->layer_gpu[layer];
-            cudaSetDevice(g);
-            cudaMemcpy(kv.k + slot_kv_off, it->second.first,
-                       (size_t)N * kv_dim * sizeof(half), cudaMemcpyHostToDevice);
-            cudaMemcpy(kv.v + slot_kv_off, it->second.second,
-                       (size_t)N * kv_dim * sizeof(half), cudaMemcpyHostToDevice);
+        if (use_turboquant) {
+            for (auto& [layer, kv] : tq_kv_caches) {
+                auto it = pc.tqkv_copy.find(layer);
+                if (it == pc.tqkv_copy.end()) continue;
+                size_t off   = kv_slot_offset(slot) * kv.blocks_per_token;
+                size_t bytes = (size_t)N * kv.blocks_per_token * sizeof(block_tq3);
+                int g = gpu->layer_gpu[layer];
+                cudaSetDevice(g);
+                cudaMemcpy(kv.k + off, it->second.first,  bytes, cudaMemcpyHostToDevice);
+                cudaMemcpy(kv.v + off, it->second.second, bytes, cudaMemcpyHostToDevice);
+            }
+            // Force the per-token TQ read path to re-dequant [0,N) on the next
+            // forward_attn; the dequant scratch otherwise holds stale positions.
+            if (!tq_decoded_until.empty())
+                std::fill(tq_decoded_until.begin(), tq_decoded_until.end(), -1);
+        } else if (use_q8_kv) {
+            for (auto& [layer, kv] : q8_kv_caches) {
+                auto it = pc.q8kv_copy.find(layer);
+                if (it == pc.q8kv_copy.end()) continue;
+                size_t off   = kv_slot_offset(slot) * kv.blocks_per_token;
+                size_t bytes = (size_t)N * kv.blocks_per_token * sizeof(block_q8_0_aligned);
+                int g = gpu->layer_gpu[layer];
+                cudaSetDevice(g);
+                cudaMemcpy(kv.k + off, it->second.first,  bytes, cudaMemcpyHostToDevice);
+                cudaMemcpy(kv.v + off, it->second.second, bytes, cudaMemcpyHostToDevice);
+            }
+        } else {
+            for (auto& [layer, kv] : kv_caches) {
+                auto it = pc.kv_copy.find(layer);
+                if (it == pc.kv_copy.end()) continue;
+                int g = gpu->layer_gpu[layer];
+                cudaSetDevice(g);
+                cudaMemcpy(kv.k + slot_kv_off, it->second.first,
+                           (size_t)N * kv_dim * sizeof(half), cudaMemcpyHostToDevice);
+                cudaMemcpy(kv.v + slot_kv_off, it->second.second,
+                           (size_t)N * kv_dim * sizeof(half), cudaMemcpyHostToDevice);
+            }
         }
         size_t conv_sz = (size_t)gdn_qkv_dim_cached * 4 * sizeof(float);
         size_t rec_sz  = (size_t)gdn_rec_per_slot * sizeof(float);
@@ -2005,7 +2086,6 @@ struct QwenModel {
             cudaMemcpy(gdn_rec_slot(layer, slot), it->second.second,
                        rec_sz,  cudaMemcpyHostToDevice);
         }
-        return N;
     }
 
     // Snapshot the slot's current KV[0..n_pos) + GDN state into its prefix
@@ -2020,27 +2100,70 @@ struct QwenModel {
         int num_kv = cfg.num_kv_heads, hd = cfg.head_dim, kv_dim = num_kv * hd;
         size_t slot_kv_off = kv_slot_offset(slot) * kv_dim;
 
-        if (pc.kv_capacity != n_pos) {
+        bool realloc = (pc.kv_capacity != n_pos);
+        if (realloc) {
             // free without re-locking — we already hold prefix_caches_mu and
             // free_prefix_cache_buffers does no locking.
-            for (auto& [layer, kv] : pc.kv_copy) {
-                cudaFreeHost(kv.first); cudaFreeHost(kv.second);
-            }
-            for (auto& [layer, gd] : pc.gdn_copy) {
-                cudaFreeHost(gd.first); cudaFreeHost(gd.second);
-            }
+            for (auto& [layer, kv] : pc.kv_copy)   { cudaFreeHost(kv.first); cudaFreeHost(kv.second); }
+            for (auto& [layer, kv] : pc.tqkv_copy) { cudaFreeHost(kv.first); cudaFreeHost(kv.second); }
+            for (auto& [layer, kv] : pc.q8kv_copy) { cudaFreeHost(kv.first); cudaFreeHost(kv.second); }
+            for (auto& [layer, gd] : pc.gdn_copy)  { cudaFreeHost(gd.first); cudaFreeHost(gd.second); }
             pc.kv_copy.clear();
+            pc.tqkv_copy.clear();
+            pc.q8kv_copy.clear();
             pc.gdn_copy.clear();
             pc.kv_capacity = 0;
             pc.valid = false;
         }
-        if (pc.kv_copy.empty()) {
-            for (auto& [layer, kv] : kv_caches) {
-                half *kc = nullptr, *vc = nullptr;
-                cudaMallocHost(&kc, (size_t)n_pos * kv_dim * sizeof(half));
-                cudaMallocHost(&vc, (size_t)n_pos * kv_dim * sizeof(half));
-                pc.kv_copy[layer] = {kc, vc};
+        // KV save — format-aware (only one of the three caches is live).
+        if (use_turboquant) {
+            for (auto& [layer, kv] : tq_kv_caches) {
+                size_t bytes = (size_t)n_pos * kv.blocks_per_token * sizeof(block_tq3);
+                size_t off   = kv_slot_offset(slot) * kv.blocks_per_token;
+                int g = gpu->layer_gpu[layer];
+                cudaSetDevice(g);
+                if (realloc) {
+                    char *kc = nullptr, *vc = nullptr;
+                    cudaMallocHost(&kc, bytes); cudaMallocHost(&vc, bytes);
+                    pc.tqkv_copy[layer] = {kc, vc};
+                }
+                auto& dst = pc.tqkv_copy[layer];
+                cudaMemcpy(dst.first,  kv.k + off, bytes, cudaMemcpyDeviceToHost);
+                cudaMemcpy(dst.second, kv.v + off, bytes, cudaMemcpyDeviceToHost);
             }
+        } else if (use_q8_kv) {
+            for (auto& [layer, kv] : q8_kv_caches) {
+                size_t bytes = (size_t)n_pos * kv.blocks_per_token * sizeof(block_q8_0_aligned);
+                size_t off   = kv_slot_offset(slot) * kv.blocks_per_token;
+                int g = gpu->layer_gpu[layer];
+                cudaSetDevice(g);
+                if (realloc) {
+                    char *kc = nullptr, *vc = nullptr;
+                    cudaMallocHost(&kc, bytes); cudaMallocHost(&vc, bytes);
+                    pc.q8kv_copy[layer] = {kc, vc};
+                }
+                auto& dst = pc.q8kv_copy[layer];
+                cudaMemcpy(dst.first,  kv.k + off, bytes, cudaMemcpyDeviceToHost);
+                cudaMemcpy(dst.second, kv.v + off, bytes, cudaMemcpyDeviceToHost);
+            }
+        } else {
+            for (auto& [layer, kv] : kv_caches) {
+                int g = gpu->layer_gpu[layer];
+                cudaSetDevice(g);
+                if (realloc) {
+                    half *kc = nullptr, *vc = nullptr;
+                    cudaMallocHost(&kc, (size_t)n_pos * kv_dim * sizeof(half));
+                    cudaMallocHost(&vc, (size_t)n_pos * kv_dim * sizeof(half));
+                    pc.kv_copy[layer] = {kc, vc};
+                }
+                auto& dst = pc.kv_copy[layer];
+                cudaMemcpy(dst.first,  kv.k + slot_kv_off,
+                           (size_t)n_pos * kv_dim * sizeof(half), cudaMemcpyDeviceToHost);
+                cudaMemcpy(dst.second, kv.v + slot_kv_off,
+                           (size_t)n_pos * kv_dim * sizeof(half), cudaMemcpyDeviceToHost);
+            }
+        }
+        if (realloc) {
             for (int layer = 0; layer < cfg.num_layers; layer++) {
                 if (!gdn_states[layer].conv_state) continue;
                 float *cc = nullptr, *rc = nullptr;
@@ -2049,16 +2172,6 @@ struct QwenModel {
                 pc.gdn_copy[layer] = {cc, rc};
             }
             pc.kv_capacity = n_pos;
-        }
-        for (auto& [layer, kv] : kv_caches) {
-            auto it = pc.kv_copy.find(layer);
-            if (it == pc.kv_copy.end()) continue;
-            int g = gpu->layer_gpu[layer];
-            cudaSetDevice(g);
-            cudaMemcpy(it->second.first,  kv.k + slot_kv_off,
-                       (size_t)n_pos * kv_dim * sizeof(half), cudaMemcpyDeviceToHost);
-            cudaMemcpy(it->second.second, kv.v + slot_kv_off,
-                       (size_t)n_pos * kv_dim * sizeof(half), cudaMemcpyDeviceToHost);
         }
         size_t conv_sz = (size_t)gdn_qkv_dim_cached * 4 * sizeof(float);
         size_t rec_sz  = (size_t)gdn_rec_per_slot * sizeof(float);
