@@ -85,6 +85,7 @@ struct QwenConfig {
     int  num_experts = 0;          // total experts (router output dim)
     int  num_experts_per_tok = 0;  // top-k active experts
     int  moe_intermediate_size = 0;// per-expert SwiGLU intermediate dim
+    int  shared_expert_intermediate_size = 0; // 0 = no shared expert
 };
 
 struct LayerBuffers {
@@ -693,7 +694,10 @@ struct QwenModel {
     // ── MoE (Qwen3.x-A3B) ────────────────────────────────────────────────────
     void ensure_moe_buffers(int g) {
         if (moe_gate[g]) return;
-        int H = cfg.hidden_size, mI = cfg.moe_intermediate_size, E = cfg.num_experts;
+        int H = cfg.hidden_size, E = cfg.num_experts;
+        // gate/up scratch sized to the larger of routed-expert and shared-expert
+        // intermediate dims (they're reused for both).
+        int mI = std::max(cfg.moe_intermediate_size, cfg.shared_expert_intermediate_size);
         cudaSetDevice(g);
         cudaMalloc(&moe_gate[g], (size_t)mI * sizeof(half));
         cudaMalloc(&moe_up[g],   (size_t)mI * sizeof(half));
@@ -767,6 +771,35 @@ struct QwenModel {
             void* dp = (uint8_t*)down_exps->data + (size_t)e * d_bytes;
             quant_gemv(dp, down_exps->type, moe_gate[g], moe_down[g], mI, H, &gpu_qi_moe[g], stream);
             qmoe_acc_f32<<<(H + 255) / 256, 256, 0, stream>>>(moe_acc[g], moe_down[g], w[t_], H);
+        }
+
+        // Shared expert (always active; optionally sigmoid-gated). qwen3_5_moe
+        // adds shared_expert(h) to the routed sum. Skipped if tensors absent.
+        if (cfg.shared_expert_intermediate_size > 0) {
+            int sI = cfg.shared_expert_intermediate_size;
+            auto* sg = t(blk(layer, "ffn_gate_shexp.weight"));
+            auto* su = t(blk(layer, "ffn_up_shexp.weight"));
+            auto* sd = t(blk(layer, "ffn_down_shexp.weight"));
+            if (sg && su && sd) {
+                float sgate = 1.0f;
+                if (auto* sgi = t(blk(layer, "ffn_gate_inp_shexp.weight"))) {
+                    // single-logit gate → sigmoid scalar
+                    if (sgi->type == GGML_TYPE_F32) {
+                        qmoe_router_gemv_f32<<<1, 32, 0, stream>>>((float*)sgi->data,
+                                                                  buf.norm_out, moe_logits[g], H, 1);
+                        float l; cudaMemcpyAsync(&l, moe_logits[g], sizeof(float),
+                                                 cudaMemcpyDeviceToHost, stream);
+                        cudaStreamSynchronize(stream);
+                        sgate = 1.0f / (1.0f + expf(-l));
+                    }
+                }
+                quant_gemv(sg->data, sg->type, buf.norm_out, moe_gate[g], H, sI, &gpu_qi[g], stream);
+                quant_gemv(su->data, su->type, buf.norm_out, moe_up[g],   H, sI, &gpu_qi[g], stream);
+                silu_mul_kernel<<<(sI + 255) / 256, 256, 0, stream>>>(moe_gate[g], moe_up[g], sI);
+                gpu_qi_moe[g].quantize(moe_gate[g], sI, stream);
+                quant_gemv(sd->data, sd->type, moe_gate[g], moe_down[g], sI, H, &gpu_qi_moe[g], stream);
+                qmoe_acc_f32<<<(H + 255) / 256, 256, 0, stream>>>(moe_acc[g], moe_down[g], sgate, H);
+            }
         }
 
         qmoe_f32_to_f16<<<(H + 255) / 256, 256, 0, stream>>>(moe_acc[g], moe_down[g], H);
@@ -2024,9 +2057,13 @@ struct QwenModel {
                 cfg.moe_intermediate_size =
                     gguf_p->get_u32(arch + ".expert_feed_forward_length", 0);
             }
-            printf("MoE: %d/%d layers, %d experts, top-%d, expert_inter=%d\n",
+            // Shared expert (qwen3_5_moe brings it back; Qwen3-MoE had none).
+            if (auto* sh = t(blk(first_moe, "ffn_gate_shexp.weight")))
+                cfg.shared_expert_intermediate_size = sh->dims[1];
+            printf("MoE: %d/%d layers, %d experts, top-%d, expert_inter=%d, shared_inter=%d\n",
                    moe_count, cfg.num_layers, cfg.num_experts,
-                   cfg.num_experts_per_tok, cfg.moe_intermediate_size);
+                   cfg.num_experts_per_tok, cfg.moe_intermediate_size,
+                   cfg.shared_expert_intermediate_size);
         }
 
         // Detect v2 separate Q/K/V attention (vs v1 combined attn_qkv)
