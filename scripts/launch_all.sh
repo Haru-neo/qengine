@@ -21,8 +21,10 @@ CHAT_PORT=${CHAT_PORT:-8000}
 EMBED_PORT=${EMBED_PORT:-8001}
 RERANK_PORT=${RERANK_PORT:-8002}
 
-# Kill any previous instances.
-pkill -9 -f "qwen-engine" 2>/dev/null || true
+# Kill any previous engine binaries. Match the executable path specifically
+# so the pkill doesn't also kill this script (whose own path contains
+# "qwen-engine"). pkill exits 1 when nothing matched, so swallow that.
+pkill -9 -f "build/qwen-engine" 2>/dev/null || true
 sleep 2
 
 # Drop page cache before loading the 28 GB chat GGUF.
