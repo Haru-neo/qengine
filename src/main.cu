@@ -3630,6 +3630,9 @@ struct EmbedForwardCtx {
     QuantInput       qi_logits;
 };
 
+// RERANK_PROF accumulators (per-forward; reset after the print).
+static double g_rr_attn = 0.0, g_rr_mlp = 0.0;
+
 // Run a single-pass prefill and return the post-output_norm hidden for the
 // last token (length H, fp32 on host).
 static bool run_embed_forward(EmbedForwardCtx& C,
@@ -3640,6 +3643,53 @@ static bool run_embed_forward(EmbedForwardCtx& C,
     int H = C.H;
     int last_gpu = C.last_gpu;
     if (prompt_ids.empty()) return false;
+
+    // RERANK_PER_TOKEN=1 forces the legacy one-token-at-a-time prefill (for
+    // A/B correctness checks against the chunked path).
+    static const bool per_token = getenv("RERANK_PER_TOKEN") != nullptr;
+    if (per_token) {
+        model.reset_all_states();
+        for (int step = 0; step < (int)prompt_ids.size(); step++) {
+            int tok = prompt_ids[step];
+            cudaSetDevice(0);
+            if (C.embd_t->type == GGML_TYPE_Q8_0)
+                dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(C.embd_t->data, C.gpu_hidden_half[0], tok, H);
+            else if (C.embd_t->type == GGML_TYPE_Q5_K)
+                dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(C.embd_t->data, C.gpu_hidden_half[0], tok, H);
+            else if (C.embd_t->type == GGML_TYPE_Q6_K)
+                dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(C.embd_t->data, C.gpu_hidden_half[0], tok, H);
+            else return false;
+            half_to_float_kernel<<<(H+255)/256, 256>>>(C.gpu_hidden_half[0], C.gpu_hidden_fp32[0], H);
+            float* h = C.gpu_hidden_fp32[0];
+            for (int layer = 0; layer < model.cfg.num_layers; layer++) {
+                int g = gpu_model.layer_gpu[layer];
+                int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
+                if (g != prev_g) {
+                    cudaSetDevice(prev_g); cudaDeviceSynchronize();
+                    cudaMemcpy(C.host_transfer, h, H * sizeof(float), cudaMemcpyDeviceToHost);
+                    cudaSetDevice(g);
+                    cudaMemcpy(C.gpu_hidden_fp32[g], C.host_transfer, H * sizeof(float), cudaMemcpyHostToDevice);
+                    h = C.gpu_hidden_fp32[g];
+                }
+                cudaSetDevice(g);
+                model.forward_attn(layer, h, step, /*stream=*/0);
+                model.forward_mlp_chunk(layer, h, /*n_tokens=*/1, /*stream=*/0);
+            }
+        }
+        cudaSetDevice(last_gpu); cudaDeviceSynchronize();
+        float_to_half_kernel<<<(H+255)/256, 256>>>(
+            C.gpu_hidden_fp32[last_gpu], C.gpu_hidden_half[last_gpu], H);
+        if (C.out_norm_t->type == GGML_TYPE_F32)
+            rms_norm_f32w(C.norm_buf, C.gpu_hidden_half[last_gpu], (float*)C.out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
+        else
+            rms_norm(C.norm_buf, C.gpu_hidden_half[last_gpu], (half*)C.out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
+        cudaDeviceSynchronize();
+        std::vector<half> hh(H);
+        cudaMemcpy(hh.data(), C.norm_buf, H * sizeof(half), cudaMemcpyDeviceToHost);
+        out_hidden.resize(H);
+        for (int i = 0; i < H; i++) out_hidden[i] = __half2float(hh[i]);
+        return true;
+    }
 
     // Fresh KV per request — single slot, no continuous batching for sidecars.
     // Chunked prefill (CHUNK_SIZE tokens per pass through the layer stack)
@@ -3683,16 +3733,34 @@ static bool run_embed_forward(EmbedForwardCtx& C,
                 h_chunk = C.gpu_hidden_chunk[g];
             }
             cudaSetDevice(g);
+            static const bool prof = getenv("RERANK_PROF") != nullptr;
+            auto p0 = std::chrono::high_resolution_clock::now();
             if (model.is_attn_layer(layer))
                 model.forward_attn_chunk(layer, h_chunk, chunk_pos, chunk_n, /*stream=*/0);
             else
                 model.forward_gdn_chunk(layer, h_chunk, chunk_n, /*stream=*/0);
+            if (prof) { cudaSetDevice(g); cudaDeviceSynchronize(); }
+            auto p1 = std::chrono::high_resolution_clock::now();
             model.forward_mlp_chunk(layer, h_chunk, chunk_n, /*stream=*/0);
+            if (prof) {
+                cudaSetDevice(g); cudaDeviceSynchronize();
+                auto p2 = std::chrono::high_resolution_clock::now();
+                g_rr_attn += std::chrono::duration<double,std::milli>(p1-p0).count();
+                g_rr_mlp  += std::chrono::duration<double,std::milli>(p2-p1).count();
+            }
         }
         cudaSetDevice(last_gpu); cudaDeviceSynchronize();
         last_h = h_chunk;
         last_n = chunk_n;
         chunk_pos += chunk_n;
+    }
+    {
+        static const bool prof = getenv("RERANK_PROF") != nullptr;
+        if (prof) {
+            fprintf(stderr, "[rr-prof] tokens=%d attn=%.1fms mlp=%.1fms\n",
+                    plen, g_rr_attn, g_rr_mlp);
+            g_rr_attn = 0; g_rr_mlp = 0;
+        }
     }
 
     // Last token's hidden is the final row of the final chunk. Convert fp32 →

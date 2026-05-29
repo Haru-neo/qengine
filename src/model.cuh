@@ -3489,6 +3489,12 @@ struct QwenModel {
             return;
         }
         int q_out_dim = q_w->dims[1];
+        // Gated attention (Qwopus3.6 hybrid) bakes a Q-gate into attn_q so
+        // q_out_dim = 2*total_qg; Qwen3 dense (embed/reranker) has no gate
+        // (q_out_dim = total_qg). Mirror forward_attn's detection so the
+        // chunked path is correct for BOTH — without this the dense models
+        // get the gated deinterleave + sigmoid and produce garbage.
+        const bool has_q_gate = (q_out_dim == 2 * total_qg);
 
         // TQ path: dequant historical [0..start_pos-1] from the TQ cache into
         // the per-GPU fp16 scratch once per chunk, append the new fp16 K/V at
@@ -3607,10 +3613,18 @@ struct QwenModel {
             v_cache_ptr = kv.v + slot_kv_off;
         }
         {
-            dim3 deint_grid((total_qg + 255) / 256, n_tokens);
-            deinterleave_qg_kernel_chunk<<<deint_grid, 256, 0, stream>>>(
-                ab.attn_chunk_q, ab.attn_chunk_q_post, ab.attn_chunk_gate,
-                num_q, hd, n_tokens);
+            if (has_q_gate) {
+                dim3 deint_grid((total_qg + 255) / 256, n_tokens);
+                deinterleave_qg_kernel_chunk<<<deint_grid, 256, 0, stream>>>(
+                    ab.attn_chunk_q, ab.attn_chunk_q_post, ab.attn_chunk_gate,
+                    num_q, hd, n_tokens);
+            } else {
+                // Ungated: attn_chunk_q is already [n_tokens × total_qg]; use
+                // it directly as q_post (no gate split, no gate sigmoid later).
+                cudaMemcpyAsync(ab.attn_chunk_q_post, ab.attn_chunk_q,
+                                (size_t)n_tokens * total_qg * sizeof(half),
+                                cudaMemcpyDeviceToDevice, stream);
+            }
             attn_dump_h("q_deint", ab.attn_chunk_q_post + (size_t)target_t * total_qg);
 
             static const bool skip_qk_norm_c = getenv("SKIP_QK_NORM") != nullptr;
@@ -4332,7 +4346,8 @@ struct QwenModel {
         }
 
         // 8. Batched output gate (sigmoid) — single launch for all n_tokens.
-        {
+        //    Only when the model has a Q-gate (skip for ungated dense models).
+        if (has_q_gate) {
             dim3 gate_grid((total_qg + 255) / 256, n_tokens);
             apply_gate_sigmoid_chunk<<<gate_grid, 256, 0, stream>>>(
                 ab.attn_chunk_out, ab.attn_chunk_gate, total_qg, n_tokens);
