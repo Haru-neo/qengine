@@ -4525,12 +4525,12 @@ int main(int argc, char** argv) {
         ret = serve_embed(gguf, gpu_model, n_gpus, serve_port, tokenizer, model_name);
     } else if (serve_port > 0 && service_mode == "rerank") {
         ret = serve_rerank(gguf, gpu_model, n_gpus, serve_port, tokenizer, model_name);
-    } else if (serve_port > 0 && arch == "qwen35") {
+    } else if (serve_port > 0 && (arch == "qwen35" || arch == "qwen35moe")) {
         ret = serve_qwen(gguf, gpu_model, n_gpus, serve_port, tokenizer, model_name, api_key, max_seq, num_slots, slot_caps,
                          proxy_embed_url, proxy_rerank_url);
     } else if (serve_port > 0) {
         ret = serve_gemma(gguf, gpu_model, n_gpus, serve_port);
-    } else if (chat_mode && arch == "qwen35") {
+    } else if (chat_mode && (arch == "qwen35" || arch == "qwen35moe")) {
         ret = run_chat(gguf, gpu_model, n_gpus, sp, tokenizer);
     } else if (arch == "gemma4" || arch == "gemma2" || arch == "gemma3") {
         ret = run_gemma(gguf, gpu_model, n_gpus, sp, prompt_ids, &tokenizer);
