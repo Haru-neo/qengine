@@ -241,7 +241,7 @@ struct Tokenizer {
             int matched_id = -1;
             size_t matched_len = 0;
             for (auto& [tok_str, tok_id] : token_to_id) {
-                if (tok_id < 248000) continue;  // only check special tokens (high IDs)
+                if (!is_special(tok_id)) continue;  // only match `<...>`-form specials
                 if (tok_str.size() > matched_len && tok_str.size() <= text.size() - pos &&
                     text.compare(pos, tok_str.size(), tok_str) == 0) {
                     matched_id = tok_id;
@@ -256,7 +256,7 @@ struct Tokenizer {
             // Find next special token to determine the text chunk boundary
             size_t next_special = text.size();
             for (auto& [tok_str, tok_id] : token_to_id) {
-                if (tok_id < 248000) continue;
+                if (!is_special(tok_id)) continue;
                 size_t found = text.find(tok_str, pos);
                 if (found != std::string::npos && found < next_special)
                     next_special = found;

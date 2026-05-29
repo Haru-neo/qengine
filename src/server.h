@@ -753,6 +753,137 @@ struct HttpServer {
         send_response(client_fd, 200, "application/json", out.str());
     }
 
+    // Call the embedding backend with arbitrary text + parse the returned
+    // vectors. Returns false on any transport / JSON error.
+    bool call_embed_backend(const std::vector<std::string>& inputs,
+                            std::vector<std::vector<float>>& out_vecs) {
+        if (proxy_embed_url.empty()) return false;
+        // Build the JSON body: {"input":["...","..."]}
+        std::ostringstream req_body;
+        req_body << "{\"input\":[";
+        for (size_t i = 0; i < inputs.size(); i++) {
+            if (i) req_body << ",";
+            req_body << "\"" << json_escape(inputs[i]) << "\"";
+        }
+        req_body << "]}";
+        // Open TCP, send, read whole response.
+        size_t colon = proxy_embed_url.find(':');
+        std::string host = colon == std::string::npos
+                           ? proxy_embed_url : proxy_embed_url.substr(0, colon);
+        int port = colon == std::string::npos
+                   ? 80 : atoi(proxy_embed_url.c_str() + colon + 1);
+        int bfd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (bfd < 0) return false;
+        struct sockaddr_in addr = {};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        if (host == "localhost" || host == "127.0.0.1")
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        else
+            inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+        if (::connect(bfd, (sockaddr*)&addr, sizeof(addr)) < 0) {
+            ::close(bfd); return false;
+        }
+        std::string body = req_body.str();
+        std::ostringstream req;
+        req << "POST /v1/embeddings HTTP/1.1\r\n"
+            << "Host: " << host << "\r\n"
+            << "Content-Type: application/json\r\n"
+            << "Content-Length: " << body.size() << "\r\n"
+            << "Connection: close\r\n\r\n"
+            << body;
+        std::string raw_req = req.str();
+        ::send(bfd, raw_req.data(), raw_req.size(), MSG_NOSIGNAL);
+        std::string resp;
+        char buf[4096];
+        while (true) {
+            ssize_t n = ::recv(bfd, buf, sizeof(buf), 0);
+            if (n <= 0) break;
+            resp.append(buf, n);
+        }
+        ::close(bfd);
+        // Strip HTTP headers.
+        size_t body_off = resp.find("\r\n\r\n");
+        if (body_off == std::string::npos) return false;
+        std::string json = resp.substr(body_off + 4);
+        // Parse vectors out of {"data":[{"embedding":[...]},{...}]}
+        out_vecs.assign(inputs.size(), {});
+        size_t pos = 0;
+        size_t idx = 0;
+        while (idx < inputs.size()) {
+            size_t e = json.find("\"embedding\":[", pos);
+            if (e == std::string::npos) break;
+            e += strlen("\"embedding\":[");
+            size_t end = json.find(']', e);
+            if (end == std::string::npos) break;
+            std::vector<float>& v = out_vecs[idx];
+            size_t cur = e;
+            while (cur < end) {
+                while (cur < end && (json[cur] == ' ' || json[cur] == ',')) cur++;
+                if (cur >= end) break;
+                v.push_back((float)strtod(json.c_str() + cur, nullptr));
+                while (cur < end && json[cur] != ',' && json[cur] != ' ') cur++;
+            }
+            pos = end + 1;
+            idx++;
+        }
+        return idx == inputs.size() && !out_vecs[0].empty();
+    }
+
+    // Fallback rerank that fans out to the embedding backend and ranks by
+    // cosine similarity. Lower precision than a real cross-encoder reranker
+    // but it's a reasonable approximation for agent-scale RAG.
+    void handle_rerank_via_embed(int client_fd, const std::string& body) {
+        std::string query = json_get_str(body, "query");
+        auto docs = json_extract_string_or_array(body, "documents");
+        if (query.empty() || docs.empty()) {
+            send_response(client_fd, 400, "application/json",
+                "{\"error\":{\"message\":\"missing 'query' or 'documents'\"}}");
+            return;
+        }
+        int top_n = json_get_int(body, "top_n", (int)docs.size());
+
+        std::vector<std::string> inputs;
+        inputs.reserve(1 + docs.size());
+        inputs.push_back(query);
+        for (auto& d : docs) inputs.push_back(d);
+
+        std::vector<std::vector<float>> vecs;
+        if (!call_embed_backend(inputs, vecs) || vecs.size() != inputs.size()) {
+            send_response(client_fd, 502, "application/json",
+                "{\"error\":{\"message\":\"embed backend unavailable for rerank fallback\"}}");
+            return;
+        }
+        // Vectors arrive L2-normalized from the embedding sidecar, so cosine
+        // similarity reduces to a plain inner product.
+        const auto& qv = vecs[0];
+        std::vector<float> scores(docs.size());
+        for (size_t i = 0; i < docs.size(); i++) {
+            const auto& dv = vecs[i + 1];
+            double s = 0.0;
+            size_t lim = std::min(qv.size(), dv.size());
+            for (size_t j = 0; j < lim; j++) s += (double)qv[j] * dv[j];
+            scores[i] = (float)s;
+        }
+        std::vector<int> order(scores.size());
+        for (size_t i = 0; i < order.size(); i++) order[i] = (int)i;
+        std::sort(order.begin(), order.end(),
+                  [&](int a, int b) { return scores[a] > scores[b]; });
+        if ((int)order.size() > top_n) order.resize(top_n);
+        std::ostringstream out;
+        out << "{\"results\":[";
+        for (size_t i = 0; i < order.size(); i++) {
+            if (i) out << ",";
+            int idx = order[i];
+            out << "{\"index\":" << idx
+                << ",\"relevance_score\":" << scores[idx]
+                << ",\"document\":\"" << json_escape(docs[idx]) << "\"}";
+        }
+        out << "],\"model\":\"" << model_name
+            << "+embed-cosine\"}";
+        send_response(client_fd, 200, "application/json", out.str());
+    }
+
     // Minimal forward proxy. Opens a TCP connection to `target` (host:port),
     // writes the request, streams back the response into the client_fd.
     void proxy_forward(int client_fd, const std::string& target,
@@ -1275,11 +1406,17 @@ struct HttpServer {
             else send_response(client_fd, 501, "application/json",
                                "{\"error\":{\"message\":\"embedding endpoint disabled\"}}");
         }
-        // POST /v1/rerank — local sidecar OR proxy to backend
+        // POST /v1/rerank: local sidecar → proxy to dedicated reranker →
+        // embedding-cosine fallback (chat server only). The last form lets
+        // us serve a working rerank endpoint even when the Qwen3-Reranker
+        // GGUFs are broken (their community quants emit "Okay" instead of
+        // yes/no, making the yes/no-logit reranker score useless).
         else if (method == "POST" && (path == "/v1/rerank" || path == "/rerank")) {
             if (rerank_fn)             handle_rerank(client_fd, body);
             else if (!proxy_rerank_url.empty())
                                        proxy_forward(client_fd, proxy_rerank_url, "POST", path, body);
+            else if (!proxy_embed_url.empty())
+                                       handle_rerank_via_embed(client_fd, body);
             else send_response(client_fd, 501, "application/json",
                                "{\"error\":{\"message\":\"rerank endpoint disabled\"}}");
         }

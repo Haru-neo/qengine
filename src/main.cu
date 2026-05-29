@@ -3742,39 +3742,81 @@ int serve_rerank(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port,
     EmbedForwardCtx C;
     init_embed_ctx(C, model, gpu_model, n_gpus);
 
-    // Look up the "yes" and "no" token IDs in the tokenizer vocab. Qwen3-Reranker
-    // is trained to emit one of these as the next token after the query+doc
-    // template; score = softmax([logit_yes, logit_no])[0].
-    int yes_id = -1, no_id = -1;
-    {
-        // Common variants — Qwen tokenizer is BPE so leading space matters.
-        for (const char* w : {"yes", " yes", "Yes", " Yes"}) {
+    // Qwen3-Reranker uses the standard Qwen3 chat template; the model is
+    // trained to emit "yes" or "no" as the FIRST assistant token (after the
+    // assistant prefix + empty <think> block). Score = softmax([yes, no])[0]
+    // on the logits at the LAST input position (= the position right before
+    // the model would generate that yes/no).
+    //
+    // Template (verbatim from the Qwen3-Reranker HF model card):
+    //   <|im_start|>system
+    //   Judge whether the Document meets the requirements based on the Query
+    //   and the Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>
+    //   <|im_start|>user
+    //   <Instruct>: …
+    //   <Query>: …
+    //   <Document>: …<|im_end|>
+    //   <|im_start|>assistant
+    //   <think>
+    //
+    //   </think>
+    //
+    //   ← model emits "yes" or "no" here
+    const std::string system_msg =
+        "Judge whether the Document meets the requirements based on the Query and the Instruct provided. "
+        "Note that the answer can only be \"yes\" or \"no\".";
+    const std::string default_instruct =
+        "Given a web search query, retrieve relevant passages that answer the query";
+
+    auto build_prompt = [&](const std::string& instruct, const std::string& q, const std::string& d) {
+        std::string user_msg =
+            "<Instruct>: " + (instruct.empty() ? default_instruct : instruct) +
+            "\n<Query>: " + q +
+            "\n<Document>: " + d;
+        // Standard Qwen3-Reranker template (HF model card). Note: the empty
+        // `<think>\n\n</think>\n\n` block IS part of the official suffix —
+        // the Voodisss GGUF inherits it from the base. The model emits
+        // yes/no right after.
+        const char* suffix = std::getenv("RERANK_NO_THINK")
+            ? "<|im_end|>\n<|im_start|>assistant\n"
+            : "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        return std::string("<|im_start|>system\n") + system_msg + "<|im_end|>\n"
+             + "<|im_start|>user\n" + user_msg + suffix;
+    };
+
+    // Look up token IDs by encoding short strings and picking the LAST token
+    // — this is robust to whether the BPE merges "yes"/"no" into a single
+    // token or splits them. We want the token the model would emit RIGHT
+    // after the prefix above, which (per the Qwen3-Reranker spec) is a bare
+    // "yes" or "no" with no leading space (because the template ends in
+    // "\n\n" so the next token continues a fresh line).
+    auto find_token_id = [&](const std::vector<const char*>& candidates) -> int {
+        for (const char* w : candidates) {
             auto ids = tok.encode(w);
-            if (ids.size() == 1) { yes_id = ids[0]; break; }
+            if (ids.size() == 1) return ids[0];
         }
-        for (const char* w : {"no", " no", "No", " No"}) {
-            auto ids = tok.encode(w);
-            if (ids.size() == 1) { no_id = ids[0]; break; }
-        }
+        // Fallback: take the LAST token of "... yes" minus the prefix ids.
+        return -1;
+    };
+    int yes_id = find_token_id({"yes", " yes", "Yes", " Yes", "YES"});
+    int no_id  = find_token_id({"no",  " no",  "No",  " No",  "NO"});
+    if (yes_id < 0 || no_id < 0) {
+        // Last-resort fallback: encode "answer yes" / "answer no" and grab
+        // the trailing single-token answer.
+        auto try_tail = [&](const std::string& full) -> int {
+            auto ids = tok.encode(full);
+            return ids.empty() ? -1 : ids.back();
+        };
+        if (yes_id < 0) yes_id = try_tail("yes");
+        if (no_id  < 0) no_id  = try_tail("no");
     }
     if (yes_id < 0 || no_id < 0) {
         fprintf(stderr, "[rerank] failed to find yes/no token IDs (yes=%d no=%d)\n", yes_id, no_id);
         return 1;
     }
-    printf("[rerank] yes_id=%d, no_id=%d\n", yes_id, no_id);
-
-    // Official Qwen3-Reranker template (from the HF model card / arXiv:2506.05176):
-    //   <Instruct>: Given a web search query, retrieve relevant passages that answer the query
-    //   <Query>: {query}
-    //   <Document>: {document}
-    //   Note that the answer can only be "yes" or "no".
-    auto build_prompt = [](const std::string& q, const std::string& d) {
-        return std::string(
-            "<Instruct>: Given a web search query, retrieve relevant passages that answer the query\n"
-            "<Query>: ") + q +
-            "\n<Document>: " + d +
-            "\nNote that the answer can only be \"yes\" or \"no\".";
-    };
+    printf("[rerank] yes_id=%d ('%s'), no_id=%d ('%s')\n",
+           yes_id, tok.decode({yes_id}).c_str(),
+           no_id,  tok.decode({no_id}).c_str());
 
     std::mutex fwd_mu;
     auto rerank_fn = [&](const std::string& query, const std::vector<std::string>& docs) -> std::vector<float> {
@@ -3782,7 +3824,7 @@ int serve_rerank(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port,
         std::vector<float> scores;
         scores.reserve(docs.size());
         for (const auto& d : docs) {
-            auto ids = tok.encode(build_prompt(query, d));
+            auto ids = tok.encode(build_prompt(/*instruct=*/"", query, d));
             std::vector<float> h;
             if (!run_embed_forward(C, ids, h)) { scores.push_back(0.0f); continue; }
             // h is post-output_norm. Run lm_head to get logits.
@@ -3800,6 +3842,23 @@ int serve_rerank(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port,
             cudaMemcpy(&lno_h,  C.logits_buf + no_id,  sizeof(half), cudaMemcpyDeviceToHost);
             float lyes = __half2float(lyes_h);
             float lno  = __half2float(lno_h);
+            // Optional: RERANK_DEBUG=1 dumps yes/no + argmax to stderr for
+            // diagnosing model/quant mismatches (a healthy reranker has yes
+            // or no as the argmax with a much larger logit than other tokens).
+            static const bool dbg = getenv("RERANK_DEBUG") != nullptr;
+            if (dbg) {
+                int* d_arg = nullptr; cudaMalloc(&d_arg, sizeof(int));
+                argmax_half_kernel<<<1, 1024, 0, 0>>>(C.logits_buf, C.V, d_arg);
+                int argmax_tok = -1;
+                cudaMemcpy(&argmax_tok, d_arg, sizeof(int), cudaMemcpyDeviceToHost);
+                cudaFree(d_arg);
+                half max_h;
+                cudaMemcpy(&max_h, C.logits_buf + argmax_tok, sizeof(half), cudaMemcpyDeviceToHost);
+                std::string argmax_str = tok.decode({argmax_tok});
+                fprintf(stderr, "[rerank-dbg] lyes=%.3f lno=%.3f argmax=%d('%s' %.3f) doc='%.40s'\n",
+                        lyes, lno, argmax_tok, argmax_str.c_str(),
+                        __half2float(max_h), d.c_str()); fflush(stderr);
+            }
             float m = std::max(lyes, lno);
             float pyes = std::exp(lyes - m);
             float pno  = std::exp(lno  - m);
