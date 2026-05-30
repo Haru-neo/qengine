@@ -139,6 +139,24 @@ __global__ void qmoe_f32_to_f16(const float* __restrict__ in, half* __restrict__
     if (i < n) out[i] = __float2half(in[i]);
 }
 
+// Grouped weighted accumulate: acc[h] += sum_e w[e] * down[e*H + h], with a
+// fp16 clamp on each expert's down output folded in (avoids a separate clamp
+// launch per expert). down is [G, H]; weights/acc on device.
+__global__ void qmoe_weighted_acc_experts(float* __restrict__ acc,
+                                          const half* __restrict__ down,
+                                          const float* __restrict__ weights,
+                                          int G, int H) {
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= H) return;
+    float s = 0.0f;
+    for (int e = 0; e < G; e++) {
+        float v = __half2float(down[(size_t)e * H + h]);
+        if (v != v || v > 65504.f) v = 65504.f; else if (v < -65504.f) v = -65504.f;
+        s += weights[e] * v;
+    }
+    acc[h] += s;
+}
+
 // Clamp fp16 to finite range (fp16 max 65504); maps nan→max. Expert GEMV
 // outputs can overflow fp16 (256 experts, large distilled weights) → inf →
 // silu/accumulate → nan. Mirrors gemma_model.cuh's clamp_fp16_kernel.
@@ -167,6 +185,16 @@ struct QwenModel {
     float* moe_acc[4]    = {};   // [hidden_size] fp32 accumulator
     float* moe_logits[4] = {};   // [num_experts] router logits (device)
     QuantInput gpu_qi_moe[4];    // input quantizer for the moe_intermediate dim
+    // Grouped-expert scratch (all top-k experts in one launch — see
+    // gemv_q8_0_q8_experts). Sized topk × per-expert dims.
+    half*  moe_gate_g[4] = {};   // [topk * moe_intermediate_size]
+    half*  moe_up_g[4]   = {};   // [topk * moe_intermediate_size]
+    half*  moe_down_g[4] = {};   // [topk * hidden_size]
+    int*   moe_ids_dev[4]= {};   // [topk] selected expert ids (device)
+    float* moe_w_dev[4]  = {};   // [topk] softmax weights (device)
+    int*   moe_ids_host[4] = {}; // pinned [topk]
+    float* moe_w_host[4] = {};   // pinned [topk]
+    QuantInput gpu_qi_moe_g[4];  // quantizer for [topk * moe_intermediate]
     bool v2_separate_qkv = false;
     int  attn_num_q_heads = 0;
     int  attn_num_kv_heads = 0;
@@ -730,6 +758,15 @@ struct QwenModel {
         cudaMalloc(&moe_down[g], (size_t)H  * sizeof(half));
         cudaMalloc(&moe_acc[g],  (size_t)H  * sizeof(float));
         cudaMalloc(&moe_logits[g], (size_t)E * sizeof(float));
+        // Grouped path: topk experts in one launch.
+        int topk = std::max(cfg.num_experts_per_tok, 1);
+        cudaMalloc(&moe_gate_g[g], (size_t)topk * mI * sizeof(half));
+        cudaMalloc(&moe_up_g[g],   (size_t)topk * mI * sizeof(half));
+        cudaMalloc(&moe_down_g[g], (size_t)topk * H  * sizeof(half));
+        cudaMalloc(&moe_ids_dev[g], (size_t)topk * sizeof(int));
+        cudaMalloc(&moe_w_dev[g],   (size_t)topk * sizeof(float));
+        cudaMallocHost(&moe_ids_host[g], (size_t)topk * sizeof(int));
+        cudaMallocHost(&moe_w_host[g],   (size_t)topk * sizeof(float));
     }
 
     // Single-token MoE FFN over `hidden` [H] (fp32, in/out via residual add).
@@ -812,20 +849,61 @@ struct QwenModel {
         size_t d_bytes = expert_bytes(down_exps->type, (size_t)H  * mI);
 
         qmoe_zero_f32<<<(H + 255) / 256, 256, 0, stream>>>(moe_acc[g], H);
-        for (int t_ = 0; t_ < topk; t_++) {
-            int e = order[t_];
-            void* gp = (uint8_t*)gate_exps->data + (size_t)e * g_bytes;
-            void* up = (uint8_t*)up_exps->data   + (size_t)e * u_bytes;
-            quant_gemv(gp, gate_exps->type, buf.norm_out, moe_gate[g], H, mI, &gpu_qi[g], stream);
-            quant_gemv(up, up_exps->type,   buf.norm_out, moe_up[g],   H, mI, &gpu_qi[g], stream);
-            qmoe_clamp_fp16<<<(mI + 255) / 256, 256, 0, stream>>>(moe_gate[g], mI);
-            qmoe_clamp_fp16<<<(mI + 255) / 256, 256, 0, stream>>>(moe_up[g], mI);
-            silu_mul_kernel<<<(mI + 255) / 256, 256, 0, stream>>>(moe_gate[g], moe_up[g], mI);
-            gpu_qi_moe[g].quantize(moe_gate[g], mI, stream);
-            void* dp = (uint8_t*)down_exps->data + (size_t)e * d_bytes;
-            quant_gemv(dp, down_exps->type, moe_gate[g], moe_down[g], mI, H, &gpu_qi_moe[g], stream);
-            qmoe_clamp_fp16<<<(H + 255) / 256, 256, 0, stream>>>(moe_down[g], H);
-            qmoe_acc_f32<<<(H + 255) / 256, 256, 0, stream>>>(moe_acc[g], moe_down[g], w[t_], H);
+
+        // Grouped path: all top-k experts in 3 GEMV launches (+ silu/quant/acc)
+        // instead of ~8 launches/expert. The per-token MoE expert loop is
+        // launch-bound on these cards (3B-active compute is trivial), so this
+        // is the dominant decode win. Requires Q8_0 experts (the dp4a grouped
+        // kernel). MOE_GROUPED_OFF=1 forces the legacy per-expert loop.
+        static const bool moe_grouped = getenv("MOE_GROUPED_OFF") == nullptr;
+        bool all_q8 = gate_exps->type == GGML_TYPE_Q8_0
+                   && up_exps->type   == GGML_TYPE_Q8_0
+                   && down_exps->type == GGML_TYPE_Q8_0;
+        if (moe_grouped && all_q8) {
+            for (int i = 0; i < topk; i++) {
+                moe_ids_host[g][i] = order[i];
+                moe_w_host[g][i]   = w[i];
+            }
+            cudaMemcpyAsync(moe_ids_dev[g], moe_ids_host[g], topk * sizeof(int),
+                            cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(moe_w_dev[g], moe_w_host[g], topk * sizeof(float),
+                            cudaMemcpyHostToDevice, stream);
+            int thr = 128;
+            // gate + up share the quantized norm_out (x_stride 0); output [topk, mI]
+            gemv_q8_0_q8_experts<<<dim3(mI, topk), thr, 0, stream>>>(
+                gate_exps->data, g_bytes, moe_ids_dev[g], gpu_qi[g].q8_buf, 0,
+                moe_gate_g[g], H, mI);
+            gemv_q8_0_q8_experts<<<dim3(mI, topk), thr, 0, stream>>>(
+                up_exps->data, u_bytes, moe_ids_dev[g], gpu_qi[g].q8_buf, 0,
+                moe_up_g[g], H, mI);
+            int gmI = topk * mI;
+            qmoe_clamp_fp16<<<(gmI + 255) / 256, 256, 0, stream>>>(moe_gate_g[g], gmI);
+            qmoe_clamp_fp16<<<(gmI + 255) / 256, 256, 0, stream>>>(moe_up_g[g], gmI);
+            silu_mul_kernel<<<(gmI + 255) / 256, 256, 0, stream>>>(moe_gate_g[g], moe_up_g[g], gmI);
+            // Per-block q8 quant; each expert's mI segment quantizes independently
+            // (mI%32==0), and the down kernel reads x at stride mI/32 per expert.
+            gpu_qi_moe_g[g].quantize(moe_gate_g[g], gmI, stream);
+            gemv_q8_0_q8_experts<<<dim3(H, topk), thr, 0, stream>>>(
+                down_exps->data, d_bytes, moe_ids_dev[g], gpu_qi_moe_g[g].q8_buf, mI / 32,
+                moe_down_g[g], mI, H);
+            qmoe_weighted_acc_experts<<<(H + 255) / 256, 256, 0, stream>>>(
+                moe_acc[g], moe_down_g[g], moe_w_dev[g], topk, H);
+        } else {
+            for (int t_ = 0; t_ < topk; t_++) {
+                int e = order[t_];
+                void* gp = (uint8_t*)gate_exps->data + (size_t)e * g_bytes;
+                void* up = (uint8_t*)up_exps->data   + (size_t)e * u_bytes;
+                quant_gemv(gp, gate_exps->type, buf.norm_out, moe_gate[g], H, mI, &gpu_qi[g], stream);
+                quant_gemv(up, up_exps->type,   buf.norm_out, moe_up[g],   H, mI, &gpu_qi[g], stream);
+                qmoe_clamp_fp16<<<(mI + 255) / 256, 256, 0, stream>>>(moe_gate[g], mI);
+                qmoe_clamp_fp16<<<(mI + 255) / 256, 256, 0, stream>>>(moe_up[g], mI);
+                silu_mul_kernel<<<(mI + 255) / 256, 256, 0, stream>>>(moe_gate[g], moe_up[g], mI);
+                gpu_qi_moe[g].quantize(moe_gate[g], mI, stream);
+                void* dp = (uint8_t*)down_exps->data + (size_t)e * d_bytes;
+                quant_gemv(dp, down_exps->type, moe_gate[g], moe_down[g], mI, H, &gpu_qi_moe[g], stream);
+                qmoe_clamp_fp16<<<(H + 255) / 256, 256, 0, stream>>>(moe_down[g], H);
+                qmoe_acc_f32<<<(H + 255) / 256, 256, 0, stream>>>(moe_acc[g], moe_down[g], w[t_], H);
+            }
         }
 
         // Shared expert (always active; optionally sigmoid-gated). qwen3_5_moe

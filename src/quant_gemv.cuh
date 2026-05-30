@@ -313,6 +313,55 @@ __global__ void gemv_q8_0_q8(
     if(l==0)sm[w2]=thread_sum; __syncthreads();
     if(w2==0){float v=(l<nw)?sm[l]:0.0f; for(int o=16;o>0;o>>=1)v+=__shfl_xor_sync(0xffffffff,v,o); if(l==0)output[row]=__float2half(v);}
 }
+
+// GROUPED Q8_0 expert GEMV for MoE. One launch processes all G selected experts
+// instead of G separate gemv_q8_0_q8 launches — collapses the per-token MoE
+// expert loop's ~24 GEMV launches/layer into 3, killing launch overhead (the
+// dominant MoE-decode cost on launch-bound CMP cards; the 3B-active compute is
+// trivial). Grid: (N rows, G experts). blockIdx.y selects the expert via
+// expert_ids[]; the weight base is expert_base + expert_ids[e]*expert_stride.
+// `x_stride_blocks` lets the input differ per expert (down-proj: each expert
+// consumes its own silu(gate)*up intermediate) — pass 0 for a shared input
+// (gate/up-proj read the same norm_out). Output is [G, N] (e*N + row).
+__global__ void gemv_q8_0_q8_experts(
+    const void* __restrict__ expert_base,
+    const size_t expert_stride,           // bytes between consecutive experts
+    const int* __restrict__ expert_ids,   // [G]
+    const block_q8_1* __restrict__ x_q8,
+    const int x_stride_blocks,            // per-expert input stride (0 = shared)
+    half* __restrict__ output,            // [G, N]
+    const int K, const int N
+) {
+    const int e   = blockIdx.y;
+    const int row = blockIdx.x;
+    if (row >= N) return;
+    const int bpr = K / 32;
+    const block_q8_0_aligned* w_row =
+        (const block_q8_0_aligned*)((const uint8_t*)expert_base
+            + (size_t)expert_ids[e] * expert_stride)
+        + (size_t)row * bpr;
+    const block_q8_1* x_row = x_q8 + (size_t)e * x_stride_blocks;
+
+    float thread_sum = 0.0f;
+    for (int b = threadIdx.x; b < bpr; b += blockDim.x) {
+        const block_q8_0_aligned* wb = &w_row[b];
+        const block_q8_1* xb = &x_row[b];
+        float d_w = __half2float(wb->d);
+        float d_x = __half2float(xb->ds.x);
+        const int* wp32  = (const int*)wb->qs;
+        const int* x_qs  = (const int*)xb->qs;
+        int isum = 0;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) isum = __dp4a(wp32[j], x_qs[j], isum);
+        thread_sum += d_w * d_x * (float)isum;
+    }
+    for (int off=16;off>0;off>>=1) thread_sum+=__shfl_xor_sync(0xffffffff,thread_sum,off);
+    __shared__ float sm[8]; int w2=threadIdx.x>>5,l=threadIdx.x&31,nw=blockDim.x>>5;
+    if(l==0)sm[w2]=thread_sum; __syncthreads();
+    if(w2==0){float v=(l<nw)?sm[l]:0.0f; for(int o=16;o>0;o>>=1)v+=__shfl_xor_sync(0xffffffff,v,o);
+              if(l==0)output[(size_t)e*N+row]=__float2half(v);}
+}
+
 // N=2 BATCHED Q8_0 weight × Q8_1 input GEMV.
 // Same as gemv_q8_0_q8 but processes two independent input vectors that share
 // the same weight matrix. The hot loop loads each weight word ONCE and runs
