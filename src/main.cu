@@ -1049,7 +1049,16 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     // automatically when spec_enabled is true to avoid running MTP twice
     // per iter — the spec branch already runs its own draft MTP.
     //
-    spec_enabled = (mtp_loaded && getenv("MTP_SPEC_OFF") == nullptr);
+    // MoE (qwen3_5_moe): MTP spec is correct (MoE-aware draft + n2/n3 verify),
+    // but it's a net SLOWDOWN on these compute-bound cards. Unlike a dense MLP
+    // — where the verify's 2nd token reuses the same weights and is nearly free
+    // (forward_mlp_n2 batches the weight load) — MoE routes each token to a
+    // different top-8 expert set, so the verify pays full expert GEMV cost for
+    // the speculative 2nd token, and ~60% of that is wasted on reject. Measured
+    // ~27 t/s plain vs ~22 t/s spec. Default OFF for MoE; MTP_SPEC_ON=1 forces it
+    // on (correct, just slower). Dense models keep spec on by default.
+    bool moe_spec_default_off = model.cfg.is_moe && getenv("MTP_SPEC_ON") == nullptr;
+    spec_enabled = (mtp_loaded && getenv("MTP_SPEC_OFF") == nullptr && !moe_spec_default_off);
     spec_k2_enabled   = (spec_enabled && getenv("MTP_K2")   != nullptr && getenv("MTP_TREE") == nullptr);
     // Tree spec verify (forward_*_tree) has no MoE FFN routing yet; MoE models
     // use the n2/n3 verify paths (which do route to forward_moe). Disable tree
