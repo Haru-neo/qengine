@@ -207,6 +207,89 @@ __global__ void qmoe_sigmoid_scalar(float* __restrict__ x) {
     if (threadIdx.x == 0 && blockIdx.x == 0) x[0] = 1.0f / (1.0f + expf(-x[0]));
 }
 
+// In-place sigmoid over a vector (per-token shared-expert gates).
+__global__ void qmoe_sigmoid_vec(float* __restrict__ x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = 1.0f / (1.0f + expf(-x[i]));
+}
+
+__global__ void qmoe_fill_f32(float* __restrict__ x, float v, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = v;
+}
+
+// ── Batched (chunk-prefill) MoE helpers ───────────────────────────────────
+// Batched F32 router: logits[token, expert] for all N tokens in one launch.
+// Grid (E, N), 32 threads/block reducing over K. Input is per-token half norm.
+__global__ void qmoe_router_gemv_chunk_f32(const float* __restrict__ weight,
+                                           const half* __restrict__ input,
+                                           float* __restrict__ output,
+                                           int K, int E, int N) {
+    int e = blockIdx.x, token = blockIdx.y;
+    if (e >= E || token >= N) return;
+    const float* w = weight + (size_t)e * K;
+    const half*  x = input  + (size_t)token * K;
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < K; i += blockDim.x) sum += w[i] * __half2float(x[i]);
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, off);
+    if (threadIdx.x == 0) output[(size_t)token * E + e] = sum;
+}
+
+// Per-token top-k + softmax for a chunk: grid.x = token. Same algorithm as
+// qmoe_topk_softmax, one block per token.
+__global__ void qmoe_topk_softmax_chunk(const float* __restrict__ logits, int E, int topk,
+                                        int* __restrict__ out_ids, float* __restrict__ out_w,
+                                        int N) {
+    int token = blockIdx.x;
+    if (token >= N) return;
+    const float* lg = logits + (size_t)token * E;
+    extern __shared__ float s_logits[];
+    __shared__ float rv[256];
+    __shared__ int   ri[256];
+    __shared__ int   sel_id[16];
+    __shared__ float sel_val[16];
+    int tid = threadIdx.x;
+    for (int i = tid; i < E; i += blockDim.x) s_logits[i] = lg[i];
+    __syncthreads();
+    for (int k = 0; k < topk; k++) {
+        float bv = -1e30f; int bi = -1;
+        for (int i = tid; i < E; i += blockDim.x) { float v = s_logits[i]; if (v > bv) { bv = v; bi = i; } }
+        rv[tid] = bv; ri[tid] = bi; __syncthreads();
+        for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+            if (tid < off && rv[tid + off] > rv[tid]) { rv[tid] = rv[tid + off]; ri[tid] = ri[tid + off]; }
+            __syncthreads();
+        }
+        if (tid == 0) { sel_id[k] = ri[0]; sel_val[k] = rv[0]; s_logits[ri[0]] = -1e30f; }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        float maxl = sel_val[0], sum = 0.0f;
+        for (int k = 0; k < topk; k++) { sel_val[k] = expf(sel_val[k] - maxl); sum += sel_val[k]; }
+        int* oid = out_ids + (size_t)token * topk;
+        float* ow = out_w + (size_t)token * topk;
+        for (int k = 0; k < topk; k++) { ow[k] = sel_val[k] / sum; oid[k] = sel_id[k]; }
+    }
+}
+
+// Scatter-add the flat per-assignment expert outputs back into the chunk hidden:
+// hidden[token, h] += sum_k weight[token*topk+k] * clamp(down[(token*topk+k), h]).
+// Grid ((H+255)/256, N); each (token,h) sums its own topk assignments (no atomics).
+__global__ void qmoe_scatter_acc_chunk(float* __restrict__ hidden, const half* __restrict__ down,
+                                       const float* __restrict__ weights,
+                                       int topk, int H, int N) {
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    int token = blockIdx.y;
+    if (h >= H || token >= N) return;
+    float s = 0.0f;
+    for (int k = 0; k < topk; k++) {
+        int a = token * topk + k;
+        float v = __half2float(down[(size_t)a * H + h]);
+        if (v != v || v > 65504.f) v = 65504.f; else if (v < -65504.f) v = -65504.f;
+        s += weights[a] * v;
+    }
+    hidden[(size_t)token * H + h] += s;
+}
+
 // acc[i] += (*w) * clamp(in[i]); weight read from device (no host round-trip).
 __global__ void qmoe_acc_f32_dev(float* __restrict__ acc, const half* __restrict__ in,
                                  const float* __restrict__ w, int n) {
@@ -255,6 +338,16 @@ struct QwenModel {
     int*   moe_ids_host[4] = {}; // pinned [topk]
     float* moe_w_host[4] = {};   // pinned [topk]
     QuantInput gpu_qi_moe_g[4];  // quantizer for [topk * moe_intermediate]
+    // Batched chunk-prefill MoE scratch (sized CHUNK_SIZE × topk × dims).
+    half*  moe_norm_c[4]  = {};  // [CHUNK_SIZE * H] batched norm output
+    float* moe_logits_c[4]= {};  // [CHUNK_SIZE * num_experts]
+    int*   moe_ids_c[4]   = {};  // [CHUNK_SIZE * topk]
+    float* moe_w_c[4]     = {};  // [CHUNK_SIZE * topk]
+    half*  moe_gate_cg[4] = {};  // [CHUNK_SIZE * topk * moe_intermediate]
+    half*  moe_up_cg[4]   = {};  // [CHUNK_SIZE * topk * moe_intermediate]
+    half*  moe_down_cg[4] = {};  // [CHUNK_SIZE * topk * hidden]
+    QuantInput gpu_qi_c[4];      // chunk norm quantizer
+    QuantInput gpu_qi_cg[4];     // chunk intermediate quantizer
     bool v2_separate_qkv = false;
     int  attn_num_q_heads = 0;
     int  attn_num_kv_heads = 0;
@@ -827,6 +920,15 @@ struct QwenModel {
         cudaMalloc(&moe_w_dev[g],   (size_t)topk * sizeof(float));
         cudaMallocHost(&moe_ids_host[g], (size_t)topk * sizeof(int));
         cudaMallocHost(&moe_w_host[g],   (size_t)topk * sizeof(float));
+        // Batched chunk-prefill scratch (CHUNK_SIZE tokens × topk experts).
+        size_t A = (size_t)CHUNK_SIZE * topk;
+        cudaMalloc(&moe_norm_c[g],   (size_t)CHUNK_SIZE * H * sizeof(half));
+        cudaMalloc(&moe_logits_c[g], (size_t)CHUNK_SIZE * E * sizeof(float));
+        cudaMalloc(&moe_ids_c[g],    A * sizeof(int));
+        cudaMalloc(&moe_w_c[g],      A * sizeof(float));
+        cudaMalloc(&moe_gate_cg[g],  A * mI * sizeof(half));
+        cudaMalloc(&moe_up_cg[g],    A * mI * sizeof(half));
+        cudaMalloc(&moe_down_cg[g],  A * H  * sizeof(half));
     }
 
     // Single-token MoE FFN over `hidden` [H] (fp32, in/out via residual add).
@@ -1000,14 +1102,109 @@ struct QwenModel {
         moe_token_core(layer, hidden, g, stream);
     }
 
-    // Chunked-prefill MoE: token-major [n_tokens × H]. First version loops
-    // tokens through the single-token core (correct; per-token routing). Each
-    // token needs a host sync for its top-k, so prefill is slower than the
-    // dense chunked MLP — optimize with a batched router + expert binning later.
+    // Batched chunk-prefill MoE: all N tokens through the router/top-k/experts
+    // in a handful of launches instead of N × (~15 launches/token). The routed
+    // experts run as a FLAT assignment list (N*topk entries) through
+    // gemv_q8_0_q8_moe_chunk (one launch per gate/up/down); the shared expert
+    // batches over N tokens via quant_gemv_chunk. No host sync. Requires F32
+    // router + Q8_0 experts; caller (forward_moe_chunk) falls back to the loop
+    // otherwise. Returns true if it handled the layer.
+    bool forward_moe_chunk_batched(int layer, float* hidden_chunk, int N, int g, cudaStream_t stream) {
+        int H = cfg.hidden_size, E = cfg.num_experts;
+        int topk = cfg.num_experts_per_tok, mI = cfg.moe_intermediate_size;
+        auto* router_w  = t(blk(layer, "ffn_gate_inp.weight"));
+        auto* gate_exps = t(blk(layer, "ffn_gate_exps.weight"));
+        auto* up_exps   = t(blk(layer, "ffn_up_exps.weight"));
+        auto* down_exps = t(blk(layer, "ffn_down_exps.weight"));
+        if (!router_w || router_w->type != GGML_TYPE_F32 || !gate_exps || !up_exps || !down_exps
+            || gate_exps->type != GGML_TYPE_Q8_0 || up_exps->type != GGML_TYPE_Q8_0
+            || down_exps->type != GGML_TYPE_Q8_0)
+            return false;
+        if (N > CHUNK_SIZE) return false;
+
+        // 1. Batched RMSNorm + quantize (token-major).
+        auto* norm_w = t(blk(layer, "post_attention_norm.weight"));
+        if (!norm_w) norm_w = t(blk(layer, "ffn_norm.weight"));
+        if (!norm_w) return false;
+        if (norm_w->type == GGML_TYPE_F32)
+            rms_norm_f32in_f32w(moe_norm_c[g], hidden_chunk, (float*)norm_w->data, N, H, cfg.rms_norm_eps, stream);
+        else
+            rms_norm_f32in(moe_norm_c[g], hidden_chunk, (half*)norm_w->data, N, H, cfg.rms_norm_eps, stream);
+        gpu_qi_c[g].quantize_chunk(moe_norm_c[g], H, N, stream);
+
+        // 2. Batched router → logits[N,E]; per-token GPU top-k → ids/weights.
+        qmoe_router_gemv_chunk_f32<<<dim3(E, N), 32, 0, stream>>>(
+            (float*)router_w->data, moe_norm_c[g], moe_logits_c[g], H, E, N);
+        qmoe_topk_softmax_chunk<<<N, 256, E * sizeof(float), stream>>>(
+            moe_logits_c[g], E, topk, moe_ids_c[g], moe_w_c[g], N);
+
+        // 3. Routed experts as one flat assignment list (A = N*topk).
+        int A = N * topk;
+        size_t g_bytes = (size_t)mI * H / 32 * 36;
+        size_t d_bytes = (size_t)H  * mI / 32 * 36;
+        int thr = 128;
+        gemv_q8_0_q8_moe_chunk<<<dim3(mI, A), thr, 0, stream>>>(
+            gate_exps->data, g_bytes, moe_ids_c[g], gpu_qi_c[g].q8_buf, H / 32, topk,
+            moe_gate_cg[g], H, mI);
+        gemv_q8_0_q8_moe_chunk<<<dim3(mI, A), thr, 0, stream>>>(
+            up_exps->data, g_bytes, moe_ids_c[g], gpu_qi_c[g].q8_buf, H / 32, topk,
+            moe_up_cg[g], H, mI);
+        int AmI = A * mI;
+        qmoe_clamp_fp16<<<(AmI + 255) / 256, 256, 0, stream>>>(moe_gate_cg[g], AmI);
+        qmoe_clamp_fp16<<<(AmI + 255) / 256, 256, 0, stream>>>(moe_up_cg[g], AmI);
+        silu_mul_kernel<<<(AmI + 255) / 256, 256, 0, stream>>>(moe_gate_cg[g], moe_up_cg[g], AmI);
+        gpu_qi_cg[g].quantize_chunk(moe_gate_cg[g], mI, A, stream);
+        gemv_q8_0_q8_moe_chunk<<<dim3(H, A), thr, 0, stream>>>(
+            down_exps->data, d_bytes, moe_ids_c[g], gpu_qi_cg[g].q8_buf, mI / 32, 0,
+            moe_down_cg[g], mI, H);
+        // 4. Scatter the routed sum back into the hidden chunk (residual add).
+        qmoe_scatter_acc_chunk<<<dim3((H + 255) / 256, N), 256, 0, stream>>>(
+            hidden_chunk, moe_down_cg[g], moe_w_c[g], topk, H, N);
+
+        // 5. Shared expert, batched over N tokens (sigmoid-gated when F32 gate).
+        if (cfg.shared_expert_intermediate_size > 0) {
+            int sI = cfg.shared_expert_intermediate_size;
+            auto* sg = t(blk(layer, "ffn_gate_shexp.weight"));
+            auto* su = t(blk(layer, "ffn_up_shexp.weight"));
+            auto* sd = t(blk(layer, "ffn_down_shexp.weight"));
+            if (sg && su && sd) {
+                auto* sgi = t(blk(layer, "ffn_gate_inp_shexp.weight"));
+                bool gated = sgi && sgi->type == GGML_TYPE_F32;
+                // gate[N]: sigmoid(router(sgi)) when gated, else 1.0. Stored in
+                // moe_w_c (size A=N*topk ≥ N, reused after the routed scatter).
+                if (gated) {
+                    qmoe_router_gemv_chunk_f32<<<dim3(1, N), 32, 0, stream>>>(
+                        (float*)sgi->data, moe_norm_c[g], moe_w_c[g], H, 1, N);
+                    qmoe_sigmoid_vec<<<(N + 255) / 256, 256, 0, stream>>>(moe_w_c[g], N);
+                } else {
+                    qmoe_fill_f32<<<(N + 255) / 256, 256, 0, stream>>>(moe_w_c[g], 1.0f, N);
+                }
+                quant_gemv_chunk(sg->data, sg->type, gpu_qi_c[g].q8_buf, moe_gate_cg[g], H, sI, N, stream);
+                quant_gemv_chunk(su->data, su->type, gpu_qi_c[g].q8_buf, moe_up_cg[g],   H, sI, N, stream);
+                int NsI = N * sI;
+                qmoe_clamp_fp16<<<(NsI + 255) / 256, 256, 0, stream>>>(moe_gate_cg[g], NsI);
+                qmoe_clamp_fp16<<<(NsI + 255) / 256, 256, 0, stream>>>(moe_up_cg[g], NsI);
+                silu_mul_kernel<<<(NsI + 255) / 256, 256, 0, stream>>>(moe_gate_cg[g], moe_up_cg[g], NsI);
+                gpu_qi_cg[g].quantize_chunk(moe_gate_cg[g], sI, N, stream);
+                quant_gemv_chunk(sd->data, sd->type, gpu_qi_cg[g].q8_buf, moe_down_cg[g], sI, H, N, stream);
+                // topk=1 scatter: each token adds gate[token]*shared_down[token].
+                qmoe_scatter_acc_chunk<<<dim3((H + 255) / 256, N), 256, 0, stream>>>(
+                    hidden_chunk, moe_down_cg[g], moe_w_c[g], 1, H, N);
+            }
+        }
+        return true;
+    }
+
+    // Chunked-prefill MoE: token-major [n_tokens × H]. Batched path (no host
+    // sync, ~constant launches) with a per-token fallback for non-Q8_0 experts /
+    // non-F32 router / MOE_CHUNK_BATCHED_OFF.
     void forward_moe_chunk(int layer, float* hidden_chunk, int n_tokens, cudaStream_t stream) {
         int g = gpu->layer_gpu[layer];
         ensure_moe_buffers(g);
         int H = cfg.hidden_size;
+        static const bool batched = getenv("MOE_CHUNK_BATCHED_OFF") == nullptr;
+        if (batched && forward_moe_chunk_batched(layer, hidden_chunk, n_tokens, g, stream))
+            return;
         for (int t_ = 0; t_ < n_tokens; t_++)
             moe_token_core(layer, hidden_chunk + (size_t)t_ * H, g, stream);
     }
