@@ -157,6 +157,66 @@ __global__ void qmoe_weighted_acc_experts(float* __restrict__ acc,
     acc[h] += s;
 }
 
+__global__ void qmoe_f16_to_f32(const half* __restrict__ in, float* __restrict__ out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __half2float(in[i]);
+}
+
+// GPU-side top-k + normalized softmax over E router logits, writing the selected
+// expert ids and softmax weights straight to device buffers — eliminates the
+// per-layer host round-trip (D2H copy + CPU partial_sort + sync) that otherwise
+// runs once per MoE layer per token (~40 syncs/token, a major decode cost on
+// PCIe Gen1 CMP cards). Single block: `topk` iterative block-argmax passes over
+// E logits (E≤1024), masking each winner, then softmax over the topk values.
+// Launch <<<1, 256, E*sizeof(float)>>>. blockDim must be a power of two.
+__global__ void qmoe_topk_softmax(const float* __restrict__ logits, int E, int topk,
+                                  int* __restrict__ out_ids, float* __restrict__ out_w) {
+    extern __shared__ float s_logits[];     // [E] working copy
+    __shared__ float rv[256];
+    __shared__ int   ri[256];
+    __shared__ int   sel_id[16];
+    __shared__ float sel_val[16];
+    int tid = threadIdx.x;
+    for (int i = tid; i < E; i += blockDim.x) s_logits[i] = logits[i];
+    __syncthreads();
+
+    for (int k = 0; k < topk; k++) {
+        float bv = -1e30f; int bi = -1;
+        for (int i = tid; i < E; i += blockDim.x) {
+            float v = s_logits[i];
+            if (v > bv) { bv = v; bi = i; }
+        }
+        rv[tid] = bv; ri[tid] = bi;
+        __syncthreads();
+        for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+            if (tid < off && rv[tid + off] > rv[tid]) { rv[tid] = rv[tid + off]; ri[tid] = ri[tid + off]; }
+            __syncthreads();
+        }
+        if (tid == 0) { sel_id[k] = ri[0]; sel_val[k] = rv[0]; s_logits[ri[0]] = -1e30f; }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        float maxl = sel_val[0], sum = 0.0f;   // sel_val[0] is the global max
+        for (int k = 0; k < topk; k++) { sel_val[k] = expf(sel_val[k] - maxl); sum += sel_val[k]; }
+        for (int k = 0; k < topk; k++) { out_w[k] = sel_val[k] / sum; out_ids[k] = sel_id[k]; }
+    }
+}
+
+// In-place sigmoid of a single device scalar (shared-expert gate).
+__global__ void qmoe_sigmoid_scalar(float* __restrict__ x) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) x[0] = 1.0f / (1.0f + expf(-x[0]));
+}
+
+// acc[i] += (*w) * clamp(in[i]); weight read from device (no host round-trip).
+__global__ void qmoe_acc_f32_dev(float* __restrict__ acc, const half* __restrict__ in,
+                                 const float* __restrict__ w, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = __half2float(in[i]);
+    if (v != v || v > 65504.f) v = 65504.f; else if (v < -65504.f) v = -65504.f;
+    acc[i] += w[0] * v;
+}
+
 // Clamp fp16 to finite range (fp16 max 65504); maps nan→max. Expert GEMV
 // outputs can overflow fp16 (256 experts, large distilled weights) → inf →
 // silu/accumulate → nan. Mirrors gemma_model.cuh's clamp_fp16_kernel.
@@ -789,34 +849,18 @@ struct QwenModel {
             rms_norm_f32in(buf.norm_out, hidden, (half*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
         gpu_qi[g].quantize(buf.norm_out, H, stream);
 
-        // Router logits → host
+        // Router logits → device float (moe_logits[g]). top-k is done on-device
+        // in the grouped path (no host round-trip); the legacy fallback copies
+        // these to host below.
         auto* router_w = t(blk(layer, "ffn_gate_inp.weight"));
-        std::vector<float> logits(E);
         if (router_w->type == GGML_TYPE_F32) {
             qmoe_router_gemv_f32<<<E, 32, 0, stream>>>((float*)router_w->data,
                                                        buf.norm_out, moe_logits[g], H, E);
-            cudaMemcpyAsync(logits.data(), moe_logits[g], E * sizeof(float),
-                            cudaMemcpyDeviceToHost, stream);
-            cudaStreamSynchronize(stream);
         } else {
             quant_gemv(router_w->data, router_w->type, buf.norm_out, buf.mlp_down,
                        H, E, &gpu_qi[g], stream);
-            std::vector<half> hl(E);
-            cudaMemcpyAsync(hl.data(), buf.mlp_down, E * sizeof(half),
-                            cudaMemcpyDeviceToHost, stream);
-            cudaStreamSynchronize(stream);
-            for (int i = 0; i < E; i++) logits[i] = __half2float(hl[i]);
+            qmoe_f16_to_f32<<<(E + 255) / 256, 256, 0, stream>>>(buf.mlp_down, moe_logits[g], E);
         }
-
-        // Top-k + softmax over the selected logits (norm_topk_prob).
-        std::vector<int> order(E);
-        for (int i = 0; i < E; i++) order[i] = i;
-        std::partial_sort(order.begin(), order.begin() + topk, order.end(),
-                          [&](int a, int b) { return logits[a] > logits[b]; });
-        float maxl = logits[order[0]], sum = 0.f;
-        std::vector<float> w(topk);
-        for (int i = 0; i < topk; i++) { w[i] = expf(logits[order[i]] - maxl); sum += w[i]; }
-        for (int i = 0; i < topk; i++) w[i] /= sum;
 
         // Expert tensors (separate gate/up; fused gate_up handled as fallback).
         auto* gate_exps = t(blk(layer, "ffn_gate_exps.weight"));
@@ -860,14 +904,9 @@ struct QwenModel {
                    && up_exps->type   == GGML_TYPE_Q8_0
                    && down_exps->type == GGML_TYPE_Q8_0;
         if (moe_grouped && all_q8) {
-            for (int i = 0; i < topk; i++) {
-                moe_ids_host[g][i] = order[i];
-                moe_w_host[g][i]   = w[i];
-            }
-            cudaMemcpyAsync(moe_ids_dev[g], moe_ids_host[g], topk * sizeof(int),
-                            cudaMemcpyHostToDevice, stream);
-            cudaMemcpyAsync(moe_w_dev[g], moe_w_host[g], topk * sizeof(float),
-                            cudaMemcpyHostToDevice, stream);
+            // On-device top-k + softmax → moe_ids_dev/moe_w_dev. No host sync.
+            qmoe_topk_softmax<<<1, 256, E * sizeof(float), stream>>>(
+                moe_logits[g], E, topk, moe_ids_dev[g], moe_w_dev[g]);
             int thr = 128;
             // gate + up share the quantized norm_out (x_stride 0); output [topk, mI]
             gemv_q8_0_q8_experts<<<dim3(mI, topk), thr, 0, stream>>>(
@@ -889,6 +928,19 @@ struct QwenModel {
             qmoe_weighted_acc_experts<<<(H + 255) / 256, 256, 0, stream>>>(
                 moe_acc[g], moe_down_g[g], moe_w_dev[g], topk, H);
         } else {
+            // Legacy per-expert loop: host top-k (copies device logits back).
+            std::vector<float> logits(E);
+            cudaMemcpyAsync(logits.data(), moe_logits[g], E * sizeof(float),
+                            cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+            std::vector<int> order(E);
+            for (int i = 0; i < E; i++) order[i] = i;
+            std::partial_sort(order.begin(), order.begin() + topk, order.end(),
+                              [&](int a, int b) { return logits[a] > logits[b]; });
+            float maxl = logits[order[0]], sum = 0.f;
+            std::vector<float> w(topk);
+            for (int i = 0; i < topk; i++) { w[i] = expf(logits[order[i]] - maxl); sum += w[i]; }
+            for (int i = 0; i < topk; i++) w[i] /= sum;
             for (int t_ = 0; t_ < topk; t_++) {
                 int e = order[t_];
                 void* gp = (uint8_t*)gate_exps->data + (size_t)e * g_bytes;
@@ -914,17 +966,14 @@ struct QwenModel {
             auto* su = t(blk(layer, "ffn_up_shexp.weight"));
             auto* sd = t(blk(layer, "ffn_down_shexp.weight"));
             if (sg && su && sd) {
-                float sgate = 1.0f;
-                if (auto* sgi = t(blk(layer, "ffn_gate_inp_shexp.weight"))) {
-                    // single-logit gate → sigmoid scalar
-                    if (sgi->type == GGML_TYPE_F32) {
-                        qmoe_router_gemv_f32<<<1, 32, 0, stream>>>((float*)sgi->data,
-                                                                  buf.norm_out, moe_logits[g], H, 1);
-                        float l; cudaMemcpyAsync(&l, moe_logits[g], sizeof(float),
-                                                 cudaMemcpyDeviceToHost, stream);
-                        cudaStreamSynchronize(stream);
-                        sgate = 1.0f / (1.0f + expf(-l));
-                    }
+                // Sigmoid gate computed on-device (no host sync). moe_logits[g][0]
+                // holds the gated weight; ungated (non-F32 gate / absent) → 1.0.
+                auto* sgi = t(blk(layer, "ffn_gate_inp_shexp.weight"));
+                bool gated = sgi && sgi->type == GGML_TYPE_F32;
+                if (gated) {
+                    qmoe_router_gemv_f32<<<1, 32, 0, stream>>>((float*)sgi->data,
+                                                              buf.norm_out, moe_logits[g], H, 1);
+                    qmoe_sigmoid_scalar<<<1, 1, 0, stream>>>(moe_logits[g]);
                 }
                 quant_gemv(sg->data, sg->type, buf.norm_out, moe_gate[g], H, sI, &gpu_qi[g], stream);
                 quant_gemv(su->data, su->type, buf.norm_out, moe_up[g],   H, sI, &gpu_qi[g], stream);
@@ -934,7 +983,10 @@ struct QwenModel {
                 gpu_qi_moe[g].quantize(moe_gate[g], sI, stream);
                 quant_gemv(sd->data, sd->type, moe_gate[g], moe_down[g], sI, H, &gpu_qi_moe[g], stream);
                 qmoe_clamp_fp16<<<(H + 255) / 256, 256, 0, stream>>>(moe_down[g], H);
-                qmoe_acc_f32<<<(H + 255) / 256, 256, 0, stream>>>(moe_acc[g], moe_down[g], sgate, H);
+                if (gated)
+                    qmoe_acc_f32_dev<<<(H + 255) / 256, 256, 0, stream>>>(moe_acc[g], moe_down[g], moe_logits[g], H);
+                else
+                    qmoe_acc_f32<<<(H + 255) / 256, 256, 0, stream>>>(moe_acc[g], moe_down[g], 1.0f, H);
             }
         }
 
