@@ -139,6 +139,18 @@ __global__ void qmoe_f32_to_f16(const float* __restrict__ in, half* __restrict__
     if (i < n) out[i] = __float2half(in[i]);
 }
 
+// Clamp fp16 to finite range (fp16 max 65504); maps nan→max. Expert GEMV
+// outputs can overflow fp16 (256 experts, large distilled weights) → inf →
+// silu/accumulate → nan. Mirrors gemma_model.cuh's clamp_fp16_kernel.
+__global__ void qmoe_clamp_fp16(half* __restrict__ x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = __half2float(x[i]);
+        if (v != v || v > 65504.f) x[i] = __float2half(65504.f);
+        else if (v < -65504.f)     x[i] = __float2half(-65504.f);
+    }
+}
+
 struct QwenModel {
     QwenConfig cfg;
     GPUModel* gpu;
@@ -715,7 +727,11 @@ struct QwenModel {
         int H = cfg.hidden_size, E = cfg.num_experts;
         int topk = cfg.num_experts_per_tok, mI = cfg.moe_intermediate_size;
 
-        auto* norm_w = t(blk(layer, "ffn_norm.weight"));
+        // Pre-FFN norm: hybrid models name it post_attention_norm; fall back
+        // to ffn_norm (dense Qwen3 naming). Mirror forward_mlp.
+        auto* norm_w = t(blk(layer, "post_attention_norm.weight"));
+        if (!norm_w) norm_w = t(blk(layer, "ffn_norm.weight"));
+        if (!norm_w) { printf("[MoE] L%d: missing pre-FFN norm weight!\n", layer); return; }
         if (norm_w->type == GGML_TYPE_F32)
             rms_norm_f32in_f32w(buf.norm_out, hidden, (float*)norm_w->data, 1, H, cfg.rms_norm_eps, stream);
         else
@@ -769,9 +785,17 @@ struct QwenModel {
             }
             return;
         }
-        size_t g_bytes = (size_t)mI * ggml_row_bytes(gate_exps->type, H);
-        size_t u_bytes = (size_t)mI * ggml_row_bytes(up_exps->type, H);
-        size_t d_bytes = (size_t)H  * ggml_row_bytes(down_exps->type, mI);
+        // Per-expert byte stride. CRITICAL: gpu_loader repacks Q8_0 to
+        // block_q8_0_aligned (36 B/block, not the GGUF 34 B), so ggml_row_bytes
+        // (34-based) gives the wrong stride and reads misaligned garbage → NaN.
+        // Use the GPU-resident block size for Q8_0; other quants aren't repacked.
+        auto expert_bytes = [](ggml_type type, size_t n_elems) -> size_t {
+            if (type == GGML_TYPE_Q8_0) return n_elems / 32 * 36;  // aligned on GPU
+            return ggml_row_bytes(type, (int)n_elems);
+        };
+        size_t g_bytes = expert_bytes(gate_exps->type, (size_t)mI * H);
+        size_t u_bytes = expert_bytes(up_exps->type,   (size_t)mI * H);
+        size_t d_bytes = expert_bytes(down_exps->type, (size_t)H  * mI);
 
         qmoe_zero_f32<<<(H + 255) / 256, 256, 0, stream>>>(moe_acc[g], H);
         for (int t_ = 0; t_ < topk; t_++) {
@@ -780,10 +804,31 @@ struct QwenModel {
             void* up = (uint8_t*)up_exps->data   + (size_t)e * u_bytes;
             quant_gemv(gp, gate_exps->type, buf.norm_out, moe_gate[g], H, mI, &gpu_qi[g], stream);
             quant_gemv(up, up_exps->type,   buf.norm_out, moe_up[g],   H, mI, &gpu_qi[g], stream);
+            {
+                static const bool md = getenv("MOE_DBG") != nullptr;
+                static int seen = 0;
+                if (md && layer == 0 && t_ == 0 && seen < 1) {
+                    seen++;
+                    cudaSetDevice(g); cudaStreamSynchronize(stream);
+                    auto pk = [&](const char* tag, half* p, int n){
+                        std::vector<half> v(std::min(n,6)); cudaMemcpy(v.data(),p,v.size()*sizeof(half),cudaMemcpyDeviceToHost);
+                        std::vector<half> all(n); cudaMemcpy(all.data(),p,n*sizeof(half),cudaMemcpyDeviceToHost);
+                        double s=0; float mx=0; for(int i=0;i<n;i++){float a=fabs((float)__half2float(all[i])); s+=a; if(a>mx)mx=a;}
+                        fprintf(stderr,"[MOE_DBG2 %s e=%d] absum=%.2f max=%.2f head:",tag,e,s,mx);
+                        for(auto h:v) fprintf(stderr," %.3f",__half2float(h)); fprintf(stderr,"\n");
+                    };
+                    pk("gate(pre-clamp)", moe_gate[g], mI);
+                    pk("up(pre-clamp)",   moe_up[g],   mI);
+                    fflush(stderr);
+                }
+            }
+            qmoe_clamp_fp16<<<(mI + 255) / 256, 256, 0, stream>>>(moe_gate[g], mI);
+            qmoe_clamp_fp16<<<(mI + 255) / 256, 256, 0, stream>>>(moe_up[g], mI);
             silu_mul_kernel<<<(mI + 255) / 256, 256, 0, stream>>>(moe_gate[g], moe_up[g], mI);
             gpu_qi_moe[g].quantize(moe_gate[g], mI, stream);
             void* dp = (uint8_t*)down_exps->data + (size_t)e * d_bytes;
             quant_gemv(dp, down_exps->type, moe_gate[g], moe_down[g], mI, H, &gpu_qi_moe[g], stream);
+            qmoe_clamp_fp16<<<(H + 255) / 256, 256, 0, stream>>>(moe_down[g], H);
             qmoe_acc_f32<<<(H + 255) / 256, 256, 0, stream>>>(moe_acc[g], moe_down[g], w[t_], H);
         }
 
@@ -809,15 +854,31 @@ struct QwenModel {
                 }
                 quant_gemv(sg->data, sg->type, buf.norm_out, moe_gate[g], H, sI, &gpu_qi[g], stream);
                 quant_gemv(su->data, su->type, buf.norm_out, moe_up[g],   H, sI, &gpu_qi[g], stream);
+                qmoe_clamp_fp16<<<(sI + 255) / 256, 256, 0, stream>>>(moe_gate[g], sI);
+                qmoe_clamp_fp16<<<(sI + 255) / 256, 256, 0, stream>>>(moe_up[g], sI);
                 silu_mul_kernel<<<(sI + 255) / 256, 256, 0, stream>>>(moe_gate[g], moe_up[g], sI);
                 gpu_qi_moe[g].quantize(moe_gate[g], sI, stream);
                 quant_gemv(sd->data, sd->type, moe_gate[g], moe_down[g], sI, H, &gpu_qi_moe[g], stream);
+                qmoe_clamp_fp16<<<(H + 255) / 256, 256, 0, stream>>>(moe_down[g], H);
                 qmoe_acc_f32<<<(H + 255) / 256, 256, 0, stream>>>(moe_acc[g], moe_down[g], sgate, H);
             }
         }
 
         qmoe_f32_to_f16<<<(H + 255) / 256, 256, 0, stream>>>(moe_acc[g], moe_down[g], H);
         add_kernel_f32<<<(H + 255) / 256, 256, 0, stream>>>(hidden, moe_down[g], H);
+
+        static const bool moe_dbg = getenv("MOE_DBG") != nullptr;
+        static int dbg_tok = -1;  // only trace one token to keep output readable
+        if (moe_dbg) {
+            // trace the first token we ever see, across all layers
+            cudaSetDevice(g); cudaStreamSynchronize(stream);
+            auto absum_f = [&](float* p, int n){ std::vector<float> v(n); cudaMemcpy(v.data(),p,n*sizeof(float),cudaMemcpyDeviceToHost); double s=0; bool nan=false; for(int i=0;i<n;i++){ if(v[i]!=v[i]) nan=true; s+=fabs((double)v[i]); } return std::make_pair(s, nan); };
+            auto [hs, hnan] = absum_f(hidden, H);
+            fprintf(stderr, "[MOE_DBG L%d %s] hidden_out_absum=%.1f%s acc_absum=%.1f\n",
+                    layer, is_attn_layer(layer)?"ATTN":"GDN ", hs, hnan?" NAN!":"",
+                    absum_f(moe_acc[g], H).first);
+            fflush(stderr);
+        }
     }
 
     void forward_moe(int layer, float* hidden, cudaStream_t stream) {
@@ -2063,7 +2124,14 @@ struct QwenModel {
             // per-expert intermediate from the stacked gate tensor (separate
             // gate/up). Fall back to fused gate_up (dims/2) then metadata.
             auto* gate_exps = t(blk(first_moe, "ffn_gate_exps.weight"));
-            if (gate_exps) {
+            if (gate_exps && gate_exps->n_dims >= 3) {
+                // 3D stacked experts [n_embd, n_ff_exp, n_expert] (llama.cpp
+                // qwen3moe). dims[1] IS the per-expert intermediate; dims[2] is
+                // the authoritative expert count.
+                cfg.moe_intermediate_size = gate_exps->dims[1];
+                cfg.num_experts = (int)gate_exps->dims[2];
+            } else if (gate_exps) {
+                // 2D flattened [n_expert*n_ff_exp, n_embd] (Gemma-style).
                 cfg.moe_intermediate_size = gate_exps->dims[1] / cfg.num_experts;
             } else if (auto* gu = t(blk(first_moe, "ffn_gate_up_exps.weight"))) {
                 cfg.moe_intermediate_size = (gu->dims[1] / cfg.num_experts) / 2;

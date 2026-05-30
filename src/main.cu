@@ -1003,13 +1003,26 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     MTPHead mtp;
     bool mtp_loaded = false;
     {
-        // Try inline GGUF MTP first (v2 models embed nextn in blk.N)
+        // Try inline GGUF MTP first (v2 models embed nextn in blk.N).
+        // The MTP head loader assumes a DENSE FFN (ffn_gate/up/down.weight) in
+        // the MTP layer. MoE models (qwen35moe) put expert tensors there
+        // (ffn_down_exps.weight) and no ffn_down.weight → the loader would
+        // null-deref. Skip MTP load when the dense FFN is absent; spec decoding
+        // is unavailable for the MoE MTP layer (the main forward excludes it
+        // anyway), and MTP_SPEC_OFF/normal decode is unaffected.
         if (model.mtp_layer_idx >= 0) {
-            mtp_loaded = mtp.load_from_gguf(
-                gpu_model, model.mtp_layer_idx,
-                model.cfg.hidden_size, V,
-                model.cfg.num_q_heads, model.cfg.num_kv_heads, model.cfg.head_dim,
-                model.cfg.intermediate_size, model.cfg.rope_dim, max_seq, model.cfg.rms_norm_eps);
+            std::string mtp_ffn = "blk." + std::to_string(model.mtp_layer_idx) + ".ffn_down.weight";
+            if (!gpu_model.get(mtp_ffn.c_str())) {
+                printf("[MTP] blk.%d has no dense ffn_down (MoE MTP layer) — "
+                       "skipping MTP head load; speculative decoding disabled\n",
+                       model.mtp_layer_idx);
+            } else {
+                mtp_loaded = mtp.load_from_gguf(
+                    gpu_model, model.mtp_layer_idx,
+                    model.cfg.hidden_size, V,
+                    model.cfg.num_q_heads, model.cfg.num_kv_heads, model.cfg.head_dim,
+                    model.cfg.intermediate_size, model.cfg.rope_dim, max_seq, model.cfg.rms_norm_eps);
+            }
         }
         // Fallback: external mtp_head_<hidden>.bin
         if (!mtp_loaded) {
@@ -1785,7 +1798,8 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     if (is_attn) g_attn += ms; else g_gdn += ms;
                 }
                 auto gm0 = prof_now();
-                model.forward_mlp(layer, h, 0);
+                if (model.layer_is_moe[layer]) model.forward_moe(layer, h, 0);
+                else                           model.forward_mlp(layer, h, 0);
                 if (do_gen_prof) g_mlp += prof_sync_ms(gm0, g);
 
                 // DFlash hidden capture (no-op unless dflash mode enabled).
@@ -1843,6 +1857,23 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 quant_gemv(out_w->data, out_w->type, norm_buf, logits_buf, H, V, &qi_logits);
                 if (do_gen_prof) g_logits += prof_sync_ms(gl0, last_gpu);
                 if (do_gen_prof) g_steps++;
+                {
+                    static const bool ld = getenv("LOGIT_DBG") != nullptr;
+                    static int n = 0;
+                    if (ld && n < 3) {
+                        n++;
+                        cudaSetDevice(last_gpu); cudaDeviceSynchronize();
+                        std::vector<half> hh(H); cudaMemcpy(hh.data(), gpu_hidden_half[last_gpu], H*sizeof(half), cudaMemcpyDeviceToHost);
+                        std::vector<half> nb(H); cudaMemcpy(nb.data(), norm_buf, H*sizeof(half), cudaMemcpyDeviceToHost);
+                        std::vector<half> lg(V); cudaMemcpy(lg.data(), logits_buf, V*sizeof(half), cudaMemcpyDeviceToHost);
+                        double hsum=0, nsum=0; for(int i=0;i<H;i++){hsum+=fabs((float)__half2float(hh[i])); nsum+=fabs((float)__half2float(nb[i]));}
+                        float lmax=-1e9; int amax=0; double lsum=0; int nan=0;
+                        for(int i=0;i<V;i++){ float v=__half2float(lg[i]); if(v!=v) nan++; lsum+=fabs((double)v); if(v>lmax){lmax=v;amax=i;} }
+                        fprintf(stderr,"[LOGIT_DBG] hid_absum=%.1f norm_absum=%.1f | logits: nan=%d absum=%.1f max=%.3f@%d  l[0]=%.3f l[1]=%.3f\n",
+                                hsum, nsum, nan, lsum, lmax, amax, __half2float(lg[0]), __half2float(lg[1]));
+                        fflush(stderr);
+                    }
+                }
 
                 std::vector<int> ctx = prompt_ids;
                 ctx.insert(ctx.end(), generated.begin(), generated.end());
@@ -2978,7 +3009,8 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 model.forward_gdn_step_batched(layer, h, N, slot_ids, 0);
             }
             // forward_mlp_chunk handles N rows directly (stateless across slots).
-            model.forward_mlp_chunk(layer, h, N, 0);
+            if (model.layer_is_moe[layer]) model.forward_moe_chunk(layer, h, N, 0);
+            else                           model.forward_mlp_chunk(layer, h, N, 0);
         }
 
         // 3. Final RMSNorm + LM head + per-slot argmax on last_gpu.
