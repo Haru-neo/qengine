@@ -1021,7 +1021,7 @@ struct QwenModel {
         // Chunked-attention compute scratch:
         half*  attn_chunk_q_post = nullptr;  // [CHUNK_SIZE * num_q * head_dim] post deinterleave + head_rms + RoPE
         half*  attn_chunk_gate   = nullptr;  // [CHUNK_SIZE * num_q * head_dim] gate slice from QKV
-        float* attn_chunk_scores = nullptr;  // [CHUNK_SIZE * num_q * max_seq] softmax scratch
+        float* attn_chunk_scores = nullptr;  // [ATTN_NB * num_q * max_seq] softmax scratch (sub-chunk reuse)
         half*  attn_chunk_out    = nullptr;  // [CHUNK_SIZE * num_q * head_dim] V-weighted output
         half*  attn_chunk_oproj  = nullptr;  // [CHUNK_SIZE * H] o_proj output staging
         // Split-K FA scratch (lazy-alloc when FA_SK env opts in, sized for
@@ -3249,7 +3249,7 @@ struct QwenModel {
             cudaMalloc(&ab.attn_chunk_v,        (size_t)CHUNK_SIZE * kv_dim    * sizeof(half));
             cudaMalloc(&ab.attn_chunk_q_post,   (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
             cudaMalloc(&ab.attn_chunk_gate,     (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
-            cudaMalloc(&ab.attn_chunk_scores,   (size_t)CHUNK_SIZE * num_q * kv_max_seq * sizeof(float));
+            cudaMalloc(&ab.attn_chunk_scores,   (size_t)ATTN_NB * num_q * kv_max_seq * sizeof(float));
             cudaMalloc(&ab.attn_chunk_out,      (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
             cudaMalloc(&ab.attn_chunk_oproj,    (size_t)CHUNK_SIZE * H         * sizeof(half));
             constexpr int K_SPLITS_MAX = 16;
@@ -3564,7 +3564,7 @@ struct QwenModel {
             cudaMalloc(&ab.attn_chunk_v,        (size_t)CHUNK_SIZE * kv_dim    * sizeof(half));
             cudaMalloc(&ab.attn_chunk_q_post,   (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
             cudaMalloc(&ab.attn_chunk_gate,     (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
-            cudaMalloc(&ab.attn_chunk_scores,   (size_t)CHUNK_SIZE * num_q * kv_max_seq * sizeof(float));
+            cudaMalloc(&ab.attn_chunk_scores,   (size_t)ATTN_NB * num_q * kv_max_seq * sizeof(float));
             cudaMalloc(&ab.attn_chunk_out,      (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
             cudaMalloc(&ab.attn_chunk_oproj,    (size_t)CHUNK_SIZE * H         * sizeof(half));
             constexpr int K_SPLITS_MAX = 16;
@@ -3835,7 +3835,13 @@ struct QwenModel {
             // Pointers into the chunk-major Q-post / scores / out buffers,
             // offset by sub_processed tokens.
             half*  q_post_sub = ab.attn_chunk_q_post + (size_t)sub_processed * total_qg;
-            float* scores_sub = ab.attn_chunk_scores + (size_t)sub_processed * num_q * kv_max_seq;
+            // Per-sub-chunk score scratch: sub-chunks are processed sequentially
+            // and never read each other's scores, so reuse the same ATTN_NB-row
+            // window (offset 0) instead of a CHUNK_SIZE-row slab. At 256K ctx the
+            // old CHUNK_SIZE sizing was 4.3 GB/GPU (num_q*kv_max_seq*256*4) which
+            // overcommitted 16 GB cards on the smaller-hidden A3B model and
+            // silently zeroed the hidden state.
+            float* scores_sub = ab.attn_chunk_scores;
             half*  out_sub    = ab.attn_chunk_out    + (size_t)sub_processed * total_qg;
 
             if (can_flash) {
