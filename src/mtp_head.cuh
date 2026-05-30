@@ -418,6 +418,9 @@ struct MTPHead {
             }
             cudaMalloc(&moe_acc,    H * sizeof(float));
             cudaMalloc(&moe_logits, std::max(moe_num_experts, 1) * sizeof(float));
+            printf("[MTP] MoE FFN: %d experts, top-%d, inter=%d, shared=%d, "
+                   "router_type=%d\n", moe_num_experts, moe_topk, moe_inter,
+                   moe_shared_inter, (int)moe_router_type);
         }
 
         // Norm tensors: GGUF converter bakes +1 into F32 norms, so use directly
@@ -531,13 +534,26 @@ struct MTPHead {
         const int E = moe_num_experts, topk = moe_topk, mI = moe_inter;
         qi.quantize(h_norm, H, stream);  // q8 input for router + expert gate/up
 
-        // Router logits (F32 weight) → host.
+        // Router logits → host. The router (ffn_gate_inp) is F32 in some GGUFs
+        // but BF16/quantized in others (qwen3_5_moe ships BF16). Reading a BF16
+        // weight as F32 reads 2x the bytes (OOB) and garbage logits, so mirror
+        // QwenModel::moe_token_core: F32 → direct GEMV, else quant_gemv into a
+        // half buffer (mlp_out is H>=E so it fits the E logits).
         std::vector<float> logits(E);
-        qmoe_router_gemv_f32<<<E, 32, 0, stream>>>(
-            (const float*)moe_router_w, h_norm, moe_logits, H, E);
-        cudaMemcpyAsync(logits.data(), moe_logits, E * sizeof(float),
-                        cudaMemcpyDeviceToHost, stream);
-        cudaStreamSynchronize(stream);
+        if (moe_router_type == GGML_TYPE_F32) {
+            qmoe_router_gemv_f32<<<E, 32, 0, stream>>>(
+                (const float*)moe_router_w, h_norm, moe_logits, H, E);
+            cudaMemcpyAsync(logits.data(), moe_logits, E * sizeof(float),
+                            cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+        } else {
+            quant_gemv(moe_router_w, moe_router_type, h_norm, mlp_out, H, E, &qi, stream);
+            std::vector<half> hl(E);
+            cudaMemcpyAsync(hl.data(), mlp_out, E * sizeof(half),
+                            cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+            for (int i = 0; i < E; i++) logits[i] = __half2float(hl[i]);
+        }
 
         // Top-k + softmax over selected logits (norm_topk_prob).
         std::vector<int> order(E);
@@ -580,7 +596,9 @@ struct MTPHead {
         if (moe_shared_inter > 0 && moe_sh_gate) {
             int sI = moe_shared_inter;
             float sgate = 1.0f;
-            if (moe_sh_gate_inp) {
+            // Sigmoid gate only when the gate weight is F32 (mirrors
+            // moe_token_core; non-F32 shared gates default to ungated).
+            if (moe_sh_gate_inp && moe_sh_gate_inp_type == GGML_TYPE_F32) {
                 qmoe_router_gemv_f32<<<1, 32, 0, stream>>>(
                     (const float*)moe_sh_gate_inp, h_norm, moe_logits, H, 1);
                 float l;

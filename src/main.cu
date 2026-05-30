@@ -1049,13 +1049,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     // automatically when spec_enabled is true to avoid running MTP twice
     // per iter — the spec branch already runs its own draft MTP.
     //
-    // MoE (qwen3_5_moe): the MTP head loads + drafts correctly (MoE-aware FFN),
-    // and the n2/n3 verify routes its MLP to forward_moe, but long-gen output
-    // corrupts after the first spec cycle (verify path bug still under
-    // investigation). Default spec OFF for MoE so output stays correct; opt back
-    // in with MTP_SPEC_ON=1 to debug. Plain decode is unaffected and correct.
-    bool moe_spec_ok = !model.cfg.is_moe || getenv("MTP_SPEC_ON") != nullptr;
-    spec_enabled = (mtp_loaded && getenv("MTP_SPEC_OFF") == nullptr && moe_spec_ok);
+    spec_enabled = (mtp_loaded && getenv("MTP_SPEC_OFF") == nullptr);
     spec_k2_enabled   = (spec_enabled && getenv("MTP_K2")   != nullptr && getenv("MTP_TREE") == nullptr);
     // Tree spec verify (forward_*_tree) has no MoE FFN routing yet; MoE models
     // use the n2/n3 verify paths (which do route to forward_moe). Disable tree

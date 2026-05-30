@@ -605,11 +605,17 @@ struct QwenModel {
         int v_total = 48 * 128;
         for (int g = 0; g < gpu->num_gpus; g++) {
             cudaSetDevice(g);
+            // mlp_gate/up/down double as GDN n2 intermediates (z_out=num_v*v_dim,
+            // a_out/b_out=num_v) in forward_gdn_n2. MoE has intermediate_size=0,
+            // so floor to 8192 like the A-lane bufs[g] (see I_alloc in
+            // alloc_buffers) — otherwise the B lane writes GDN state into a
+            // 0-size buffer and corrupts spec verify (garbage long-gen output).
+            int I_alloc = std::max(I, 8192);
             cudaMalloc(&bufs2[g].norm_out, H * sizeof(half));
             cudaMalloc(&bufs2[g].attn_out, std::max(H * 4, cfg.num_q_heads * cfg.head_dim * 2) * sizeof(half));
-            cudaMalloc(&bufs2[g].mlp_gate, I * sizeof(half));
-            cudaMalloc(&bufs2[g].mlp_up,   I * sizeof(half));
-            cudaMalloc(&bufs2[g].mlp_down, H * sizeof(half));
+            cudaMalloc(&bufs2[g].mlp_gate, I_alloc * sizeof(half));
+            cudaMalloc(&bufs2[g].mlp_up,   I_alloc * sizeof(half));
+            cudaMalloc(&bufs2[g].mlp_down, std::max(H, I_alloc) * sizeof(half));
             cudaMalloc(&bufs2[g].residual, H * sizeof(half));
             // GDN second-token intermediates
             cudaMalloc(&gdn_bufs2[g].conv_out,   qkv_dim * sizeof(float));
@@ -643,11 +649,13 @@ struct QwenModel {
         int v_total = 48 * 128;
         for (int g = 0; g < gpu->num_gpus; g++) {
             cudaSetDevice(g);
+            // Same GDN-intermediate floor as bufs2 (MoE intermediate_size=0).
+            int I_alloc = std::max(I, 8192);
             cudaMalloc(&bufs3[g].norm_out, H * sizeof(half));
             cudaMalloc(&bufs3[g].attn_out, std::max(H * 4, cfg.num_q_heads * cfg.head_dim * 2) * sizeof(half));
-            cudaMalloc(&bufs3[g].mlp_gate, I * sizeof(half));
-            cudaMalloc(&bufs3[g].mlp_up,   I * sizeof(half));
-            cudaMalloc(&bufs3[g].mlp_down, H * sizeof(half));
+            cudaMalloc(&bufs3[g].mlp_gate, I_alloc * sizeof(half));
+            cudaMalloc(&bufs3[g].mlp_up,   I_alloc * sizeof(half));
+            cudaMalloc(&bufs3[g].mlp_down, std::max(H, I_alloc) * sizeof(half));
             cudaMalloc(&bufs3[g].residual, H * sizeof(half));
             cudaMalloc(&gdn_bufs3[g].conv_out,   qkv_dim * sizeof(float));
             cudaMalloc(&gdn_bufs3[g].core_out,   v_total * sizeof(half));
