@@ -553,19 +553,25 @@ struct QwenModel {
     void alloc_buffers() {
         int H = cfg.hidden_size;
         int I = cfg.intermediate_size;
+        // MoE models have no dense FFN → intermediate_size == 0. But the
+        // per-token forward_gdn REUSES bufs.mlp_gate/up as GDN intermediates
+        // (z_out = num_v*v_dim, a_out/b_out = num_v). Allocating them at I=0
+        // gives zero-size buffers → GDN writes corrupt adjacent memory (the
+        // hidden state), zeroing it. Floor the alloc to cover GDN reuse.
+        int I_alloc = std::max(I, 8192);
         for (int g = 0; g < gpu->num_gpus; g++) {
             cudaSetDevice(g);
             cudaMalloc(&bufs[g].norm_out, H * sizeof(half));
             cudaMalloc(&bufs[g].attn_out, std::max(H * 4, cfg.num_q_heads * cfg.head_dim * 2) * sizeof(half));
-            cudaMalloc(&bufs[g].mlp_gate, I * sizeof(half));
-            cudaMalloc(&bufs[g].mlp_up, I * sizeof(half));
-            cudaMalloc(&bufs[g].mlp_down, H * sizeof(half));
+            cudaMalloc(&bufs[g].mlp_gate, I_alloc * sizeof(half));
+            cudaMalloc(&bufs[g].mlp_up, I_alloc * sizeof(half));
+            cudaMalloc(&bufs[g].mlp_down, std::max(H, I_alloc) * sizeof(half));
             cudaMalloc(&bufs[g].residual, H * sizeof(half));
 
             // Chunked prefill MLP buffers (token-major, [CHUNK_SIZE * dim]).
             cudaMalloc(&bufs[g].mlp_chunk_norm, (size_t)CHUNK_SIZE * H * sizeof(half));
-            cudaMalloc(&bufs[g].mlp_chunk_gate, (size_t)CHUNK_SIZE * I * sizeof(half));
-            cudaMalloc(&bufs[g].mlp_chunk_up,   (size_t)CHUNK_SIZE * I * sizeof(half));
+            cudaMalloc(&bufs[g].mlp_chunk_gate, (size_t)CHUNK_SIZE * I_alloc * sizeof(half));
+            cudaMalloc(&bufs[g].mlp_chunk_up,   (size_t)CHUNK_SIZE * I_alloc * sizeof(half));
             cudaMalloc(&bufs[g].mlp_chunk_down, (size_t)CHUNK_SIZE * H * sizeof(half));
 
             // GDN buffers (over-allocate for 27B max)
@@ -804,24 +810,6 @@ struct QwenModel {
             void* up = (uint8_t*)up_exps->data   + (size_t)e * u_bytes;
             quant_gemv(gp, gate_exps->type, buf.norm_out, moe_gate[g], H, mI, &gpu_qi[g], stream);
             quant_gemv(up, up_exps->type,   buf.norm_out, moe_up[g],   H, mI, &gpu_qi[g], stream);
-            {
-                static const bool md = getenv("MOE_DBG") != nullptr;
-                static int seen = 0;
-                if (md && layer == 0 && t_ == 0 && seen < 1) {
-                    seen++;
-                    cudaSetDevice(g); cudaStreamSynchronize(stream);
-                    auto pk = [&](const char* tag, half* p, int n){
-                        std::vector<half> v(std::min(n,6)); cudaMemcpy(v.data(),p,v.size()*sizeof(half),cudaMemcpyDeviceToHost);
-                        std::vector<half> all(n); cudaMemcpy(all.data(),p,n*sizeof(half),cudaMemcpyDeviceToHost);
-                        double s=0; float mx=0; for(int i=0;i<n;i++){float a=fabs((float)__half2float(all[i])); s+=a; if(a>mx)mx=a;}
-                        fprintf(stderr,"[MOE_DBG2 %s e=%d] absum=%.2f max=%.2f head:",tag,e,s,mx);
-                        for(auto h:v) fprintf(stderr," %.3f",__half2float(h)); fprintf(stderr,"\n");
-                    };
-                    pk("gate(pre-clamp)", moe_gate[g], mI);
-                    pk("up(pre-clamp)",   moe_up[g],   mI);
-                    fflush(stderr);
-                }
-            }
             qmoe_clamp_fp16<<<(mI + 255) / 256, 256, 0, stream>>>(moe_gate[g], mI);
             qmoe_clamp_fp16<<<(mI + 255) / 256, 256, 0, stream>>>(moe_up[g], mI);
             silu_mul_kernel<<<(mI + 255) / 256, 256, 0, stream>>>(moe_gate[g], moe_up[g], mI);
@@ -866,19 +854,6 @@ struct QwenModel {
 
         qmoe_f32_to_f16<<<(H + 255) / 256, 256, 0, stream>>>(moe_acc[g], moe_down[g], H);
         add_kernel_f32<<<(H + 255) / 256, 256, 0, stream>>>(hidden, moe_down[g], H);
-
-        static const bool moe_dbg = getenv("MOE_DBG") != nullptr;
-        static int dbg_tok = -1;  // only trace one token to keep output readable
-        if (moe_dbg) {
-            // trace the first token we ever see, across all layers
-            cudaSetDevice(g); cudaStreamSynchronize(stream);
-            auto absum_f = [&](float* p, int n){ std::vector<float> v(n); cudaMemcpy(v.data(),p,n*sizeof(float),cudaMemcpyDeviceToHost); double s=0; bool nan=false; for(int i=0;i<n;i++){ if(v[i]!=v[i]) nan=true; s+=fabs((double)v[i]); } return std::make_pair(s, nan); };
-            auto [hs, hnan] = absum_f(hidden, H);
-            fprintf(stderr, "[MOE_DBG L%d %s] hidden_out_absum=%.1f%s acc_absum=%.1f\n",
-                    layer, is_attn_layer(layer)?"ATTN":"GDN ", hs, hnan?" NAN!":"",
-                    absum_f(moe_acc[g], H).first);
-            fflush(stderr);
-        }
     }
 
     void forward_moe(int layer, float* hidden, cudaStream_t stream) {
