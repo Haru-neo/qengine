@@ -53,6 +53,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
+#include <algorithm>
 #include <cmath>
 
 static inline void dump_half_stats(const char* tag, const half* dev, int n) {
@@ -117,9 +118,26 @@ struct MTPHead {
     void* k_proj;      // [H, kv_dim] Q8_0
     void* v_proj;      // [H, kv_dim] Q8_0
     void* o_proj;      // [q_dim, H] Q8_0
-    void* gate_proj;   // [H, I] Q8_0
+    void* gate_proj;   // [H, I] Q8_0   (dense MLP — null for MoE MTP layer)
     void* up_proj;     // [H, I] Q8_0
     void* down_proj;   // [I, H] Q8_0
+
+    // ── MoE FFN (qwen3_5_moe MTP layer: blk.N carries expert tensors) ──────
+    bool  is_moe = false;
+    int   moe_num_experts = 0;
+    int   moe_topk = 0;
+    int   moe_inter = 0;            // per-expert SwiGLU intermediate
+    int   moe_shared_inter = 0;     // shared-expert intermediate (0 = none)
+    void* moe_router_w   = nullptr; ggml_type moe_router_type   = GGML_TYPE_F32;
+    void* moe_gate_exps  = nullptr; ggml_type moe_gate_type     = GGML_TYPE_Q8_0;
+    void* moe_up_exps    = nullptr; ggml_type moe_up_type       = GGML_TYPE_Q8_0;
+    void* moe_down_exps  = nullptr; ggml_type moe_down_type     = GGML_TYPE_Q8_0;
+    void* moe_sh_gate    = nullptr; ggml_type moe_sh_gate_type  = GGML_TYPE_Q8_0;
+    void* moe_sh_up      = nullptr; ggml_type moe_sh_up_type    = GGML_TYPE_Q8_0;
+    void* moe_sh_down    = nullptr; ggml_type moe_sh_down_type  = GGML_TYPE_Q8_0;
+    void* moe_sh_gate_inp= nullptr; ggml_type moe_sh_gate_inp_type = GGML_TYPE_F32;
+    float* moe_acc       = nullptr; // [H]  fp32 routed-sum accumulator
+    float* moe_logits    = nullptr; // [E]  router logits scratch
 
     // Norms — converted from F16 → F32 at load so we can reuse the existing
     // F32-weight RMSNorm kernels (head_rms_norm_kernel etc.).
@@ -337,7 +355,8 @@ struct MTPHead {
     bool load_from_gguf(GPUModel& gm, int mtp_layer,
                         int hidden_size, int vocab_size,
                         int num_q_heads, int num_kv_heads, int head_dim_,
-                        int intermediate, int rope_dim_, int max_seq_, float rms_eps) {
+                        int intermediate, int rope_dim_, int max_seq_, float rms_eps,
+                        int moe_topk_arg = 0) {
         std::string pfx = "blk." + std::to_string(mtp_layer) + ".";
         auto gt = [&](const std::string& suffix) -> GPUTensor* {
             auto it = gm.tensors.find(pfx + suffix);
@@ -362,9 +381,44 @@ struct MTPHead {
         k_proj    = gt("attn_k.weight")->data;
         v_proj    = gt("attn_v.weight")->data;
         o_proj    = gt("attn_output.weight")->data;
-        gate_proj = gt("ffn_gate.weight")->data;
-        up_proj   = gt("ffn_up.weight")->data;
-        down_proj = gt("ffn_down.weight")->data;
+        // FFN: dense (ffn_gate/up/down) or MoE (ffn_gate_inp + *_exps). The
+        // qwen3_5_moe MTP layer is itself MoE, so detect and bind expert tensors.
+        if (auto* dg = gt("ffn_gate.weight")) {
+            gate_proj = dg->data;
+            up_proj   = gt("ffn_up.weight")->data;
+            down_proj = gt("ffn_down.weight")->data;
+        } else {
+            is_moe = true;
+            auto* router = gt("ffn_gate_inp.weight");
+            auto* ge = gt("ffn_gate_exps.weight");
+            auto* ue = gt("ffn_up_exps.weight");
+            auto* de = gt("ffn_down_exps.weight");
+            if (!router || !ge || !ue || !de) {
+                fprintf(stderr, "MTP: MoE layer missing router/expert tensors\n");
+                return false;
+            }
+            moe_router_w  = router->data; moe_router_type = router->type;
+            moe_gate_exps = ge->data;     moe_gate_type   = ge->type;
+            moe_up_exps   = ue->data;     moe_up_type     = ue->type;
+            moe_down_exps = de->data;     moe_down_type   = de->type;
+            // 3D expert tensor: [n_embd, n_ff_exp, n_expert].
+            moe_inter        = (int)ge->dims[1];
+            moe_num_experts  = (int)ge->dims[2];
+            moe_topk         = (moe_topk_arg > 0) ? moe_topk_arg : 8;
+            if (auto* sg = gt("ffn_gate_shexp.weight")) {
+                moe_sh_gate = sg->data; moe_sh_gate_type = sg->type;
+                auto* su = gt("ffn_up_shexp.weight");
+                auto* sd = gt("ffn_down_shexp.weight");
+                moe_sh_up   = su->data; moe_sh_up_type   = su->type;
+                moe_sh_down = sd->data; moe_sh_down_type = sd->type;
+                moe_shared_inter = (int)sg->dims[1];
+                if (auto* sgi = gt("ffn_gate_inp_shexp.weight")) {
+                    moe_sh_gate_inp = sgi->data; moe_sh_gate_inp_type = sgi->type;
+                }
+            }
+            cudaMalloc(&moe_acc,    H * sizeof(float));
+            cudaMalloc(&moe_logits, std::max(moe_num_experts, 1) * sizeof(float));
+        }
 
         // Norm tensors: GGUF converter bakes +1 into F32 norms, so use directly
         auto bind_norm = [&](const std::string& suffix) -> float* {
@@ -406,8 +460,11 @@ struct MTPHead {
         cudaMalloc(&attn_scores, num_q * max_seq * sizeof(float));
         cudaMalloc(&attn_out,   q_dim * sizeof(half));
         cudaMalloc(&attn_proj_out, H * sizeof(half));
-        cudaMalloc(&mlp_gate_tmp, I * sizeof(half));
-        cudaMalloc(&mlp_up_tmp,   I * sizeof(half));
+        // gate/up scratch: dense uses I; MoE uses max expert/shared intermediate
+        // (cfg.intermediate_size is 0 for MoE, so floor to the routed dims).
+        int mlp_buf = is_moe ? std::max(std::max(I, moe_inter), moe_shared_inter) : I;
+        cudaMalloc(&mlp_gate_tmp, mlp_buf * sizeof(half));
+        cudaMalloc(&mlp_up_tmp,   mlp_buf * sizeof(half));
         cudaMalloc(&mlp_out,      H * sizeof(half));
         cudaMalloc(&h_final,      H * sizeof(half));
         cudaMalloc(&logits_buf,   V * sizeof(half));
@@ -463,6 +520,88 @@ struct MTPHead {
     }
 
     void reset_kv() { kv_pos = 0; }
+
+    // MoE FFN for the qwen3_5_moe MTP layer. `h_norm` is the post-attention-norm
+    // hidden (half[H]); writes the routed+shared expert sum into `out` (half[H]).
+    // Mirrors QwenModel::moe_token_core: F32 router GEMV → CPU top-k softmax →
+    // per-expert SwiGLU (byte-strided Q8_0 experts) → fp32 weighted sum → shared
+    // expert (sigmoid-gated). Reuses mlp_gate_tmp/up_tmp (floored to moe_inter at
+    // load) and mlp_out as expert scratch.
+    void moe_ffn(half* h_norm, half* out, cudaStream_t stream) {
+        const int E = moe_num_experts, topk = moe_topk, mI = moe_inter;
+        qi.quantize(h_norm, H, stream);  // q8 input for router + expert gate/up
+
+        // Router logits (F32 weight) → host.
+        std::vector<float> logits(E);
+        qmoe_router_gemv_f32<<<E, 32, 0, stream>>>(
+            (const float*)moe_router_w, h_norm, moe_logits, H, E);
+        cudaMemcpyAsync(logits.data(), moe_logits, E * sizeof(float),
+                        cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+
+        // Top-k + softmax over selected logits (norm_topk_prob).
+        std::vector<int> order(E);
+        for (int i = 0; i < E; i++) order[i] = i;
+        std::partial_sort(order.begin(), order.begin() + topk, order.end(),
+                          [&](int a, int b) { return logits[a] > logits[b]; });
+        float maxl = logits[order[0]], sum = 0.f;
+        std::vector<float> w(topk);
+        for (int i = 0; i < topk; i++) { w[i] = expf(logits[order[i]] - maxl); sum += w[i]; }
+        for (int i = 0; i < topk; i++) w[i] /= sum;
+
+        // Per-expert byte stride. gpu_loader repacks Q8_0 to 36 B/block, so the
+        // GGUF 34 B row size gives a misaligned offset → NaN.
+        auto expert_bytes = [](ggml_type type, size_t n_elems) -> size_t {
+            if (type == GGML_TYPE_Q8_0) return n_elems / 32 * 36;
+            return ggml_row_bytes(type, (int)n_elems);
+        };
+        size_t g_bytes = expert_bytes(moe_gate_type, (size_t)mI * H);
+        size_t u_bytes = expert_bytes(moe_up_type,   (size_t)mI * H);
+        size_t d_bytes = expert_bytes(moe_down_type, (size_t)H  * mI);
+
+        qmoe_zero_f32<<<(H + 255) / 256, 256, 0, stream>>>(moe_acc, H);
+        for (int t = 0; t < topk; t++) {
+            int e = order[t];
+            void* gp = (uint8_t*)moe_gate_exps + (size_t)e * g_bytes;
+            void* up = (uint8_t*)moe_up_exps   + (size_t)e * u_bytes;
+            quant_gemv(gp, moe_gate_type, h_norm, mlp_gate_tmp, H, mI, &qi, stream);
+            quant_gemv(up, moe_up_type,   h_norm, mlp_up_tmp,   H, mI, &qi, stream);
+            qmoe_clamp_fp16<<<(mI + 255) / 256, 256, 0, stream>>>(mlp_gate_tmp, mI);
+            qmoe_clamp_fp16<<<(mI + 255) / 256, 256, 0, stream>>>(mlp_up_tmp, mI);
+            silu_mul_kernel<<<(mI + 255) / 256, 256, 0, stream>>>(mlp_gate_tmp, mlp_up_tmp, mI);
+            qi_inter.quantize(mlp_gate_tmp, mI, stream);
+            void* dp = (uint8_t*)moe_down_exps + (size_t)e * d_bytes;
+            quant_gemv(dp, moe_down_type, mlp_gate_tmp, mlp_out, mI, H, &qi_inter, stream);
+            qmoe_clamp_fp16<<<(H + 255) / 256, 256, 0, stream>>>(mlp_out, H);
+            qmoe_acc_f32<<<(H + 255) / 256, 256, 0, stream>>>(moe_acc, mlp_out, w[t], H);
+        }
+
+        // Shared expert (sigmoid-gated), added to the routed sum.
+        if (moe_shared_inter > 0 && moe_sh_gate) {
+            int sI = moe_shared_inter;
+            float sgate = 1.0f;
+            if (moe_sh_gate_inp) {
+                qmoe_router_gemv_f32<<<1, 32, 0, stream>>>(
+                    (const float*)moe_sh_gate_inp, h_norm, moe_logits, H, 1);
+                float l;
+                cudaMemcpyAsync(&l, moe_logits, sizeof(float),
+                                cudaMemcpyDeviceToHost, stream);
+                cudaStreamSynchronize(stream);
+                sgate = 1.0f / (1.0f + expf(-l));
+            }
+            quant_gemv(moe_sh_gate, moe_sh_gate_type, h_norm, mlp_gate_tmp, H, sI, &qi, stream);
+            quant_gemv(moe_sh_up,   moe_sh_up_type,   h_norm, mlp_up_tmp,   H, sI, &qi, stream);
+            qmoe_clamp_fp16<<<(sI + 255) / 256, 256, 0, stream>>>(mlp_gate_tmp, sI);
+            qmoe_clamp_fp16<<<(sI + 255) / 256, 256, 0, stream>>>(mlp_up_tmp, sI);
+            silu_mul_kernel<<<(sI + 255) / 256, 256, 0, stream>>>(mlp_gate_tmp, mlp_up_tmp, sI);
+            qi_inter.quantize(mlp_gate_tmp, sI, stream);
+            quant_gemv(moe_sh_down, moe_sh_down_type, mlp_gate_tmp, mlp_out, sI, H, &qi_inter, stream);
+            qmoe_clamp_fp16<<<(H + 255) / 256, 256, 0, stream>>>(mlp_out, H);
+            qmoe_acc_f32<<<(H + 255) / 256, 256, 0, stream>>>(moe_acc, mlp_out, sgate, H);
+        }
+
+        qmoe_f32_to_f16<<<(H + 255) / 256, 256, 0, stream>>>(moe_acc, out, H);
+    }
 
     // Run the MTP head one position. Returns argmax(logits) of the predicted
     // next token. h_main_normed is the post-output_norm hidden state from the
@@ -629,13 +768,17 @@ struct MTPHead {
         rms_norm_f32w_kernel<<<1, min(H, 1024), min(H, 1024) * sizeof(float), stream>>>(
             h_tmp, post_attention_layernorm, h_norm_tmp, H, eps);
 
-        // 5l. SwiGLU MLP
-        qi.quantize(h_norm_tmp, H, stream);
-        quant_gemv(gate_proj, GGML_TYPE_Q8_0, h_norm_tmp, mlp_gate_tmp, H, I, &qi, stream);
-        quant_gemv(up_proj,   GGML_TYPE_Q8_0, h_norm_tmp, mlp_up_tmp,   H, I, &qi, stream);
-        silu_mul_kernel<<<(I + 255) / 256, 256, 0, stream>>>(mlp_gate_tmp, mlp_up_tmp, I);
-        qi_inter.quantize(mlp_gate_tmp, I, stream);
-        quant_gemv(down_proj, GGML_TYPE_Q8_0, mlp_gate_tmp, mlp_out, I, H, &qi_inter, stream);
+        // 5l. FFN: dense SwiGLU or MoE routing → mlp_out
+        if (is_moe) {
+            moe_ffn(h_norm_tmp, mlp_out, stream);
+        } else {
+            qi.quantize(h_norm_tmp, H, stream);
+            quant_gemv(gate_proj, GGML_TYPE_Q8_0, h_norm_tmp, mlp_gate_tmp, H, I, &qi, stream);
+            quant_gemv(up_proj,   GGML_TYPE_Q8_0, h_norm_tmp, mlp_up_tmp,   H, I, &qi, stream);
+            silu_mul_kernel<<<(I + 255) / 256, 256, 0, stream>>>(mlp_gate_tmp, mlp_up_tmp, I);
+            qi_inter.quantize(mlp_gate_tmp, I, stream);
+            quant_gemv(down_proj, GGML_TYPE_Q8_0, mlp_gate_tmp, mlp_out, I, H, &qi_inter, stream);
+        }
 
         // 5m. residual: h_tmp += mlp_out
         add_kernel<<<(H + 255) / 256, 256, 0, stream>>>(h_tmp, mlp_out, H);

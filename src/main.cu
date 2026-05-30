@@ -1003,26 +1003,18 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     MTPHead mtp;
     bool mtp_loaded = false;
     {
-        // Try inline GGUF MTP first (v2 models embed nextn in blk.N).
-        // The MTP head loader assumes a DENSE FFN (ffn_gate/up/down.weight) in
-        // the MTP layer. MoE models (qwen35moe) put expert tensors there
-        // (ffn_down_exps.weight) and no ffn_down.weight → the loader would
-        // null-deref. Skip MTP load when the dense FFN is absent; spec decoding
-        // is unavailable for the MoE MTP layer (the main forward excludes it
-        // anyway), and MTP_SPEC_OFF/normal decode is unaffected.
+        // Try inline GGUF MTP first (v2 models embed nextn in blk.N). The MTP
+        // head handles both a dense FFN (ffn_gate/up/down) and a MoE FFN
+        // (ffn_gate_inp + *_exps + shared expert) in the MTP layer — qwen3_5_moe
+        // makes the MTP layer itself MoE. load_from_gguf detects which and binds
+        // the right tensors; num_experts_per_tok is passed through for top-k.
         if (model.mtp_layer_idx >= 0) {
-            std::string mtp_ffn = "blk." + std::to_string(model.mtp_layer_idx) + ".ffn_down.weight";
-            if (!gpu_model.get(mtp_ffn.c_str())) {
-                printf("[MTP] blk.%d has no dense ffn_down (MoE MTP layer) — "
-                       "skipping MTP head load; speculative decoding disabled\n",
-                       model.mtp_layer_idx);
-            } else {
-                mtp_loaded = mtp.load_from_gguf(
-                    gpu_model, model.mtp_layer_idx,
-                    model.cfg.hidden_size, V,
-                    model.cfg.num_q_heads, model.cfg.num_kv_heads, model.cfg.head_dim,
-                    model.cfg.intermediate_size, model.cfg.rope_dim, max_seq, model.cfg.rms_norm_eps);
-            }
+            mtp_loaded = mtp.load_from_gguf(
+                gpu_model, model.mtp_layer_idx,
+                model.cfg.hidden_size, V,
+                model.cfg.num_q_heads, model.cfg.num_kv_heads, model.cfg.head_dim,
+                model.cfg.intermediate_size, model.cfg.rope_dim, max_seq, model.cfg.rms_norm_eps,
+                model.cfg.num_experts_per_tok);
         }
         // Fallback: external mtp_head_<hidden>.bin
         if (!mtp_loaded) {
@@ -1056,9 +1048,19 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     // per-iter MTP measurement (formerly gated by MTP_ON=1) is suppressed
     // automatically when spec_enabled is true to avoid running MTP twice
     // per iter — the spec branch already runs its own draft MTP.
-    spec_enabled = (mtp_loaded && getenv("MTP_SPEC_OFF") == nullptr);
+    //
+    // MoE (qwen3_5_moe): the MTP head loads + drafts correctly (MoE-aware FFN),
+    // and the n2/n3 verify routes its MLP to forward_moe, but long-gen output
+    // corrupts after the first spec cycle (verify path bug still under
+    // investigation). Default spec OFF for MoE so output stays correct; opt back
+    // in with MTP_SPEC_ON=1 to debug. Plain decode is unaffected and correct.
+    bool moe_spec_ok = !model.cfg.is_moe || getenv("MTP_SPEC_ON") != nullptr;
+    spec_enabled = (mtp_loaded && getenv("MTP_SPEC_OFF") == nullptr && moe_spec_ok);
     spec_k2_enabled   = (spec_enabled && getenv("MTP_K2")   != nullptr && getenv("MTP_TREE") == nullptr);
-    spec_tree_enabled = (spec_enabled && getenv("MTP_TREE") != nullptr);
+    // Tree spec verify (forward_*_tree) has no MoE FFN routing yet; MoE models
+    // use the n2/n3 verify paths (which do route to forward_moe). Disable tree
+    // for MoE so MTP_TREE silently falls back to basic/K2 spec.
+    spec_tree_enabled = (spec_enabled && getenv("MTP_TREE") != nullptr && !model.cfg.is_moe);
 
     // Continuous batching N>1 keeps the MTP/spec paths available because
     // they're only ever invoked from generate_impl when slot==0, and the
@@ -2541,7 +2543,13 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                                 if (is_attn_s) g_attn += ms; else g_gdn += ms;
                             }
                             auto sm0 = prof_now();
-                            model.forward_mlp_n3(layer, h_a, h_b, h_c, 0);
+                            if (model.layer_is_moe[layer]) {
+                                model.forward_moe(layer, h_a, 0);
+                                model.forward_moe(layer, h_b, 0);
+                                model.forward_moe(layer, h_c, 0);
+                            } else {
+                                model.forward_mlp_n3(layer, h_a, h_b, h_c, 0);
+                            }
                             if (do_gen_prof) g_mlp += prof_sync_ms(sm0, g_l);
                         }
 
@@ -2689,7 +2697,12 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                                 if (is_attn_s) g_attn += ms; else g_gdn += ms;
                             }
                             auto sm0 = prof_now();
-                            model.forward_mlp_n2(layer, h_a, h_b, 0);
+                            if (model.layer_is_moe[layer]) {
+                                model.forward_moe(layer, h_a, 0);
+                                model.forward_moe(layer, h_b, 0);
+                            } else {
+                                model.forward_mlp_n2(layer, h_a, h_b, 0);
+                            }
                             if (do_gen_prof) g_mlp += prof_sync_ms(sm0, g_l);
                         }
 
