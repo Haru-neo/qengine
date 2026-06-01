@@ -1123,7 +1123,7 @@ template __global__ void gemm_q8_0_q8_1_v2<16, 128, 1, 8, 4>(const void*, const 
 // accumulators, cutting input-side global memory traffic in half. Grid layout
 // matches v2 so dispatch can use the same (M, n_tokens) tiling.
 template<int BM, int BN, int TM, int TN, int BK_BLOCKS>
-__global__ void gemm_q8_0_q8_1_fused2(
+__global__ void __launch_bounds__((BM/TM)*(BN/TN), 2) gemm_q8_0_q8_1_fused2(
     const void* __restrict__ Wg,
     const void* __restrict__ Wu,
     const block_q8_1* __restrict__ X,
