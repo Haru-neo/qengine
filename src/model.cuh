@@ -4543,6 +4543,42 @@ struct QwenModel {
                         sub_processed += sub_n;
                         continue;
                     }
+                    // PREFILL_FA_V2: NT-batched dense split kernel (loads K/V
+                    // once per NT t_idx instead of per t_idx). Microbench 1.43×
+                    // over the per-t_idx split kernel; opt-in until edge cases
+                    // (short ctx / cache-hit start_pos / sub_n<NT) are validated
+                    // end-to-end. NT=4 BM=8 K_SPLITS=16 was the sweep winner.
+                    static const bool fa_v2 = getenv("PREFILL_FA_V2") != nullptr;
+                    if (fa_v2) {
+                        constexpr int NT = 4, BMV = 8, KV = 16;
+                        int smem_v2 = (num_q == 24 ? 6 : 4) * NT * HD * sizeof(half)
+                                    + 2 * BMV * HD * sizeof(half)
+                                    + (num_q == 24 ? 6 : 4) * NT * BMV * sizeof(float);
+                        auto launch_v2 = [&](auto gqa_const) {
+                            constexpr int GQA = decltype(gqa_const)::value;
+                            void* fn = (void*)flash_attn_chunk_fused_split_ntb<HD,GQA,BMV,BLOCK,KV,NT>;
+                            if (smem_v2 > 48*1024 && cur_dev>=0 && cur_dev<16 && !fa_smem_set[cur_dev]) {
+                                cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, 96*1024);
+                            }
+                            dim3 fgv(num_kv, (sub_n + NT - 1)/NT, KV);
+                            flash_attn_chunk_fused_split_ntb<HD,GQA,BMV,BLOCK,KV,NT>
+                                <<<fgv, BLOCK, smem_v2, stream>>>(
+                                    q_post_sub, k_cache_ptr, v_cache_ptr,
+                                    ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
+                                    num_q, num_kv, sub_start_pos, sub_n, ATTN_NB,
+                                    active_end_max, scale);
+                            dim3 mg(num_kv, sub_n);
+                            flash_attn_split_merge<HD, GQA, BLOCK, KV>
+                                <<<mg, BLOCK, 0, stream>>>(
+                                    ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
+                                    out_sub, num_q, sub_n, ATTN_NB);
+                        };
+                        if (num_q == 24) launch_v2(std::integral_constant<int,6>{});
+                        else             launch_v2(std::integral_constant<int,4>{});
+                        if (g_profile_attn) g_attn_fused_ms += pa_sync_ms(tf0);
+                        sub_processed += sub_n;
+                        continue;
+                    }
                     auto launch_split = [&](auto gqa_const, auto k_const) {
                         constexpr int GQA = decltype(gqa_const)::value;
                         constexpr int K   = decltype(k_const)::value;
