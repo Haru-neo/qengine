@@ -1647,9 +1647,12 @@ __global__ void __launch_bounds__(BLOCK, 4) flash_attn_chunk_fused_split_ntb(
 
     extern __shared__ unsigned char smem_ntb[];
     half*  q_s    = (half*)smem_ntb;
-    half*  k_tile = q_s    + QPB * HD;
+    half*  k_tile = q_s    + QPB * HD;   // stored TRANSPOSED as half2 [d2][r]
     half*  v_tile = k_tile + BM  * HD;
     float* s_smem = (float*)(v_tile + BM * HD);
+    half2* q_s2 = (half2*)q_s;
+    half2* kT2  = (half2*)k_tile;
+    constexpr int HD2 = HD / 2;
 
     for (int i = tid; i < QPB * HD; i += BLOCK) {
         int qi = i / HD, c = i - qi * HD;
@@ -1674,35 +1677,38 @@ __global__ void __launch_bounds__(BLOCK, 4) flash_attn_chunk_fused_split_ntb(
     for (int tile_start = tile_lo; tile_start < tile_hi; tile_start += BM) {
         int tile_end = min(tile_start + BM, tile_hi);
         int tile_len = tile_end - tile_start;
-        for (int i = tid; i < BM * HD; i += BLOCK) {
-            int r = i / HD, c = i - r * HD;
-            half z = __float2half(0.0f);
+        // K loaded TRANSPOSED (half2 [d2][r]) for conflict-free per-d2 reads in
+        // the no-shuffle score; V loaded normal [r][d] for the AV phase.
+        for (int i = tid; i < BM * HD2; i += BLOCK) {
+            int r = i / HD2, d2 = i - r * HD2;
+            half2 kv;
             if (r < tile_len) {
                 size_t base = (size_t)(tile_start + r) * num_kv * HD + kv_head * HD;
-                k_tile[r * HD + c] = k_cache[base + c];
+                kv = ((const half2*)(k_cache + base))[d2];
+            } else kv = __float2half2_rn(0.0f);
+            kT2[d2 * BM + r] = kv;
+        }
+        for (int i = tid; i < BM * HD; i += BLOCK) {
+            int r = i / HD, c = i - r * HD;
+            if (r < tile_len) {
+                size_t base = (size_t)(tile_start + r) * num_kv * HD + kv_head * HD;
                 v_tile[r * HD + c] = v_cache[base + c];
-            } else { k_tile[r * HD + c] = z; v_tile[r * HD + c] = z; }
+            } else v_tile[r * HD + c] = __float2half(0.0f);
         }
         __syncthreads();
-        #pragma unroll
-        for (int u = 0; u < QPW; u++) {
-            int qi = warp + u * N_WARPS; if (qi >= QPB) break;
-            const half2* qs2 = (const half2*)(q_s + qi * HD);
-            for (int r = 0; r < BM; r++) {
-                const half2* kt2 = (const half2*)(k_tile + r * HD);
-                float partial = 0.0f;
-                #pragma unroll
-                for (int i = 0; i < LANE_D / 2; i++) {
-                    half2 qv = qs2[lane * (LANE_D / 2) + i];
-                    half2 kv = kt2[lane * (LANE_D / 2) + i];
-                    float2 qf = __half22float2(qv), kf = __half22float2(kv);
-                    partial += qf.x * kf.x + qf.y * kf.y;
-                }
-                #pragma unroll
-                for (int off = 16; off > 0; off >>= 1)
-                    partial += __shfl_xor_sync(0xffffffff, partial, off);
-                if (lane == 0) s_smem[qi * BM + r] = partial * scale;
+        // Score: one thread per (qi, r), full-HD dot, NO warp reduction.
+        for (int idx = tid; idx < QPB * BM; idx += BLOCK) {
+            int qi = idx / BM, r = idx - qi * BM;
+            const half2* qp = q_s2 + qi * HD2;
+            float acc = 0.0f;
+            #pragma unroll 8
+            for (int d2 = 0; d2 < HD2; d2++) {
+                half2 q = qp[d2];
+                half2 k = kT2[d2 * BM + r];
+                float2 qf = __half22float2(q), kf = __half22float2(k);
+                acc += qf.x * kf.x + qf.y * kf.y;
             }
+            s_smem[qi * BM + r] = acc * scale;
         }
         __syncthreads();
         #pragma unroll

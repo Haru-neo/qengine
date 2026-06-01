@@ -193,6 +193,86 @@ __global__ void __launch_bounds__(BLOCK,4) fa_v2(
         for(int i=0;i<LANE_D;i++)part_o[ob+lane*LANE_D+i]=acc_o[u][i];}
 }
 
+// ===== fa_v3: fa_v2 + K transposed in shared + thread-per-score (NO shuffle) =====
+// Score phase: each thread computes one (qi,r) dot over full HD with no warp
+// reduction. K stored transposed as half2 [d2][r] so the per-d2 read is
+// bank-conflict-free. Targets the score phase (~51% of fa_v2).
+template<int GQA,int BM,int BLOCK,int K_SPLITS,int NT>
+__global__ void __launch_bounds__(BLOCK,4) fa_v3(
+    const half* __restrict__ q_chunk,const half* __restrict__ k_cache,const half* __restrict__ v_cache,
+    float* __restrict__ part_m,float* __restrict__ part_l,float* __restrict__ part_o,
+    int num_q,int num_kv,int start_pos,int sub_n,int sub_n_max,int active_end_max,float scale){
+    constexpr int N_WARPS=BLOCK/32; constexpr int LANE_D=HD/32; constexpr int QPB=NT*GQA;
+    constexpr int QPW=(QPB+N_WARPS-1)/N_WARPS; constexpr int HD2=HD/2;
+    int kv_head=blockIdx.x, tg=blockIdx.y, split_idx=blockIdx.z;
+    int tid=threadIdx.x, warp=tid>>5, lane=tid&31;
+    int t_base=tg*NT;
+    if(t_base>=sub_n) return;
+    int abs_pos_max=start_pos+min(t_base+NT-1,sub_n-1)+1;
+    int total_tiles=(active_end_max+BM-1)/BM, tiles_per_split=(total_tiles+K_SPLITS-1)/K_SPLITS;
+    int tile_lo=split_idx*tiles_per_split*BM, tile_hi=min((split_idx+1)*tiles_per_split*BM,abs_pos_max);
+    extern __shared__ unsigned char sm[];
+    half* q_s=(half*)sm; half* kT=q_s+QPB*HD; half* v_tile=kT+BM*HD; float* s_smem=(float*)(v_tile+BM*HD);
+    half2* q_s2=(half2*)q_s; half2* kT2=(half2*)kT;
+    for(int i=tid;i<QPB*HD;i+=BLOCK){int qi=i/HD,c=i-qi*HD;int t=qi/GQA,g=qi-t*GQA;int tok=t_base+t;int qh=kv_head*GQA+g;
+        q_s[qi*HD+c]=(tok<sub_n)?q_chunk[(size_t)tok*num_q*HD+(size_t)qh*HD+c]:__float2half(0.f);}
+    __syncthreads();
+    float acc_o[QPW][LANE_D]; float m_w[QPW],l_w[QPW];
+    #pragma unroll
+    for(int u=0;u<QPW;u++){m_w[u]=-INFINITY;l_w[u]=0.f;
+        #pragma unroll
+        for(int i=0;i<LANE_D;i++)acc_o[u][i]=0.f;}
+    for(int tile_start=tile_lo;tile_start<tile_hi;tile_start+=BM){
+        int tile_end=min(tile_start+BM,tile_hi),tile_len=tile_end-tile_start;
+        // load K transposed (half2 [d2][r]) + V normal [r][d]
+        for(int i=tid;i<BM*HD2;i+=BLOCK){int r=i/HD2,d2=i-r*HD2;
+            half2 kv;
+            if(r<tile_len){size_t base=(size_t)(tile_start+r)*num_kv*HD+kv_head*HD; kv=((const half2*)(k_cache+base))[d2];}
+            else kv=__float2half2_rn(0.f);
+            kT2[d2*BM+r]=kv;}
+        for(int i=tid;i<BM*HD;i+=BLOCK){int r=i/HD,c=i-r*HD;
+            if(r<tile_len){size_t base=(size_t)(tile_start+r)*num_kv*HD+kv_head*HD;v_tile[r*HD+c]=v_cache[base+c];}
+            else v_tile[r*HD+c]=__float2half(0.f);}
+        __syncthreads();
+        // score: thread-per-(qi,r), full HD, no shuffle
+        for(int idx=tid;idx<QPB*BM;idx+=BLOCK){int qi=idx/BM,r=idx-qi*BM;
+            const half2* qp=q_s2+qi*HD2; float acc=0.f;
+            #pragma unroll 8
+            for(int d2=0;d2<HD2;d2++){half2 q=qp[d2];half2 k=kT2[d2*BM+r];float2 qf=__half22float2(q),kf=__half22float2(k);acc+=qf.x*kf.x+qf.y*kf.y;}
+            s_smem[qi*BM+r]=acc*scale;}
+        __syncthreads();
+        // softmax + AV (same as fa_v2): warp per query, lane = key
+        #pragma unroll
+        for(int u=0;u<QPW;u++){int qi=warp+u*N_WARPS; if(qi>=QPB) break;
+            int t=qi/GQA; int tok=t_base+t; int active_end=start_pos+tok+1;
+            int gkey=tile_start+lane;
+            float s_val=(lane<tile_len && gkey<active_end)? s_smem[qi*BM+lane] : -INFINITY;
+            float m_row=s_val;
+            #pragma unroll
+            for(int off=16;off>0;off>>=1)m_row=fmaxf(m_row,__shfl_xor_sync(0xffffffff,m_row,off));
+            float m_new=fmaxf(m_w[u],m_row),corr=expf(m_w[u]-m_new),p_lane=expf(s_val-m_new),sum_p=p_lane;
+            #pragma unroll
+            for(int off=16;off>0;off>>=1)sum_p+=__shfl_xor_sync(0xffffffff,sum_p,off);
+            #pragma unroll
+            for(int i=0;i<LANE_D;i++)acc_o[u][i]*=corr;
+            l_w[u]=l_w[u]*corr+sum_p;
+            #pragma unroll
+            for(int r=0;r<BM;r++){float p_r=__shfl_sync(0xffffffff,p_lane,r);const half2* vt=(const half2*)(v_tile+r*HD+lane*LANE_D);
+                #pragma unroll
+                for(int i=0;i<LANE_D/2;i++){half2 vv=vt[i];float2 vf=__half22float2(vv);acc_o[u][i*2]+=p_r*vf.x;acc_o[u][i*2+1]+=p_r*vf.y;}}
+            m_w[u]=m_new;}
+        __syncthreads();
+    }
+    #pragma unroll
+    for(int u=0;u<QPW;u++){int qi=warp+u*N_WARPS; if(qi>=QPB) break;
+        int t=qi/GQA,g=qi-t*GQA; int tok=t_base+t; if(tok>=sub_n) continue;
+        int qh=kv_head*GQA+g; size_t ml=((size_t)qh*sub_n_max+tok)*K_SPLITS+split_idx;
+        if(lane==0){part_m[ml]=m_w[u];part_l[ml]=l_w[u];}
+        size_t ob=(((size_t)qh*sub_n_max+tok)*K_SPLITS+split_idx)*HD;
+        #pragma unroll
+        for(int i=0;i<LANE_D;i++)part_o[ob+lane*LANE_D+i]=acc_o[u][i];}
+}
+
 double maxabsdiff(const std::vector<half>&a,const std::vector<half>&b){
     double mx=0; for(size_t i=0;i<a.size();i++){double d=fabs(__half2float(a[i])-__half2float(b[i])); if(d>mx)mx=d;} return mx;
 }
@@ -231,6 +311,27 @@ double run_v2(half*q,half*k,half*v,half*out,int num_q,int num_kv,int start_pos,i
     dim3 fg(num_kv,(sub_n+NT-1)/NT,K); float scale=1.f/sqrtf((float)HD);
     auto launch=[&]{
         fa_v2<GQA,BM,BLOCK,K,NT><<<fg,BLOCK,dyn>>>(q,k,v,pm,pl,po,num_q,num_kv,start_pos,sub_n,ATTN_NB,active_end_max,scale);
+        dim3 mg(num_kv,sub_n); flash_attn_split_merge<HD,GQA,BLOCK,K><<<mg,BLOCK>>>(pm,pl,po,out,num_q,sub_n,ATTN_NB);
+    };
+    launch(); CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+    if(!timeit) return 0;
+    cudaEvent_t a,b;cudaEventCreate(&a);cudaEventCreate(&b);cudaEventRecord(a);
+    for(int i=0;i<iters;i++) launch();
+    cudaEventRecord(b);CK(cudaEventSynchronize(b));float ms;cudaEventElapsedTime(&ms,a,b);return ms/iters;
+}
+
+template<int GQA,int BM,int BLOCK,int K,int NT>
+double run_v3(half*q,half*k,half*v,half*out,int num_q,int num_kv,int start_pos,int sub_n,int seq,int iters,bool timeit){
+    int ATTN_NB=sub_n,active_end_max=seq;
+    static float *pm=0,*pl=0,*po=0; size_t pn=(size_t)num_q*ATTN_NB*K;
+    if(!pm){CK(cudaMalloc(&pm,pn*4));CK(cudaMalloc(&pl,pn*4));CK(cudaMalloc(&po,pn*HD*4));}
+    constexpr int QPB=NT*GQA;
+    int dyn=QPB*HD*2+2*BM*HD*2+QPB*BM*4;
+    void*fn=(void*)fa_v3<GQA,BM,BLOCK,K,NT>;
+    if(dyn>48*1024) cudaFuncSetAttribute(fn,cudaFuncAttributeMaxDynamicSharedMemorySize,96*1024);
+    dim3 fg(num_kv,(sub_n+NT-1)/NT,K); float scale=1.f/sqrtf((float)HD);
+    auto launch=[&]{
+        fa_v3<GQA,BM,BLOCK,K,NT><<<fg,BLOCK,dyn>>>(q,k,v,pm,pl,po,num_q,num_kv,start_pos,sub_n,ATTN_NB,active_end_max,scale);
         dim3 mg(num_kv,sub_n); flash_attn_split_merge<HD,GQA,BLOCK,K><<<mg,BLOCK>>>(pm,pl,po,out,num_q,sub_n,ATTN_NB);
     };
     launch(); CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
@@ -296,7 +397,9 @@ int main(int argc,char**argv){
     bool t=(seq>=4096);
     #define V2(NT,BM,K) { run_v2<6,BM,256,K,NT>(q,k,v,o_v2,num_q,num_kv,start_pos,sub_n,seq,0,false); \
         check("NT=" #NT " BM=" #BM " K=" #K, t?run_v2<6,BM,256,K,NT>(q,k,v,o_v2,num_q,num_kv,start_pos,sub_n,seq,200,true):0); }
-    V2(4,8,12) V2(4,8,16) V2(4,8,20) V2(4,8,24)
-    V2(4,4,16) V2(4,4,24) V2(2,8,12) V2(8,8,16)
+    V2(4,8,16)
+    #define V3(NT,BM,K) { run_v3<6,BM,256,K,NT>(q,k,v,o_v2,num_q,num_kv,start_pos,sub_n,seq,0,false); \
+        check("V3 NT=" #NT " BM=" #BM " K=" #K, t?run_v3<6,BM,256,K,NT>(q,k,v,o_v2,num_q,num_kv,start_pos,sub_n,seq,200,true):0); }
+    V3(4,8,16) V3(4,8,12) V3(2,8,16) V3(4,16,16) V3(4,8,24) V3(2,16,8)
     return 0;
 }
