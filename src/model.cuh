@@ -4544,11 +4544,17 @@ struct QwenModel {
                         continue;
                     }
                     // PREFILL_FA_V2: NT-batched dense split kernel (loads K/V
-                    // once per NT t_idx instead of per t_idx). Microbench 1.43×
-                    // over the per-t_idx split kernel; opt-in until edge cases
-                    // (short ctx / cache-hit start_pos / sub_n<NT) are validated
-                    // end-to-end. NT=4 BM=8 K_SPLITS=16 was the sweep winner.
-                    static const bool fa_v2 = getenv("PREFILL_FA_V2") != nullptr;
+                    // once per NT t_idx instead of per t_idx). NT=4 BM=8
+                    // K_SPLITS=16 (sweep winner). Default ON — validated:
+                    // microbench bit-matches the fp32 reference at 14608; engine
+                    // long-ctx gen (9522 tok) -> correct, multi-turn cache ->
+                    // correct; production prefill 18K -16% / 26K -22% vs the
+                    // occupancy-only build. PREFILL_FA_V2=0 opts back into the
+                    // per-t_idx split kernel without a rebuild.
+                    static const bool fa_v2 = [](){
+                        const char* e = getenv("PREFILL_FA_V2");
+                        return !e || e[0] != '0';
+                    }();
                     if (fa_v2) {
                         constexpr int NT = 4, BMV = 8, KV = 16;
                         int smem_v2 = (num_q == 24 ? 6 : 4) * NT * HD * sizeof(half)
