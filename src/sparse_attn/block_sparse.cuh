@@ -49,8 +49,12 @@
 //   active_end_max  position past which we never attend (causal cap shared
 //                   with the dense kernel; passed for parity, not used here
 //                   because index builder already enforces causal)
+// __launch_bounds__(BLOCK, 4): cap regs at 64/thread so 4 blocks fit per SM
+// (50% occ vs 25%) — same register-limited occupancy fix as the dense split
+// kernel. With BM=16 (dyn smem 19.4 KB) this is the production sparse-prefill
+// analogue of the dense ~1.78× score-kernel win.
 template<int HD, int GQA, int BM, int BLOCK, int K_SPLITS>
-__global__ void flash_attn_chunk_block_sparse_split(
+__global__ void __launch_bounds__(BLOCK, 4) flash_attn_chunk_block_sparse_split(
     const half* __restrict__ q_chunk,
     const half* __restrict__ k_cache,
     const half* __restrict__ v_cache,

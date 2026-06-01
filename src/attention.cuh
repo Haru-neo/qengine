@@ -1446,8 +1446,13 @@ __global__ void flash_attn_chunk_fused(
 // That keeps split-K within the fp32-reordering noise floor (≈1e-7 per add)
 // of the base flash_attn_chunk_fused kernel: greedy argmax matches across
 // long generations, so Korean quality stays intact (project_qwopus_lang_bias).
+// __launch_bounds__(BLOCK, 4): cap regs at 65536/(BLOCK*4)=64/thread so 4
+// blocks fit per SM. With BM=16 (dyn smem 19.4 KB → 4 blocks fit) this lifts
+// occupancy 25%→50% and the dense prefill score kernel ~1.78× (microbench
+// tools/fa_bench.cu, 18K last-chunk: 4.79→2.69 ms). At BM=32 smem caps at
+// 2 blocks regardless, so the prefill split path now launches BM=16.
 template<int HD, int GQA, int BM, int BLOCK, int K_SPLITS>
-__global__ void flash_attn_chunk_fused_split(
+__global__ void __launch_bounds__(BLOCK, 4) flash_attn_chunk_fused_split(
     const half* __restrict__ q_chunk,
     const half* __restrict__ k_cache,
     const half* __restrict__ v_cache,

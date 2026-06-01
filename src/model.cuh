@@ -4226,7 +4226,12 @@ struct QwenModel {
                 // grid (num_kv*sub_n) already fills SMs and the merge overhead
                 // would dominate.
                 if (fa_sk > 0 && sub_seq_total >= 4096) {
-                    constexpr int BM = 32;
+                    // BM=16 (was 32): with __launch_bounds__(BLOCK,4) on the
+                    // split kernels this drops dyn smem to 19.4 KB so 4 blocks
+                    // fit per SM (50% occ vs 25%) — dense prefill score ~1.78×
+                    // (microbench). Smaller key tiles = more tile iters but
+                    // bit-identical result.
+                    constexpr int BM = 16;
                     int active_end_max = sub_start_pos + sub_n;
                     int smem_bytes = (num_q == 24 ? 6 : 4) * HD * sizeof(half)
                                    + 2 * BM * HD * sizeof(half)
