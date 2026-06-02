@@ -39,7 +39,16 @@ struct GPUModel {
         num_layers = gguf.get_u32(arch + ".block_count");
 
         layer_gpu.resize(num_layers);
-        if (n_gpus == 4 && num_layers == 65) {
+        // PP_LAYER_BOUNDS="b1,b2,b3" overrides the 4-GPU split (cumulative
+        // boundaries): [0,b1)->GPU0, [b1,b2)->GPU1, [b2,b3)->GPU2, [b3,N)->GPU3.
+        // Lets us rebalance the prefill pipeline (the default 15/17/17/16 was
+        // chosen for load-time repack-OOM avoidance, not runtime balance).
+        const char* bounds_env = getenv("PP_LAYER_BOUNDS");
+        if (n_gpus == 4 && num_layers == 65 && bounds_env) {
+            int b1=15,b2=32,b3=49; sscanf(bounds_env, "%d,%d,%d", &b1,&b2,&b3);
+            for (int i = 0; i < num_layers; i++)
+                layer_gpu[i] = (i<b1)?0 : (i<b2)?1 : (i<b3)?2 : 3;
+        } else if (n_gpus == 4 && num_layers == 65) {
             // v2-MTP Q8_0: GPU 0 has token_embd, GPU 3 has output+MTP.
             // Shift layers away from GPU 0/3 to avoid repack-peak OOM.
             // 15 / 17 / 17 / 16
