@@ -48,6 +48,10 @@ static vision::VisionModel* g_vision_model = nullptr;
 #include <chrono>
 #include <vector>
 #include <algorithm>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
 #include <cstring>
 #include <iostream>
 
@@ -1438,12 +1442,167 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
             && !no_pipeline_env && !do_prof
             && !force_pt_gdn && !force_pt_attn && !force_pt_mlp
             && !dump_layers_chunk && !dump_prefill_hash;
+        // v3 multi-threaded pipeline (PREFILL_PIPELINE_V3=1, opt-in): one CPU
+        // launch thread per GPU segment. Measured root cause of the v2 ~61%
+        // util: a single CPU thread serializes launches — heavy GEMM launches
+        // BLOCK on the full per-stream queue (~97us vs 6us for a tiny kernel),
+        // so the one thread can only feed one GPU at a time. Per-GPU threads
+        // each block only on their own GPU's drain → all 3 GPUs run concurrently
+        // → wall → max-stage (~GPU-bound). No snapshot support yet → falls back
+        // to v2 when a snapshot is required.
+        // Default ON (opt out with PREFILL_PIPELINE_V3=0 → falls back to the
+        // single-thread v2 pipeline). Verified token-identical to v1/v2 on full
+        // + prefix-cache-hit prefills; clean A/B 1.25x faster than v2 at 18K
+        // (33.9s vs 42.4s, util 96% vs 79%) because per-GPU launch threads keep
+        // all 3 GPUs saturated instead of one CPU thread serializing launches.
+        static const bool v3_env = []{ const char* e=getenv("PREFILL_PIPELINE_V3"); return !e || e[0]!='0'; }();
+        const bool use_pipeline_v3 = v3_env && alloc_pp_v2 && common_pipe_ok;
         // v2 deep pipeline: opt-in. Handles the prefix-cache snapshot via a
         // one-time drain barrier at snapshot_target (see below).
-        const bool use_pipeline_v2 = alloc_pp_v2 && common_pipe_ok;
-        const bool use_pipeline = common_pipe_ok && !use_pipeline_v2;
+        const bool use_pipeline_v2 = alloc_pp_v2 && common_pipe_ok && !use_pipeline_v3;
+        const bool use_pipeline = common_pipe_ok && !use_pipeline_v2 && !use_pipeline_v3;
 
-        if (use_pipeline_v2) {
+        if (use_pipeline_v3) {
+            // ── Multi-threaded chunked prefill (PREFILL_PIPELINE_V3) ───────────
+            const int nseg = (int)gpu_segs.size();
+            const int last_seg = nseg - 1;
+            const int g0 = gpu_segs[0].g;
+            const int NB = PP_NBUF;
+            // Stage lambdas — each sets its own device, so they are correct when
+            // invoked from the per-stage worker thread that owns that GPU.
+            auto v3_embed = [&](int buf, int pos, int n){
+                cudaSetDevice(g0);
+                cudaStream_t s0 = prefill_comp_stream[g0];
+                float* h_in = v2_gpu_hidden[g0][buf];
+                for (int t = 0; t < n; t++) {
+                    int token_id = prompt_ids[pos + t];
+                    bool vision_hit = false;
+                    if (g_vision_embeds && g_image_pad_id >= 0 && token_id == g_image_pad_id) {
+                        if (s_vision_idx < g_vision_n_tokens && H == g_vision_H) {
+                            cudaMemcpyAsync(gpu_hidden_half[0], g_vision_embeds + (size_t)s_vision_idx * H,
+                                (size_t)H * sizeof(half), cudaMemcpyDeviceToDevice, s0);
+                            s_vision_idx++; vision_hit = true;
+                        }
+                    }
+                    if (!vision_hit) {
+                        if (embd_t->type == GGML_TYPE_Q8_0)
+                            dequant_embd_q8_0_row<<<(H+255)/256,256,0,s0>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+                        else if (embd_t->type == GGML_TYPE_Q5_K)
+                            dequant_embd_q5k_row_v2<<<(H+255)/256,256,0,s0>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+                        else if (embd_t->type == GGML_TYPE_Q6_K)
+                            dequant_embd_q6k_row_v2<<<(H+255)/256,256,0,s0>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+                    }
+                    half_to_float_kernel<<<(H+255)/256,256,0,s0>>>(gpu_hidden_half[0], h_in + (size_t)t * H, H);
+                }
+            };
+            auto v3_seg = [&](int s, int buf, int pos, int n){
+                int g = gpu_segs[s].g;
+                cudaSetDevice(g);
+                cudaStream_t cs = prefill_comp_stream[g];
+                float* h_chunk = v2_gpu_hidden[g][buf];
+                for (int layer = gpu_segs[s].l_lo; layer < gpu_segs[s].l_hi; layer++) {
+                    if (model.is_attn_layer(layer)) model.forward_attn_chunk(layer, h_chunk, pos, n, cs, slot);
+                    else                            model.forward_gdn_chunk(layer, h_chunk, n, cs, slot);
+                    if (model.layer_is_moe[layer]) model.forward_moe_chunk(layer, h_chunk, n, cs);
+                    else                           model.forward_mlp_chunk(layer, h_chunk, n, cs);
+                    model.dflash_capture_chunk(layer, h_chunk, pos, n, g, cs);
+                }
+                cudaEventRecord(v2_sd[s][buf], cs);
+            };
+            auto v3_d2h = [&](int s, int buf, int n){
+                int g = gpu_segs[s].g;
+                cudaSetDevice(g);
+                cudaStreamWaitEvent(prefill_d2h_stream[g], v2_sd[s][buf], 0);
+                cudaMemcpyAsync(v2_host_xfer[buf], v2_gpu_hidden[g][buf],
+                    (size_t)n * H * sizeof(float), cudaMemcpyDeviceToHost, prefill_d2h_stream[g]);
+                cudaEventRecord(v2_dh[s][buf], prefill_d2h_stream[g]);
+            };
+            // Buffer free-list + per-stage work queues.
+            struct W { int buf, pos, n; };
+            std::mutex mtx; std::condition_variable cv;
+            std::deque<int> free_bufs; for (int b=0;b<NB;b++) free_bufs.push_back(b);
+            std::vector<std::deque<W>> q(nseg);
+            std::vector<bool> q_done(nseg, false);
+            int v3_final_buf = -1, v3_final_n = 0;
+            auto pv_t0 = std::chrono::high_resolution_clock::now();
+
+            // Consumer threads for stages 1..last_seg.
+            std::vector<std::thread> workers;
+            for (int s = 1; s < nseg; s++) {
+                workers.emplace_back([&, s]{
+                    cudaSetDevice(gpu_segs[s].g);
+                    for (;;) {
+                        W w;
+                        { std::unique_lock<std::mutex> lk(mtx);
+                          cv.wait(lk, [&]{ return !q[s].empty() || q_done[s]; });
+                          if (q[s].empty()) break;
+                          w = q[s].front(); q[s].pop_front(); }
+                        cudaEventSynchronize(v2_dh[s-1][w.buf]);  // host-coherent: prev D2H done
+                        cudaMemcpyAsync(v2_gpu_hidden[gpu_segs[s].g][w.buf], v2_host_xfer[w.buf],
+                            (size_t)w.n * H * sizeof(float), cudaMemcpyHostToDevice, prefill_comp_stream[gpu_segs[s].g]);
+                        v3_seg(s, w.buf, w.pos, w.n);
+                        if (s < last_seg) {
+                            v3_d2h(s, w.buf, w.n);
+                            { std::lock_guard<std::mutex> lk(mtx); q[s+1].push_back(w); } cv.notify_all();
+                        } else {
+                            cudaEventSynchronize(v2_sd[last_seg][w.buf]);
+                            v3_final_buf = w.buf; v3_final_n = w.n;
+                            { std::lock_guard<std::mutex> lk(mtx); free_bufs.push_back(w.buf); } cv.notify_all();
+                        }
+                    }
+                    if (s < last_seg) { std::lock_guard<std::mutex> lk(mtx); q_done[s+1] = true; cv.notify_all(); }
+                });
+            }
+            // Producer (this thread) = stage 0.
+            cudaSetDevice(g0);
+            int v3_pos = chunk_pos; bool v3_cancel = false;
+            bool v3_snap_pending = (snapshot_target > prefix_skip);
+            while (v3_pos < prefill_len) {
+                if (cancelled && cancelled->load(std::memory_order_relaxed)) { v3_cancel = true; break; }
+                // Snapshot drain barrier: when all tokens < snapshot_target are
+                // admitted, wait for the pipeline to fully drain (every buffer
+                // back in the free-list = all in-flight chunks done), save a
+                // consistent KV/GDN snapshot, then resume. One-time, ~= tail.
+                if (v3_snap_pending && v3_pos >= snapshot_target) {
+                    { std::unique_lock<std::mutex> lk(mtx);
+                      cv.wait(lk, [&]{ return (int)free_bufs.size() == NB; }); }
+                    for (int g = 0; g < n_gpus; g++) { cudaSetDevice(g); cudaStreamSynchronize(prefill_comp_stream[g]); }
+                    model.save_prefix_snapshot(prompt_ids, snapshot_target, slot);
+                    printf("[CACHE] snapshot saved at pos=%d (v3)\n", snapshot_target);
+                    fflush(stdout);
+                    cudaSetDevice(g0);
+                    v3_snap_pending = false;
+                }
+                int n = std::min(CHUNK_SIZE, prefill_len - v3_pos);
+                int buf;
+                { std::unique_lock<std::mutex> lk(mtx);
+                  cv.wait(lk, [&]{ return !free_bufs.empty(); });
+                  buf = free_bufs.front(); free_bufs.pop_front(); }
+                v3_embed(buf, v3_pos, n);
+                v3_seg(0, buf, v3_pos, n);
+                v3_d2h(0, buf, n);
+                { std::lock_guard<std::mutex> lk(mtx); q[1].push_back({buf, v3_pos, n}); } cv.notify_all();
+                v3_pos += n;
+            }
+            { std::lock_guard<std::mutex> lk(mtx); q_done[1] = true; cv.notify_all(); }
+            for (auto& t : workers) t.join();
+            for (int g = 0; g < n_gpus; g++) { cudaSetDevice(g); cudaDeviceSynchronize(); }
+            {
+                double wall = std::chrono::duration<double,std::milli>(std::chrono::high_resolution_clock::now()-pv_t0).count();
+                printf("[PIPE_V3] wall=%.1fms (multi-thread, %d stages, NB=%d)\n", wall, nseg, NB); fflush(stdout);
+            }
+            if (v3_cancel) {
+                if (out_completion_tokens) *out_completion_tokens = (int)generated.size();
+                return tok.decode(generated);
+            }
+            if (v3_final_buf >= 0 && v3_final_n > 0) {
+                int g = gpu_model.layer_gpu[model.cfg.num_layers - 1];
+                cudaSetDevice(g);
+                cudaMemcpy(gpu_hidden_chunk[g], v2_gpu_hidden[g][v3_final_buf],
+                           (size_t)v3_final_n * H * sizeof(float), cudaMemcpyDeviceToDevice);
+            }
+            cudaSetDevice(last_gpu);
+        } else if (use_pipeline_v2) {
             // ── Deep event-driven chunked prefill (PREFILL_PIPELINE_V2) ────────
             const int NB = PP_NBUF;
             const int nseg = (int)gpu_segs.size();
@@ -1529,7 +1688,16 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
             bool snap_pending = (snapshot_target > prefix_skip);
             int admit_limit = snap_pending ? snapshot_target : prefill_len;
 
+            // PREFILL_PIPELINE_V2_PROF=1 : measure where the wall-time goes —
+            // CPU launch (admit+advance kernel launches) vs poll-spin (GPU idle
+            // waiting on events). Localizes the ~39% idle (CPU-bound vs GPU dep).
+            static const bool prof_v2 = getenv("PREFILL_PIPELINE_V2_PROF") != nullptr;
+            auto pv_now = []{ return std::chrono::high_resolution_clock::now(); };
+            auto pv_t0 = pv_now();
+            double pv_launch_ms = 0; long pv_iters = 0;
+
             while (v2_pos < prefill_len || !inflight.empty()) {
+                pv_iters++;
                 if (cancelled && cancelled->load(std::memory_order_relaxed)) { v2_cancelled = true; break; }
                 // Snapshot drain barrier: all tokens < snapshot_target fully
                 // processed (pipeline empty) → save, then lift the limit.
@@ -1545,10 +1713,12 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     if (buf_busy[b]) continue;
                     int n = std::min(CHUNK_SIZE, prefill_len - v2_pos);
                     buf_busy[b] = true;
+                    auto _la = pv_now();
                     launch_embed(b, v2_pos, n);
                     launch_seg(0, b, v2_pos, n);
                     if (nseg > 1) { launch_d2h(0, b, n); inflight.push_back({b, v2_pos, n, 1}); }
                     else          { inflight.push_back({b, v2_pos, n, 2*last_seg}); }
+                    pv_launch_ms += std::chrono::duration<double,std::milli>(pv_now()-_la).count();
                     v2_last_buf = b; v2_last_n = n;
                     v2_pos += n;
                 }
@@ -1561,7 +1731,9 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     bool done = false, advanced = false;
                     if (polling_d2h) {
                         if (cudaEventQuery(v2_dh[s][c.buf]) == cudaSuccess) {
+                            auto _la = pv_now();
                             launch_h2d_and_next(s, c.buf, c.pos, c.n);
+                            pv_launch_ms += std::chrono::duration<double,std::milli>(pv_now()-_la).count();
                             c.stage = (s+1 < last_seg) ? (2*(s+1)+1) : (2*last_seg);
                             advanced = true;
                         }
@@ -1575,6 +1747,13 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     else      i++;
                 }
                 (void)progressed;  // busy-poll; events fire fast and we mostly have work to launch
+            }
+            if (prof_v2) {
+                double wall = std::chrono::duration<double,std::milli>(pv_now()-pv_t0).count();
+                printf("[PIPE_V2 PROF] wall=%.1fms  cpu_launch=%.1fms (%.1f%%)  poll/idle=%.1fms (%.1f%%)  iters=%ld\n",
+                       wall, pv_launch_ms, 100.0*pv_launch_ms/wall,
+                       wall-pv_launch_ms, 100.0*(wall-pv_launch_ms)/wall, pv_iters);
+                fflush(stdout);
             }
             // Drain all pipeline streams before the per-token loop reads KV/state.
             for (int g = 0; g < n_gpus; g++) { cudaSetDevice(g); cudaDeviceSynchronize(); }
