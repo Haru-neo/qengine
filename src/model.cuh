@@ -5495,15 +5495,16 @@ struct QwenModel {
             num_v, v_dim, 1e-6f);
 
         // 5. Snapshot GDN state for THIS layer (post-a, for reject rollback).
-        // gdn_snapshots is a single shared buffer (slot 0 only). MTP/spec is
-        // currently constrained to one slot at a time; the scheduler enforces
-        // this by serializing slots that opt into spec.
-        if (snapshots_ready) {
+        // Snapshot is taken into the per-slot backing store at `slot`, mirroring
+        // the live conv_state_slot/rec_state_slot. With num_slots==1 (current
+        // single-stream MTP) slot==0 and this is bit-identical to the original
+        // single-buffer snapshot. restore_gdn_states(slot) reverses it.
+        if (snapshots_ready && gdn_snapshots[layer].conv_state) {
             size_t conv_sz = qkv_dim * 4 * sizeof(float);
             size_t rec_sz  = (size_t)num_v * k_dim * v_dim * sizeof(float);
-            cudaMemcpyAsync(gdn_snapshots[layer].conv_state, conv_state_slot,
+            cudaMemcpyAsync(gdn_snap_conv_slot(layer, slot), conv_state_slot,
                             conv_sz, cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(gdn_snapshots[layer].rec_state, rec_state_slot,
+            cudaMemcpyAsync(gdn_snap_rec_slot(layer, slot), rec_state_slot,
                             rec_sz, cudaMemcpyDeviceToDevice, stream);
         }
 
@@ -5817,13 +5818,14 @@ struct QwenModel {
             num_v, v_dim, 1e-6f);
 
         // Snapshot slot A — state post-token-A, for reject-both rollback.
-        // (snapshots are slot-0 only — MTP serialized to a single slot.)
+        // Captured into the per-slot backing store at `slot` (==0 in the current
+        // single-stream MTP path → bit-identical to the prior single buffer).
         if (snapshots_ready && gdn_snapshots[layer].conv_state) {
             size_t conv_sz = qkv_dim * 4 * sizeof(float);
             size_t rec_sz  = (size_t)num_v * k_dim * v_dim * sizeof(float);
-            cudaMemcpyAsync(gdn_snapshots[layer].conv_state, conv_state_slot,
+            cudaMemcpyAsync(gdn_snap_conv_slot(layer, slot), conv_state_slot,
                             conv_sz, cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(gdn_snapshots[layer].rec_state, rec_state_slot,
+            cudaMemcpyAsync(gdn_snap_rec_slot(layer, slot), rec_state_slot,
                             rec_sz, cudaMemcpyDeviceToDevice, stream);
         }
 
@@ -5841,12 +5843,13 @@ struct QwenModel {
             num_v, v_dim, 1e-6f);
 
         // Snapshot slot B — state post-token-B, for accept_a-only rollback.
+        // Captured into the per-slot B backing store at `slot` (==0 today).
         if (snapshots_b_ready && gdn_snapshots_b[layer].conv_state) {
             size_t conv_sz = qkv_dim * 4 * sizeof(float);
             size_t rec_sz  = (size_t)num_v * k_dim * v_dim * sizeof(float);
-            cudaMemcpyAsync(gdn_snapshots_b[layer].conv_state, conv_state_slot,
+            cudaMemcpyAsync(gdn_snap_b_conv_slot(layer, slot), conv_state_slot,
                             conv_sz, cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(gdn_snapshots_b[layer].rec_state, rec_state_slot,
+            cudaMemcpyAsync(gdn_snap_b_rec_slot(layer, slot), rec_state_slot,
                             rec_sz, cudaMemcpyDeviceToDevice, stream);
         }
 
@@ -5894,6 +5897,25 @@ struct QwenModel {
     std::vector<GDNSnapshot> gdn_snapshots_b;  // slot B — post-second-token (MTP K=2)
     bool snapshots_ready = false;
     bool snapshots_b_ready = false;
+
+    // Per-slot accessors into the snapshot backing store. Each layer's
+    // conv_state/rec_state holds num_slots contiguous copies, laid out
+    // identically to gdn_states (slot stride = gdn_qkv_dim_cached*4 for conv,
+    // gdn_rec_per_slot for rec). With num_slots==1 (the default single-stream
+    // MTP path) slot 0 is the only copy, so the footprint and the accessed
+    // bytes are bit-identical to the original single-buffer layout.
+    inline float* gdn_snap_conv_slot(int layer, int slot) {
+        return gdn_snapshots[layer].conv_state + (size_t)slot * gdn_qkv_dim_cached * 4;
+    }
+    inline float* gdn_snap_rec_slot(int layer, int slot) {
+        return gdn_snapshots[layer].rec_state + (size_t)slot * gdn_rec_per_slot;
+    }
+    inline float* gdn_snap_b_conv_slot(int layer, int slot) {
+        return gdn_snapshots_b[layer].conv_state + (size_t)slot * gdn_qkv_dim_cached * 4;
+    }
+    inline float* gdn_snap_b_rec_slot(int layer, int slot) {
+        return gdn_snapshots_b[layer].rec_state + (size_t)slot * gdn_rec_per_slot;
+    }
 
     // ============ DDTree: per-layer GDN persistent intermediate buffers ========
     // For each GDN layer, we keep a per-tree-node state-history buffer so that
@@ -6117,17 +6139,23 @@ struct QwenModel {
             }
             int g = gpu->layer_gpu[layer];
             cudaSetDevice(g);
-            size_t conv_sz = qkv_dim * 4 * sizeof(float);
-            size_t rec_sz  = (size_t)num_v * k_dim * v_dim * sizeof(float);
+            // Per-slot backing store: num_slots contiguous copies. num_slots==1
+            // reduces to the original single-buffer footprint exactly.
+            int ns = num_slots > 0 ? num_slots : 1;
+            size_t conv_sz = (size_t)ns * qkv_dim * 4 * sizeof(float);
+            size_t rec_sz  = (size_t)ns * num_v * k_dim * v_dim * sizeof(float);
             cudaMalloc(&gdn_snapshots[layer].conv_state, conv_sz);
             cudaMalloc(&gdn_snapshots[layer].rec_state,  rec_sz);
             total += conv_sz + rec_sz;
         }
         snapshots_ready = true;
-        printf("[SPEC] GDN snapshot buffers allocated (%.1f MB total)\n", total / 1e6);
+        printf("[SPEC] GDN snapshot buffers allocated (%.1f MB total, %d slot(s))\n",
+               total / 1e6, num_slots > 0 ? num_slots : 1);
     }
 
-    void snapshot_gdn_states(cudaStream_t stream = 0) {
+    // slot: which per-slot live/snapshot copy to capture. Defaults to 0 so the
+    // existing single-stream MTP path (snapshot/restore on slot 0) is unchanged.
+    void snapshot_gdn_states(int slot = 0, cudaStream_t stream = 0) {
         auto* qkv = t("blk.0.attn_qkv.weight");
         int qkv_dim = qkv->dims[1];
         int num_v = cfg.linear_v_heads;
@@ -6139,14 +6167,17 @@ struct QwenModel {
             if (!gdn_snapshots[layer].conv_state) continue;
             int g = gpu->layer_gpu[layer];
             cudaSetDevice(g);
-            cudaMemcpyAsync(gdn_snapshots[layer].conv_state, gdn_states[layer].conv_state,
+            cudaMemcpyAsync(gdn_snap_conv_slot(layer, slot), gdn_conv_slot(layer, slot),
                             conv_sz, cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(gdn_snapshots[layer].rec_state, gdn_states[layer].rec_state,
+            cudaMemcpyAsync(gdn_snap_rec_slot(layer, slot), gdn_rec_slot(layer, slot),
                             rec_sz, cudaMemcpyDeviceToDevice, stream);
         }
     }
 
-    void restore_gdn_states(cudaStream_t stream = 0) {
+    // slot: which per-slot copy to roll back. Defaults to 0; main.cu's
+    // single-stream MTP path calls restore_gdn_states(0) which binds slot=0,
+    // stream=0 — bit-identical to the original behavior.
+    void restore_gdn_states(int slot = 0, cudaStream_t stream = 0) {
         auto* qkv = t("blk.0.attn_qkv.weight");
         int qkv_dim = qkv->dims[1];
         int num_v = cfg.linear_v_heads;
@@ -6158,9 +6189,9 @@ struct QwenModel {
             if (!gdn_snapshots[layer].conv_state) continue;
             int g = gpu->layer_gpu[layer];
             cudaSetDevice(g);
-            cudaMemcpyAsync(gdn_states[layer].conv_state, gdn_snapshots[layer].conv_state,
+            cudaMemcpyAsync(gdn_conv_slot(layer, slot), gdn_snap_conv_slot(layer, slot),
                             conv_sz, cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(gdn_states[layer].rec_state, gdn_snapshots[layer].rec_state,
+            cudaMemcpyAsync(gdn_rec_slot(layer, slot), gdn_snap_rec_slot(layer, slot),
                             rec_sz, cudaMemcpyDeviceToDevice, stream);
         }
     }
@@ -6188,18 +6219,22 @@ struct QwenModel {
             }
             int g = gpu->layer_gpu[layer];
             cudaSetDevice(g);
-            size_t conv_sz = qkv_dim * 4 * sizeof(float);
-            size_t rec_sz  = (size_t)num_v * k_dim * v_dim * sizeof(float);
+            // Per-slot backing store: num_slots contiguous copies (see slot A).
+            int ns = num_slots > 0 ? num_slots : 1;
+            size_t conv_sz = (size_t)ns * qkv_dim * 4 * sizeof(float);
+            size_t rec_sz  = (size_t)ns * num_v * k_dim * v_dim * sizeof(float);
             cudaMalloc(&gdn_snapshots_b[layer].conv_state, conv_sz);
             cudaMalloc(&gdn_snapshots_b[layer].rec_state,  rec_sz);
             total += conv_sz + rec_sz;
         }
         snapshots_b_ready = true;
-        printf("[SPEC] GDN snapshot B buffers allocated (%.1f MB total) — MTP K=2\n", total / 1e6);
+        printf("[SPEC] GDN snapshot B buffers allocated (%.1f MB total, %d slot(s)) — MTP K=2\n",
+               total / 1e6, num_slots > 0 ? num_slots : 1);
     }
 
-    // Restore from slot B (post-draft1).
-    void restore_gdn_states_b(cudaStream_t stream = 0) {
+    // Restore from slot B (post-draft1). slot defaults to 0 so the existing
+    // restore_gdn_states_b(0) call binds slot=0, stream=0 (unchanged behavior).
+    void restore_gdn_states_b(int slot = 0, cudaStream_t stream = 0) {
         if (!snapshots_b_ready) return;
         auto* qkv = t("blk.0.attn_qkv.weight");
         int qkv_dim = qkv->dims[1];
@@ -6212,9 +6247,9 @@ struct QwenModel {
             if (!gdn_snapshots_b[layer].conv_state) continue;
             int g = gpu->layer_gpu[layer];
             cudaSetDevice(g);
-            cudaMemcpyAsync(gdn_states[layer].conv_state, gdn_snapshots_b[layer].conv_state,
+            cudaMemcpyAsync(gdn_conv_slot(layer, slot), gdn_snap_b_conv_slot(layer, slot),
                             conv_sz, cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(gdn_states[layer].rec_state,  gdn_snapshots_b[layer].rec_state,
+            cudaMemcpyAsync(gdn_rec_slot(layer, slot), gdn_snap_b_rec_slot(layer, slot),
                             rec_sz, cudaMemcpyDeviceToDevice, stream);
         }
     }

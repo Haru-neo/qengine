@@ -1215,6 +1215,27 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     long long spec_accept_count = 0;
     long long spec_total_count  = 0;
 
+    // ── Dynamic slot-router (RANK 1) ────────────────────────────────
+    // When slot 0 runs the legacy MTP single-stream fast path it holds
+    // sched.forward_mutex() for its whole run, which blocks the batched
+    // gen-loop the moment a 2nd request arrives (concurrency REGRESSES from
+    // ~24 t/s single-stream to ~17 t/s). The router lets slot-0's MTP loop
+    // cooperatively yield: when any slot 1..N becomes active mid-MTP, run_fn
+    // raises `router_yield_signal`; generate_impl polls it (RELAXED, every
+    // few tokens, no lock) and breaks the MTP loop CLEANLY at the TOP of a
+    // step iter — where slot-0's live GDN+KV state is exactly consistent with
+    // the last emitted token (no restore_gdn_states needed). It then hands the
+    // continuation (next_tok + slot_pos + the tokens already emitted) back to
+    // run_fn through the dyn_yield_* out-params, and run_fn registers slot 0
+    // into slot_gen_state so the batched loop drives it alongside the new
+    // request. QWEN_DYNAMIC_ROUTER=0 disables (today's behavior — full MTP,
+    // no yield) for bisecting. Default ON.
+    static const bool dynamic_router_on = []{
+        const char* e = getenv("QWEN_DYNAMIC_ROUTER");
+        return !e || e[0] != '0';
+    }();
+    std::atomic<bool> router_yield_signal{false};
+
     SamplingParams sp;
     sp.rep_penalty = 1.0f;  // match llama.cpp default; users can set via repetition_penalty in request
     Sampler sampler;
@@ -1257,7 +1278,25 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                              int slot = 0,
                              int* batched_handoff_first_tok = nullptr,
                              int* batched_handoff_slot_pos = nullptr,
-                             std::atomic<bool>* cancelled = nullptr) -> std::string {
+                             std::atomic<bool>* cancelled = nullptr,
+                             // Dynamic slot-router yield (RANK 1). When
+                             // dyn_yield_tok is non-null AND router_yield_signal
+                             // fires mid-generation, the MTP loop breaks at a
+                             // step boundary and hands the continuation state
+                             // back here: *dyn_yield_tok = last emitted token
+                             // (the one forward_step_batched should embed next),
+                             // *dyn_yield_pos = its KV write position, and the
+                             // already-emitted tokens / think-state / output
+                             // count via the dyn_yield_* sinks below. on_token
+                             // has ALREADY fired for every token in dyn_yield_gen
+                             // — the caller must NOT re-stream them. When the
+                             // loop finishes normally these stay untouched
+                             // (*dyn_yield_tok keeps its caller-set sentinel).
+                             int* dyn_yield_tok = nullptr,
+                             int* dyn_yield_pos = nullptr,
+                             std::vector<int>* dyn_yield_gen = nullptr,
+                             int* dyn_yield_output_tokens = nullptr,
+                             bool* dyn_yield_in_think = nullptr) -> std::string {
         // Prefix cache: if caller asked for caching AND a snapshot matches
         // the requested prefix, restore state instead of resetting. Otherwise
         // do a normal full reset.
@@ -2118,8 +2157,34 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
             return output_tokens >= max_gen;
         };
         int step_cap = std::min((int)prompt_ids.size() + max_gen + 4096, max_seq);
+        int dyn_poll_ctr = 0;   // throttle the router-yield atomic poll
         for (int step = prefill_len; step < step_cap; step++) {
             if (cancelled && cancelled->load(std::memory_order_relaxed)) break;
+
+            // ── Dynamic slot-router cooperative yield (RANK 1) ─────────────
+            // Poll the yield signal at the TOP of a step iter, BEFORE any
+            // forward for `step` runs. Here slot-0's live GDN + KV state is
+            // fully consistent with the last emitted token (every spec
+            // accept/reject already applied its own rollback at the end of
+            // the previous iter), and `generated.back()` is the token whose
+            // forward would write KV at position `step`. That is exactly the
+            // (next_tok, slot_pos) contract forward_step_batched expects, so
+            // we can hand off WITHOUT touching GDN state (NO restore_gdn_states
+            // — the advanced state IS what the batched path consumes). We only
+            // yield once we are past prefill (step >= prompt_len, so `generated`
+            // is non-empty and holds the token to embed next).
+            if (dyn_yield_tok && dynamic_router_on
+                && step >= (int)prompt_ids.size()
+                && ((dyn_poll_ctr++ & 0x3) == 0)            // every 4 tokens
+                && router_yield_signal.load(std::memory_order_relaxed)) {
+                *dyn_yield_tok = generated.back();          // token at logical pos `step`
+                if (dyn_yield_pos)           *dyn_yield_pos = step;
+                if (dyn_yield_gen)           *dyn_yield_gen = generated;
+                if (dyn_yield_output_tokens) *dyn_yield_output_tokens = output_tokens;
+                if (dyn_yield_in_think)      *dyn_yield_in_think = in_think;
+                break;
+            }
+
             int token_id = step < (int)prompt_ids.size() ? prompt_ids[step] : generated.back();
 
             cudaSetDevice(0);
@@ -3469,6 +3534,24 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         return false;
     };
 
+    // Dynamic slot-router (RANK 1): count of in-flight requests on slots
+    // OTHER than slot 0. While >0, slot-0's legacy MTP fast path must yield
+    // (router_yield_signal raised) so the batched loop can run both. Raised
+    // at the TOP of run_fn for slot!=0 (before any forward_mutex acquisition),
+    // lowered on that request's completion. When it drops back to 0 the next
+    // lone slot-0 request goes back to full MTP single-stream.
+    std::atomic<int> router_others_inflight{0};
+    auto router_enter_other = [&]() {
+        if (!dynamic_router_on) return;
+        router_others_inflight.fetch_add(1, std::memory_order_acq_rel);
+        router_yield_signal.store(true, std::memory_order_release);
+    };
+    auto router_leave_other = [&]() {
+        if (!dynamic_router_on) return;
+        if (router_others_inflight.fetch_sub(1, std::memory_order_acq_rel) == 1)
+            router_yield_signal.store(false, std::memory_order_release);
+    };
+
     std::thread gen_loop_thread;  // started below, after `sched` is in scope.
 
     qwen_engine::GenScheduler sched(num_slots,
@@ -3478,6 +3561,23 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
             };
             int completion_tokens = 0;
             std::string final_text;
+
+            // Dynamic slot-router (RANK 1): any request NOT on slot 0 raises
+            // the yield signal so slot-0's legacy MTP loop cooperatively bails
+            // and lets the batched loop drive both. Raise BEFORE acquiring any
+            // forward_mutex (slot-0 holds it for its whole MTP run, so we must
+            // signal it to release before we can make progress). RAII guard
+            // lowers the count when this request finishes.
+            struct RouterGuard {
+                bool engaged = false;
+                std::function<void()> leave;
+                ~RouterGuard() { if (engaged) leave(); }
+            } router_guard;
+            if (slot != 0) {
+                router_enter_other();
+                router_guard.engaged = true;
+                router_guard.leave = router_leave_other;
+            }
 
             // Grammar-constrained requests force the legacy single-stream path:
             // sampler is shared (one Sampler instance) so we can only bind one
@@ -3522,6 +3622,18 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
             // faster than a batched N=2 step would, and other slots queue.
             // QWEN_NO_LEGACY_FAST_PATH=1 disables this optimization (always
             // batched) — useful for benchmarking pure batched throughput.
+            // Dynamic-router continuation state. When slot-0's legacy MTP loop
+            // yields mid-generation (a 2nd request arrived), generate_impl hands
+            // back the tokens it already emitted + the live (next_tok, slot_pos)
+            // through these. We then seed the batched gen-loop with the FULL
+            // history instead of clearing it. dyn_yielded gates that path.
+            bool             dyn_yielded = false;
+            int              dyn_yield_tok = -1;       // sentinel: not yielded
+            int              dyn_yield_pos = 0;
+            std::vector<int> dyn_yield_gen;
+            int              dyn_yield_output_tokens = 0;
+            bool             dyn_yield_in_think = false;
+
             if (slot == 0 && getenv("QWEN_NO_LEGACY_FAST_PATH") == nullptr) {
                 bool alone;
                 {
@@ -3532,26 +3644,47 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     }
                 }
                 if (alone) {
-                    std::lock_guard<std::mutex> lk(sched.forward_mutex());
-                    final_text = generate_impl(seq.prompt_ids, seq.max_tokens,
-                                               seq.cached_prompt_tokens,
-                                               &completion_tokens, on_tok, slot,
-                                               nullptr, nullptr, &seq.cancelled);
-                    if (seq.on_done) seq.on_done(std::move(final_text), completion_tokens);
-                    return;
+                    {
+                        std::lock_guard<std::mutex> lk(sched.forward_mutex());
+                        // Pass the dynamic-router yield hooks. generate_impl runs
+                        // full MTP; if router_yield_signal fires mid-gen it breaks
+                        // cleanly at a step boundary and fills dyn_yield_*.
+                        final_text = generate_impl(seq.prompt_ids, seq.max_tokens,
+                                                   seq.cached_prompt_tokens,
+                                                   &completion_tokens, on_tok, slot,
+                                                   nullptr, nullptr, &seq.cancelled,
+                                                   &dyn_yield_tok, &dyn_yield_pos,
+                                                   &dyn_yield_gen,
+                                                   &dyn_yield_output_tokens,
+                                                   &dyn_yield_in_think);
+                    }
+                    if (dyn_yield_tok < 0) {
+                        // MTP ran to completion (no yield) — same as before.
+                        if (seq.on_done) seq.on_done(std::move(final_text), completion_tokens);
+                        return;
+                    }
+                    // Yielded mid-generation: fall through to register slot 0
+                    // into the batched gen loop, seeded with the emitted history
+                    // and the live continuation point. NO GDN restore — the live
+                    // state already matches dyn_yield_tok @ dyn_yield_pos.
+                    dyn_yielded = true;
                 }
             }
 
             // Batched path: prefill + first-token sample under the mutex via
             // generate_impl's handoff hook, then drive remaining tokens via
-            // the gen-loop thread.
+            // the gen-loop thread. (When dyn_yielded, prefill+MTP already ran;
+            // we just hand the continuation to the gen loop.)
             int first_tok = -1, slot_pos_after = 0;
-            {
+            if (!dyn_yielded) {
                 std::lock_guard<std::mutex> lk(sched.forward_mutex());
                 generate_impl(seq.prompt_ids, seq.max_tokens,
                               seq.cached_prompt_tokens,
                               &completion_tokens, on_tok, slot,
                               &first_tok, &slot_pos_after, &seq.cancelled);
+            } else {
+                first_tok      = dyn_yield_tok;
+                slot_pos_after = dyn_yield_pos;
             }
             // Reset per-slot gen state.
             auto& st = *slot_gen_state[slot];
@@ -3559,21 +3692,37 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 std::lock_guard<std::mutex> lk(gen_loop_mu);
                 st.active = false;
                 st.done = false;
-                st.in_think = false;
-                st.output_tokens = 0;
-                st.generated.clear();
                 st.on_token = on_tok;
                 st.cancelled = &seq.cancelled;
                 int prompt_len = (int)seq.prompt_ids.size();
                 st.max_gen = seq.max_tokens > 0
                              ? seq.max_tokens
                              : std::max(64, model.slot_capacity(slot) - prompt_len - 64);
+                if (dyn_yielded) {
+                    // Seed with the FULL emitted history. on_token already fired
+                    // for every token in dyn_yield_gen, so the gen loop must NOT
+                    // re-stream them — it appends only NEW tokens from here.
+                    st.generated     = std::move(dyn_yield_gen);
+                    st.output_tokens = dyn_yield_output_tokens;
+                    st.in_think      = dyn_yield_in_think;
+                } else {
+                    st.in_think = false;
+                    st.output_tokens = 0;
+                    st.generated.clear();
+                }
             }
             // first_tok already pushed into generate_impl's local `generated`
             // and on_token fired. Replicate the bookkeeping here so our
             // SlotGenState matches the model's side.
             bool stop = false;
-            if (first_tok < 0) {
+            if (dyn_yielded) {
+                // dyn_yield_tok (== first_tok) is the LAST already-emitted token
+                // and is ALREADY in st.generated + counted in output_tokens. The
+                // gen loop embeds it next (next_tok) and writes its KV at
+                // slot_pos; the token it samples becomes the NEXT new token. So
+                // do not re-push or re-count here — just check the gen budget.
+                if (st.output_tokens >= st.max_gen) stop = true;
+            } else if (first_tok < 0) {
                 // generate_impl took an early exit before sampling (max_tokens=0
                 // or empty prompt). Treat as immediate stop.
                 stop = true;
