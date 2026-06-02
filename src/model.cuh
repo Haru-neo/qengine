@@ -2535,6 +2535,22 @@ struct QwenModel {
             std::fill(tq_decoded_until.begin(), tq_decoded_until.end(), -1);
     }
 
+    // STAGE 0 (embed/rerank latency): reset everything EXCEPT the ~1.15 GB KV
+    // cache memset. Safe ONLY for the fresh-KV-per-request fp16 path (embed/
+    // rerank sidecars, no Q8/TQ KV): a new request writes fresh K/V over
+    // [0, plen) and attends strictly causally within [0, pos<=plen), while the
+    // FA kernel masks query rows >= active_end to -inf and zero-fills out-of-
+    // range K/V tiles — so stale KV at pos >= plen (from a longer previous doc)
+    // is NEVER read. Skipping the per-doc full-cache memset removes a length-
+    // independent ~1.15 GB (36 layers × kv_total_seq × kv_dim × 2B × 2) tax paid
+    // on EVERY forward. NOT safe for Q8/TQ KV (dequant may touch wider ranges),
+    // so callers must only use this on the fp16 dense sidecar path.
+    void reset_states_no_kv_memset() {
+        reset_gdn_states_inner();
+        if (!tq_decoded_until.empty())
+            std::fill(tq_decoded_until.begin(), tq_decoded_until.end(), -1);
+    }
+
     // ============ Prefix cache (per-slot) ============
     // Each slot owns a snapshot of (KV [0, N) + GDN recurrent state) taken at
     // a chunk-aligned position. On the next request that hits the same first

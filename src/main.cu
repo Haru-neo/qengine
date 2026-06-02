@@ -4198,8 +4198,14 @@ static bool run_embed_forward(EmbedForwardCtx& C,
     // RERANK_PER_TOKEN=1 forces the legacy one-token-at-a-time prefill (for
     // A/B correctness checks against the chunked path).
     static const bool per_token = getenv("RERANK_PER_TOKEN") != nullptr;
+    // STAGE 0: skip the ~1.15 GB per-doc KV memset on the fp16 dense sidecar
+    // path (safe: causal attention + fresh KV writes never read stale pos>=plen
+    // from a longer previous doc). EMBED_SKIP_KV_RESET=0 reverts to the full
+    // reset for A/B / bisecting.
+    static const bool skip_kv_reset = []{ const char* e=getenv("EMBED_SKIP_KV_RESET"); return !e || e[0]!='0'; }();
+    auto embed_reset = [&]{ if (skip_kv_reset) model.reset_states_no_kv_memset(); else model.reset_all_states(); };
     if (per_token) {
-        model.reset_all_states();
+        embed_reset();
         for (int step = 0; step < (int)prompt_ids.size(); step++) {
             int tok = prompt_ids[step];
             cudaSetDevice(0);
@@ -4249,7 +4255,7 @@ static bool run_embed_forward(EmbedForwardCtx& C,
     // uses for prompt processing. For an N-token rerank/embed prompt this turns
     // N sequential single-token forwards into ceil(N/256) batched ones.
     constexpr int CHUNK = QwenModel::CHUNK_SIZE;
-    model.reset_all_states();
+    embed_reset();   // STAGE 0: skip the full KV memset on the fp16 dense path
     int plen = (int)prompt_ids.size();
     int chunk_pos = 0;
     float* last_h = nullptr;   // chunk buffer holding the final chunk (on last_gpu)
