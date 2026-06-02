@@ -938,6 +938,47 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
             cudaEventCreateWithFlags(&pp_h2d_done[s][b], cudaEventDisableTiming);
         }
     }
+    // ── PREFILL_PIPELINE_V2 resources ───────────────────────────────────────
+    // Deep (N-buffer) event-driven prefill pipeline. The legacy double-buffer
+    // path (above) serializes the 3-GPU pipeline because the per-segment host
+    // fence (cudaEventSynchronize) blocks the CPU launch loop, so GPUs run one
+    // chunk-segment at a time (~48% util, measured). v2 keeps NB chunks in
+    // flight and replaces the blocking fence with a NON-blocking cudaEventQuery
+    // poll: when a segment's D2H completes (host memory coherent — same
+    // completion guarantee as cudaEventSynchronize, unlike the GPU-side
+    // cudaStreamWaitEvent which does NOT fence pinned host on no-P2P CMP), the
+    // scheduler launches that hop's H2D + the next segment, and spends the wait
+    // launching OTHER chunks' segments. All 3 GPUs stay busy on different
+    // chunks. Single-threaded: every CUDA call is on the main thread, per-GPU
+    // compute-stream FIFO serializes same-GPU chunk-segments so the shared
+    // per-GPU chunk scratch is reused safely.
+    constexpr int PP_NBUF = 6;
+    // Default ON (verified token-identical to the v1 double-buffer pipeline on
+    // full + prefix-cache-hit prefills; 1.6-1.9x faster at 18K). Opt out with
+    // PREFILL_PIPELINE_V2=0.
+    const bool alloc_pp_v2 = [](){ const char* e = getenv("PREFILL_PIPELINE_V2"); return !e || e[0] != '0'; }();
+    float* v2_host_xfer[PP_NBUF] = {};
+    float* v2_gpu_hidden[4][PP_NBUF] = {};
+    cudaEvent_t v2_sd[PP_MAX_SEGS][PP_NBUF] = {};   // seg compute done
+    cudaEvent_t v2_dh[PP_MAX_SEGS][PP_NBUF] = {};   // D2H done (host coherent)
+    cudaEvent_t v2_hd[PP_MAX_SEGS][PP_NBUF] = {};   // H2D done
+    if (alloc_pp_v2) {
+        for (int b = 0; b < PP_NBUF; b++)
+            cudaMallocHost(&v2_host_xfer[b], (size_t)CHUNK_SIZE * H * sizeof(float));
+        for (int g = 0; g < n_gpus; g++) {
+            cudaSetDevice(g);
+            for (int b = 0; b < PP_NBUF; b++)
+                cudaMalloc(&v2_gpu_hidden[g][b], (size_t)CHUNK_SIZE * H * sizeof(float));
+        }
+        for (int s = 0; s < (int)gpu_segs.size(); s++) {
+            cudaSetDevice(gpu_segs[s].g);
+            for (int b = 0; b < PP_NBUF; b++) {
+                cudaEventCreateWithFlags(&v2_sd[s][b], cudaEventDisableTiming);
+                cudaEventCreateWithFlags(&v2_dh[s][b], cudaEventDisableTiming);
+                cudaEventCreateWithFlags(&v2_hd[s][b], cudaEventDisableTiming);
+            }
+        }
+    }
     QuantInput qi_logits;
     // GPU argmax fast path: when temp=0 and rep_penalty=1.0 we can pick the
     // winning token entirely on-device and only transfer 4 bytes back over
@@ -1393,12 +1434,163 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         // overlap, keeps cross-segment async). Bisect helper for the drift
         // we see at certain prompt lengths.
         static const bool chunks_serial = getenv("PREFILL_CHUNKS_SERIAL") != nullptr;
-        const bool use_pipeline = (gpu_segs.size() >= 2)
+        const bool common_pipe_ok = (gpu_segs.size() >= 2)
             && !no_pipeline_env && !do_prof
             && !force_pt_gdn && !force_pt_attn && !force_pt_mlp
             && !dump_layers_chunk && !dump_prefill_hash;
+        // v2 deep pipeline: opt-in. Handles the prefix-cache snapshot via a
+        // one-time drain barrier at snapshot_target (see below).
+        const bool use_pipeline_v2 = alloc_pp_v2 && common_pipe_ok;
+        const bool use_pipeline = common_pipe_ok && !use_pipeline_v2;
 
-        if (use_pipeline) {
+        if (use_pipeline_v2) {
+            // ── Deep event-driven chunked prefill (PREFILL_PIPELINE_V2) ────────
+            const int NB = PP_NBUF;
+            const int nseg = (int)gpu_segs.size();
+            const int last_seg = nseg - 1;
+            const int g0 = gpu_segs[0].g;
+            // Embed n tokens of a chunk onto buffer `buf` of GPU0, on GPU0's
+            // compute stream (FIFO-serialized vs other chunks' embeds, so the
+            // shared gpu_hidden_half[0] scratch is reused safely).
+            auto launch_embed = [&](int buf, int pos, int n){
+                cudaSetDevice(g0);
+                cudaStream_t s0 = prefill_comp_stream[g0];
+                float* h_in = v2_gpu_hidden[g0][buf];
+                for (int t = 0; t < n; t++) {
+                    int token_id = prompt_ids[pos + t];
+                    bool vision_hit = false;
+                    if (g_vision_embeds && g_image_pad_id >= 0 && token_id == g_image_pad_id) {
+                        if (s_vision_idx < g_vision_n_tokens && H == g_vision_H) {
+                            cudaMemcpyAsync(gpu_hidden_half[0],
+                                g_vision_embeds + (size_t)s_vision_idx * H,
+                                (size_t)H * sizeof(half), cudaMemcpyDeviceToDevice, s0);
+                            s_vision_idx++; vision_hit = true;
+                        }
+                    }
+                    if (!vision_hit) {
+                        if (embd_t->type == GGML_TYPE_Q8_0)
+                            dequant_embd_q8_0_row<<<(H+255)/256,256,0,s0>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+                        else if (embd_t->type == GGML_TYPE_Q5_K)
+                            dequant_embd_q5k_row_v2<<<(H+255)/256,256,0,s0>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+                        else if (embd_t->type == GGML_TYPE_Q6_K)
+                            dequant_embd_q6k_row_v2<<<(H+255)/256,256,0,s0>>>(embd_t->data, gpu_hidden_half[0], token_id, H);
+                    }
+                    half_to_float_kernel<<<(H+255)/256,256,0,s0>>>(gpu_hidden_half[0], h_in + (size_t)t * H, H);
+                }
+            };
+            // Run segment s's layers for chunk (buf,pos,n) on its GPU's compute
+            // stream; record seg-done.
+            auto launch_seg = [&](int s, int buf, int pos, int n){
+                int g = gpu_segs[s].g;
+                cudaSetDevice(g);
+                cudaStream_t cs = prefill_comp_stream[g];
+                float* h_chunk = v2_gpu_hidden[g][buf];
+                for (int layer = gpu_segs[s].l_lo; layer < gpu_segs[s].l_hi; layer++) {
+                    if (model.is_attn_layer(layer)) model.forward_attn_chunk(layer, h_chunk, pos, n, cs, slot);
+                    else                            model.forward_gdn_chunk(layer, h_chunk, n, cs, slot);
+                    if (model.layer_is_moe[layer]) model.forward_moe_chunk(layer, h_chunk, n, cs);
+                    else                           model.forward_mlp_chunk(layer, h_chunk, n, cs);
+                    model.dflash_capture_chunk(layer, h_chunk, pos, n, g, cs);
+                }
+                cudaEventRecord(v2_sd[s][buf], cs);
+            };
+            // Issue the D2H at the end of segment s (depends seg-done[s]).
+            auto launch_d2h = [&](int s, int buf, int n){
+                int g = gpu_segs[s].g;
+                cudaSetDevice(g);
+                cudaStreamWaitEvent(prefill_d2h_stream[g], v2_sd[s][buf], 0);
+                cudaMemcpyAsync(v2_host_xfer[buf], v2_gpu_hidden[g][buf],
+                    (size_t)n * H * sizeof(float), cudaMemcpyDeviceToHost, prefill_d2h_stream[g]);
+                cudaEventRecord(v2_dh[s][buf], prefill_d2h_stream[g]);
+            };
+            // After D2H[s] is host-complete: H2D into seg s+1's GPU, then launch
+            // seg s+1 (gated on H2D).
+            auto launch_h2d_and_next = [&](int s, int buf, int pos, int n){
+                int gnext = gpu_segs[s+1].g;
+                cudaSetDevice(gnext);
+                cudaMemcpyAsync(v2_gpu_hidden[gnext][buf], v2_host_xfer[buf],
+                    (size_t)n * H * sizeof(float), cudaMemcpyHostToDevice, prefill_h2d_stream[gnext]);
+                cudaEventRecord(v2_hd[s][buf], prefill_h2d_stream[gnext]);
+                cudaStreamWaitEvent(prefill_comp_stream[gnext], v2_hd[s][buf], 0);
+                launch_seg(s+1, buf, pos, n);
+                if (s+1 < last_seg) launch_d2h(s+1, buf, n);
+            };
+
+            struct IFC { int buf, pos, n, stage; };  // stage: 2*s=awaiting seg_done[s]; 2*s+1=polling d2h[s]
+            std::vector<IFC> inflight;
+            bool buf_busy[PP_NBUF] = {};
+            int v2_pos = chunk_pos, v2_last_buf = -1, v2_last_n = 0;  // resume from prefix-cache hit (chunk_pos = prefix_skip)
+            bool v2_cancelled = false;
+            // Prefix-cache snapshot: save a consistent KV/GDN state at
+            // snapshot_target. v2 enforces a one-time drain barrier there —
+            // admit only up to snapshot_target, let the pipeline empty, save,
+            // then resume. snapshot_target is chunk-aligned and ~= prompt end,
+            // so the barrier costs one pipeline-depth bubble near the tail.
+            bool snap_pending = (snapshot_target > prefix_skip);
+            int admit_limit = snap_pending ? snapshot_target : prefill_len;
+
+            while (v2_pos < prefill_len || !inflight.empty()) {
+                if (cancelled && cancelled->load(std::memory_order_relaxed)) { v2_cancelled = true; break; }
+                // Snapshot drain barrier: all tokens < snapshot_target fully
+                // processed (pipeline empty) → save, then lift the limit.
+                if (snap_pending && v2_pos >= admit_limit && inflight.empty()) {
+                    for (int g = 0; g < n_gpus; g++) { cudaSetDevice(g); cudaStreamSynchronize(prefill_comp_stream[g]); }
+                    model.save_prefix_snapshot(prompt_ids, snapshot_target, slot);
+                    printf("[CACHE] snapshot saved at pos=%d (v2)\n", snapshot_target);
+                    fflush(stdout);
+                    snap_pending = false; admit_limit = prefill_len;
+                }
+                // 1) Admit new chunks into any free buffer.
+                for (int b = 0; b < NB && v2_pos < admit_limit; b++) {
+                    if (buf_busy[b]) continue;
+                    int n = std::min(CHUNK_SIZE, prefill_len - v2_pos);
+                    buf_busy[b] = true;
+                    launch_embed(b, v2_pos, n);
+                    launch_seg(0, b, v2_pos, n);
+                    if (nseg > 1) { launch_d2h(0, b, n); inflight.push_back({b, v2_pos, n, 1}); }
+                    else          { inflight.push_back({b, v2_pos, n, 2*last_seg}); }
+                    v2_last_buf = b; v2_last_n = n;
+                    v2_pos += n;
+                }
+                // 2) Advance any in-flight chunk whose pending event is ready.
+                bool progressed = false;
+                for (size_t i = 0; i < inflight.size(); ) {
+                    IFC& c = inflight[i];
+                    int s = c.stage >> 1;
+                    bool polling_d2h = c.stage & 1;
+                    bool done = false, advanced = false;
+                    if (polling_d2h) {
+                        if (cudaEventQuery(v2_dh[s][c.buf]) == cudaSuccess) {
+                            launch_h2d_and_next(s, c.buf, c.pos, c.n);
+                            c.stage = (s+1 < last_seg) ? (2*(s+1)+1) : (2*last_seg);
+                            advanced = true;
+                        }
+                    } else { // awaiting seg_done[s]; only the last segment lands here
+                        if (cudaEventQuery(v2_sd[s][c.buf]) == cudaSuccess) {
+                            buf_busy[c.buf] = false; done = true; advanced = true;
+                        }
+                    }
+                    if (advanced) progressed = true;
+                    if (done) inflight.erase(inflight.begin() + i);
+                    else      i++;
+                }
+                (void)progressed;  // busy-poll; events fire fast and we mostly have work to launch
+            }
+            // Drain all pipeline streams before the per-token loop reads KV/state.
+            for (int g = 0; g < n_gpus; g++) { cudaSetDevice(g); cudaDeviceSynchronize(); }
+            if (v2_cancelled) {
+                if (out_completion_tokens) *out_completion_tokens = (int)generated.size();
+                return tok.decode(generated);
+            }
+            // Hand the final chunk's hidden to where the per-token loop expects it.
+            if (v2_last_buf >= 0 && v2_last_n > 0) {
+                int g = gpu_model.layer_gpu[model.cfg.num_layers - 1];
+                cudaSetDevice(g);
+                cudaMemcpy(gpu_hidden_chunk[g], v2_gpu_hidden[g][v2_last_buf],
+                           (size_t)v2_last_n * H * sizeof(float), cudaMemcpyDeviceToDevice);
+            }
+            cudaSetDevice(last_gpu);
+        } else if (use_pipeline) {
             // ── Pipelined chunked prefill ──────────────────────────────────
             // Per-segment compute streams + per-GPU D2H/H2D streams + double-
             // buffered (host transfer, per-GPU hidden chunk). chunk i's D2H
