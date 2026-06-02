@@ -4160,8 +4160,13 @@ struct QwenModel {
         // FlashAttention fused path: score+softmax+value in one kernel per
         // (kv_head, t_idx). Supports Qwen3.5-27B (GQA=6) and -9B (GQA=4)
         // attention shapes.
-        bool can_flash = g_use_flash_attn && hd == 256 && num_kv == 4
-                      && (num_q == 24 || num_q == 16);
+        // 27B/9B hybrid: HD=256, num_kv=4, GQA = num_q/num_kv (6 or 4).
+        // Qwen3-4B dense embed/reranker: HD=128, num_q=32, num_kv=8, GQA=4
+        // (full rope_dim=128, applied pre-FA below — FA kernels are rope-agnostic).
+        bool can_flash_hybrid = (hd == 256 && num_kv == 4
+                              && (num_q == 24 || num_q == 16));
+        bool can_flash_dense  = (hd == 128 && num_kv == 8 && num_q == 32);
+        bool can_flash = g_use_flash_attn && (can_flash_hybrid || can_flash_dense);
         while (sub_processed < n_tokens) {
             int sub_n = std::min(ATTN_NB, n_tokens - sub_processed);
             int sub_start_pos = start_pos + sub_processed;
@@ -4225,7 +4230,7 @@ struct QwenModel {
                 // Split-K shortcut. Skipped for short contexts where the base
                 // grid (num_kv*sub_n) already fills SMs and the merge overhead
                 // would dominate.
-                if (fa_sk > 0 && sub_seq_total >= 4096) {
+                if (fa_sk > 0 && sub_seq_total >= 4096 && hd == 256) {
                     // BM=16 (was 32): with __launch_bounds__(BLOCK,4) on the
                     // split kernels this drops dyn smem to 19.4 KB so 4 blocks
                     // fit per SM (50% occ vs 25%) — dense prefill score ~1.78×
@@ -4608,6 +4613,49 @@ struct QwenModel {
                         if      (fa_sk == 2) launch_split(std::integral_constant<int,4>{}, std::integral_constant<int,2>{});
                         else if (fa_sk == 4) launch_split(std::integral_constant<int,4>{}, std::integral_constant<int,4>{});
                         else                 launch_split(std::integral_constant<int,4>{}, std::integral_constant<int,8>{});
+                    }
+                    if (g_profile_attn) g_attn_fused_ms += pa_sync_ms(tf0);
+                    sub_processed += sub_n;
+                    continue;
+                }
+                if (hd == 128) {
+                    // Qwen3-4B dense embed/reranker: HD=128, GQA=4, num_kv=8.
+                    // Mirrors the GQA=4 base-path dispatch below but with a
+                    // 128-wide head. fp16 KV (k_cache_ptr=kv.k), short ctx,
+                    // no split-K/sparse/Q8 (gated to hd==256 above).
+                    constexpr int HD128 = 128, GQA = 4;
+                    if (fa_nt == 2) {
+                        // GQA=4 N_T=2 → 8 active warps, BLOCK=256 (exact fit).
+                        constexpr int BM = 32, NT = 2;
+                        int smem_bytes = NT * GQA * HD128 * sizeof(half)
+                                       + 2 * BM * HD128 * sizeof(half)
+                                       + NT * GQA * BM * sizeof(float);
+                        dim3 fg(num_kv, (sub_n + NT - 1) / NT);
+                        flash_attn_chunk_fused_nt<HD128, GQA, BM, BLOCK, NT>
+                            <<<fg, BLOCK, smem_bytes, stream>>>(
+                                q_post_sub, k_cache_ptr, v_cache_ptr, out_sub,
+                                num_q, num_kv, sub_start_pos, sub_n, scale);
+                    } else if (fa_bm == 64) {
+                        constexpr int BM = 64;
+                        dim3 fg(num_kv, sub_n);
+                        int smem_bytes = GQA * HD128 * sizeof(half)
+                                       + 2 * BM * HD128 * sizeof(half)
+                                       + GQA * BM * sizeof(float);
+                        ensure_smem((const void*)flash_attn_chunk_fused_bm<HD128, GQA, BM, BLOCK>);
+                        flash_attn_chunk_fused_bm<HD128, GQA, BM, BLOCK>
+                            <<<fg, BLOCK, smem_bytes, stream>>>(
+                                q_post_sub, k_cache_ptr, v_cache_ptr, out_sub,
+                                num_q, num_kv, sub_start_pos, sub_n, scale);
+                    } else {
+                        constexpr int BM = 32;
+                        dim3 fg(num_kv, sub_n);
+                        int smem_bytes = GQA * HD128 * sizeof(half)
+                                       + 2 * BM * HD128 * sizeof(half)
+                                       + GQA * BM * sizeof(float);
+                        flash_attn_chunk_fused<HD128, GQA, BM, BLOCK>
+                            <<<fg, BLOCK, smem_bytes, stream>>>(
+                                q_post_sub, k_cache_ptr, v_cache_ptr, out_sub,
+                                num_q, num_kv, sub_start_pos, sub_n, scale);
                     }
                     if (g_profile_attn) g_attn_fused_ms += pa_sync_ms(tf0);
                     sub_processed += sub_n;

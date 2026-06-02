@@ -4224,6 +4224,12 @@ int serve_embed(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port,
     model.alloc_buffers();
     model.init_gdn_states(1);                  // no-op for dense (no ssm tensors)
     model.init_attention(8192, 1);             // 8K context plenty for embed inputs
+    // Enable FlashAttention for the dense embed shape (HD=128, GQA=4, num_kv=8).
+    // Default ON; FLASH_ATTN=0 opts back into the strict score/softmax/value path.
+    {
+        const char* fa_env = getenv("FLASH_ATTN");
+        g_use_flash_attn = (fa_env == nullptr) ? true : (fa_env[0] == '1');
+    }
     printf("[embed] model loaded: H=%d, layers=%d, V=%d\n",
            model.cfg.hidden_size, model.cfg.num_layers, model.cfg.vocab_size);
 
@@ -4261,6 +4267,12 @@ int serve_rerank(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port,
     model.alloc_buffers();
     model.init_gdn_states(1);
     model.init_attention(8192, 1);
+    // Enable FlashAttention for the dense rerank shape (HD=128, GQA=4, num_kv=8).
+    // Default ON; FLASH_ATTN=0 opts back into the strict path.
+    {
+        const char* fa_env = getenv("FLASH_ATTN");
+        g_use_flash_attn = (fa_env == nullptr) ? true : (fa_env[0] == '1');
+    }
     printf("[rerank] model loaded: H=%d, layers=%d, V=%d\n",
            model.cfg.hidden_size, model.cfg.num_layers, model.cfg.vocab_size);
 
