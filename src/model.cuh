@@ -560,15 +560,23 @@ struct QwenModel {
 
     // Chunk capture: fp32 [n_tokens, hidden] on `src_gpu` → fp16 → GPU0 with
     // strided per-token write. Used by the prefill chunked path.
+    // ctx_base: offset (in tokens) added to the capture-buffer token index. The
+    // serve path uses 0 (one sequence → one capture region). The offline
+    // dflash-extract pipeline binds each in-flight pipeline buffer to its own
+    // capture region (ctx_base = buf * max_L) so multiple sequences can prefill
+    // concurrently across the GPU stages without colliding in gpu0_buf.
     void dflash_capture_chunk(int layer, const float* h_chunk_fp32, int start_pos,
-                              int n_tokens, int src_gpu, cudaStream_t stream = 0) {
+                              int n_tokens, int src_gpu, cudaStream_t stream = 0,
+                              int ctx_base = 0) {
         if (!dflash_cap.enabled) return;
         if (layer < 0 || layer >= 256) return;
         int slot = dflash_cap.layer_to_slot[layer];
         if (slot < 0) return;
         if (n_tokens <= 0) return;
-        if (start_pos < 0 || start_pos + n_tokens > dflash_cap.max_ctx) return;
+        if (start_pos < 0 || ctx_base < 0
+            || ctx_base + start_pos + n_tokens > dflash_cap.max_ctx) return;
         int H = cfg.hidden_size;
+        int cb = ctx_base + start_pos;  // absolute first token index in gpu0_buf
 
         static const bool dump_cap = getenv("DFLASH_DUMP_CAPTURE") != nullptr;
         if (dump_cap && start_pos == 0) {
@@ -596,7 +604,7 @@ struct QwenModel {
         if (src_gpu == 0) {
             for (int i = 0; i < n_tokens; i++) {
                 half* dst = dflash_cap.gpu0_buf
-                          + ((size_t)(start_pos+i) * dflash_cap.n_slots + slot) * H;
+                          + ((size_t)(cb+i) * dflash_cap.n_slots + slot) * H;
                 cudaMemcpyAsync(dst, chunk_half + (size_t)i * H, H * sizeof(half),
                                 cudaMemcpyDeviceToDevice, stream);
             }
@@ -609,7 +617,7 @@ struct QwenModel {
             cudaSetDevice(0);
             for (int i = 0; i < n_tokens; i++) {
                 half* dst = dflash_cap.gpu0_buf
-                          + ((size_t)(start_pos+i) * dflash_cap.n_slots + slot) * H;
+                          + ((size_t)(cb+i) * dflash_cap.n_slots + slot) * H;
                 cudaMemcpy(dst, host_buf + (size_t)i * H, H * sizeof(half),
                            cudaMemcpyHostToDevice);
             }
@@ -2863,7 +2871,39 @@ struct QwenModel {
         reset_kv_slot(slot);
         reset_gdn_slot(slot);
     }
-    
+
+    // Stream-ordered per-slot reset restricted to the layers [l_lo, l_hi) that
+    // live on GPU `g`. Issued on `stream` (the GPU's compute stream) so the
+    // memsets are correctly ordered BEFORE that segment's forward kernels —
+    // used by the offline dflash-extract cross-sequence pipeline, where each
+    // GPU stage resets the next sequence's slot just before computing it. Only
+    // the fp16-KV path is supported (extract never sets MTP_TQ/Q8KV).
+    void reset_slot_segment_stream(int slot, int l_lo, int l_hi, int g,
+                                   cudaStream_t stream) {
+        if (slot < 0 || slot >= num_slots) return;
+        cudaSetDevice(g);
+        // GDN conv + recurrent state for this slot, this GPU's GDN layers.
+        size_t conv_off = (size_t)slot * gdn_qkv_dim_cached * 4;
+        size_t rec_off  = (size_t)slot * gdn_rec_per_slot;
+        size_t conv_sz  = (size_t)gdn_qkv_dim_cached * 4 * sizeof(float);
+        size_t rec_sz   = (size_t)gdn_rec_per_slot * sizeof(float);
+        for (int layer = l_lo; layer < l_hi; layer++) {
+            if (layer < 0 || layer >= cfg.num_layers) continue;
+            if (!gdn_states[layer].conv_state) continue;
+            cudaMemsetAsync(gdn_states[layer].conv_state + conv_off, 0, conv_sz, stream);
+            cudaMemsetAsync(gdn_states[layer].rec_state  + rec_off,  0, rec_sz,  stream);
+        }
+        // fp16 KV range for this slot, this GPU's attn layers.
+        int kv_dim = cfg.num_kv_heads * cfg.head_dim;
+        size_t per_slot = (size_t)slot_capacity(slot) * kv_dim * sizeof(half);
+        size_t off_elem = kv_slot_offset(slot) * kv_dim;
+        for (auto& [layer, kv] : kv_caches) {
+            if (layer < l_lo || layer >= l_hi) continue;
+            cudaMemsetAsync(kv.k + off_elem, 0, per_slot, stream);
+            cudaMemsetAsync(kv.v + off_elem, 0, per_slot, stream);
+        }
+    }
+
     bool is_attn_layer(int layer) { return (layer >= 0 && layer < 256) ? layer_is_attn[layer] : false; }
 
 

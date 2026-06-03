@@ -551,13 +551,27 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
     model.gpu = &gpu_model;
     model.init_config(gguf);
     model.alloc_buffers();
-    model.init_gdn_states();
 
     const int H = model.cfg.hidden_size;
     const int V = model.cfg.vocab_size;
     const int n_layers = model.cfg.num_layers;
     const int last_gpu = gpu_model.layer_gpu[n_layers - 1];
     constexpr int CHUNK = QwenModel::CHUNK_SIZE;
+
+    // DFLASH_EXTRACT_PIPELINE (default ON): cross-sequence pipelined prefill.
+    // Each in-flight pipeline buffer is bound to its own KV/GDN slot + its own
+    // capture region, so independent corpus sequences prefill concurrently
+    // across the 3 GPU stages (GPU0 does seq B while GPU1 does seq A etc.).
+    // Set to 0 to fall back to the original single-stream per-sequence loop
+    // (used for the byte-identical correctness diff).
+    const bool use_pipeline = [](){ const char* e=getenv("DFLASH_EXTRACT_PIPELINE"); return !e || e[0]!='0'; }();
+    // Number of concurrent in-flight sequences = pipeline buffers = KV/GDN
+    // slots. 6 keeps all 3 GPU stages saturated with margin. DFLASH_EXTRACT_NB
+    // overrides for tuning.
+    int NB = 6;
+    if (const char* e = getenv("DFLASH_EXTRACT_NB")) { int v = atoi(e); if (v >= 1 && v <= 16) NB = v; }
+    if (!use_pipeline) NB = 1;
+    model.init_gdn_states(NB);
     constexpr int N_TGT = dflash::DraftConfig::n_target_layers;     // 5
     constexpr int BLOCK_SIZE = dflash::DraftConfig::block_size;     // 16
     constexpr int MASK_TOKEN = dflash::DraftConfig::mask_token_id;  // 248070
@@ -589,9 +603,17 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
     printf("[dflash-extract] %zu sequences, max_len=%zu, H=%d V=%d layers=%d\n",
            sequences.size(), max_L, H, V, n_layers);
 
-    // Capture buffer must hold the longest sequence.
-    model.init_attention((int)std::max<size_t>(max_L, 1));
-    model.init_dflash_capture((int)max_L, dflash::kTargetLayerIds, N_TGT);
+    // Attention/KV + GDN are sized per slot. With the pipeline we run NB
+    // independent sequences concurrently, one per slot.
+    int per_slot_cap = (int)std::max<size_t>(max_L, 1);
+    {
+        std::vector<int> caps(NB, per_slot_cap);
+        model.init_attention_caps(caps);
+    }
+    // Capture buffer holds NB independent regions of max_L tokens each, so the
+    // NB in-flight sequences write to disjoint ranges of gpu0_buf. The single-
+    // stream path (NB=1) is unchanged (one region of max_L).
+    model.init_dflash_capture((int)(NB * max_L), dflash::kTargetLayerIds, N_TGT);
 
     // ── Output dir + chunk-stream bookkeeping ──
     {
@@ -647,28 +669,24 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
         cudaFree(d_row);
         return ok;
     };
-    if (!dequant_weight_to_file(embd_t, "embed.fp16")) {
-        fprintf(stderr, "[dflash-extract] embed.fp16 export failed\n"); return 1;
+    // DFLASH_SKIP_WEIGHTS=1: skip the embed.fp16 / lm_head.fp16 export (each
+    // ~V*H*2 ≈ 2.5 GB). These exports are mode-independent (computed before the
+    // prefill loop) and only used for the correctness A/B diff of the C arrays
+    // and throughput benchmarking — not by the on-disk record stream. Default
+    // OFF so a real extract still produces the full output set.
+    const bool skip_weights = (getenv("DFLASH_SKIP_WEIGHTS") != nullptr);
+    if (!skip_weights) {
+        if (!dequant_weight_to_file(embd_t, "embed.fp16")) {
+            fprintf(stderr, "[dflash-extract] embed.fp16 export failed\n"); return 1;
+        }
+        printf("[dflash-extract] wrote embed.fp16 (%zu bytes)\n", (size_t)V * H * sizeof(half));
+        if (!dequant_weight_to_file(out_w, "lm_head.fp16")) {
+            fprintf(stderr, "[dflash-extract] lm_head.fp16 export failed\n"); return 1;
+        }
+        printf("[dflash-extract] wrote lm_head.fp16 (%zu bytes)\n", (size_t)V * H * sizeof(half));
+    } else {
+        printf("[dflash-extract] DFLASH_SKIP_WEIGHTS=1 — skipping embed.fp16/lm_head.fp16 export\n");
     }
-    printf("[dflash-extract] wrote embed.fp16 (%zu bytes)\n", (size_t)V * H * sizeof(half));
-    if (!dequant_weight_to_file(out_w, "lm_head.fp16")) {
-        fprintf(stderr, "[dflash-extract] lm_head.fp16 export failed\n"); return 1;
-    }
-    printf("[dflash-extract] wrote lm_head.fp16 (%zu bytes)\n", (size_t)V * H * sizeof(half));
-
-    // ── Prefill scratch (mirror BENCH_PREFILL: single stream 0, GPU-walk) ──
-    half* gpu_hidden_half0 = nullptr;
-    cudaSetDevice(0); cudaMalloc(&gpu_hidden_half0, (size_t)H * sizeof(half));
-    float* gpu_hidden_chunk[4] = {};
-    for (int g = 0; g < n_gpus; g++) {
-        cudaSetDevice(g);
-        cudaMalloc(&gpu_hidden_chunk[g], (size_t)CHUNK * H * sizeof(float));
-    }
-    float* host_chunk_transfer = nullptr;
-    cudaMallocHost(&host_chunk_transfer, (size_t)CHUNK * H * sizeof(float));
-
-    // Host buffer for one sequence's C, read back from gpu0_buf.
-    std::vector<half> host_C;
 
     // ── Chunk-file stream ──
     std::vector<std::pair<std::string,int>> chunk_index;  // (filename, record_count)
@@ -677,6 +695,12 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
     char  cur_chunk_name[64] = {0};
     size_t cur_chunk_bytes = 0;
     int    cur_chunk_records = 0;
+    // DFLASH_NO_WRITE=1: open chunk files on /dev/null instead of out_dir.
+    // Benchmark-only — runs the full GPU compute + C readback path but discards
+    // the (potentially many-GB) record bytes so throughput can be measured on a
+    // large corpus without the disk to hold the output. Capture/compute is
+    // untouched. Default OFF.
+    const bool no_write = (getenv("DFLASH_NO_WRITE") != nullptr);
     // Roll to a fresh chunk file when the current one would exceed chunk_bytes.
     auto ensure_chunk = [&](size_t need_bytes) {
         if (chunk_f == nullptr || (cur_chunk_bytes + need_bytes > chunk_bytes && cur_chunk_records > 0)) {
@@ -686,82 +710,16 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
             }
             chunk_idx++;
             snprintf(cur_chunk_name, sizeof(cur_chunk_name), "chunk_%03d.bin", chunk_idx);
-            std::string path = out_dir + "/" + cur_chunk_name;
+            std::string path = no_write ? std::string("/dev/null") : (out_dir + "/" + cur_chunk_name);
             chunk_f = fopen(path.c_str(), "wb");
             cur_chunk_bytes = 0;
             cur_chunk_records = 0;
             printf("[dflash-extract] opened %s\n", cur_chunk_name);
         }
     };
-
-    // ── Main extraction loop: prefill each sequence, dump C + tokens ──
-    auto t_start = std::chrono::high_resolution_clock::now();
-    size_t total_tokens = 0;
-    for (size_t si = 0; si < sequences.size(); si++) {
-        const std::vector<int>& ids = sequences[si];
-        int L = (int)ids.size();
-        if (L > (int)max_L) L = (int)max_L;
-
-        // Fresh KV/GDN state + zero the capture buffer region for this seq.
-        model.reset_all_states();
-        cudaSetDevice(0);
-        cudaMemset(model.dflash_cap.gpu0_buf, 0,
-                   (size_t)L * N_TGT * H * sizeof(half));
-
-        int chunk_pos = 0;
-        while (chunk_pos < L) {
-            int chunk_n = std::min(CHUNK, L - chunk_pos);
-
-            // Embed chunk tokens onto GPU0 fp32 buffer.
-            cudaSetDevice(0);
-            for (int t = 0; t < chunk_n; t++) {
-                int token_id = ids[chunk_pos + t];
-                if (embd_t->type == GGML_TYPE_Q8_0)
-                    dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half0, token_id, H);
-                else if (embd_t->type == GGML_TYPE_Q5_K)
-                    dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half0, token_id, H);
-                else if (embd_t->type == GGML_TYPE_Q6_K)
-                    dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half0, token_id, H);
-                half_to_float_kernel<<<(H+255)/256, 256>>>(
-                    gpu_hidden_half0, gpu_hidden_chunk[0] + (size_t)t * H, H);
-            }
-
-            float* h_chunk = gpu_hidden_chunk[0];
-            for (int layer = 0; layer < n_layers; layer++) {
-                int g = gpu_model.layer_gpu[layer];
-                int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
-                if (g != prev_g) {
-                    cudaSetDevice(prev_g);
-                    cudaMemcpy(host_chunk_transfer, h_chunk,
-                               (size_t)chunk_n * H * sizeof(float), cudaMemcpyDeviceToHost);
-                    cudaSetDevice(g);
-                    cudaMemcpy(gpu_hidden_chunk[g], host_chunk_transfer,
-                               (size_t)chunk_n * H * sizeof(float), cudaMemcpyHostToDevice);
-                    h_chunk = gpu_hidden_chunk[g];
-                } else {
-                    cudaSetDevice(g);
-                }
-                bool is_attn = model.is_attn_layer(layer);
-                if (is_attn) model.forward_attn_chunk(layer, h_chunk, chunk_pos, chunk_n, 0);
-                else         model.forward_gdn_chunk (layer, h_chunk, chunk_n, 0);
-                if (model.layer_is_moe[layer]) model.forward_moe_chunk(layer, h_chunk, chunk_n, 0);
-                else                           model.forward_mlp_chunk(layer, h_chunk, chunk_n, 0);
-                // Capture exactly as the serve path (main.cu:1899): residual
-                // stream output of each captured layer → gpu0_buf.
-                model.dflash_capture_chunk(layer, h_chunk, chunk_pos, chunk_n, g, 0);
-            }
-            cudaSetDevice(last_gpu); cudaDeviceSynchronize();
-            chunk_pos += chunk_n;
-        }
-
-        // Read back C for the whole sequence: [L * N_TGT * H] fp16 from GPU0.
-        cudaSetDevice(0); cudaDeviceSynchronize();
-        size_t c_count = (size_t)L * N_TGT * H;
-        host_C.resize(c_count);
-        cudaMemcpy(host_C.data(), model.dflash_cap.gpu0_buf,
-                   c_count * sizeof(half), cudaMemcpyDeviceToHost);
-
-        // Write record: [magic][L][tokens[L]][C[L*5*H]]
+    // Write one record from a host-side C buffer (byte-identical layout to the
+    // single-stream path). Used by BOTH paths.
+    auto write_record = [&](int L, const int* ids_ptr, const half* C, size_t c_count) {
         size_t rec_bytes = sizeof(int32_t) * 2 + (size_t)L * sizeof(int32_t)
                          + c_count * sizeof(half);
         ensure_chunk(rec_bytes);
@@ -769,19 +727,387 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
         int32_t Lw = L;
         fwrite(&magic, sizeof(int32_t), 1, chunk_f);
         fwrite(&Lw,    sizeof(int32_t), 1, chunk_f);
-        fwrite(ids.data(), sizeof(int32_t), L, chunk_f);
-        fwrite(host_C.data(), sizeof(half), c_count, chunk_f);
+        fwrite(ids_ptr, sizeof(int32_t), L, chunk_f);
+        fwrite(C, sizeof(half), c_count, chunk_f);
         cur_chunk_bytes += rec_bytes;
         cur_chunk_records++;
-        total_tokens += L;
+    };
 
-        if ((si + 1) % 64 == 0 || si + 1 == sequences.size()) {
-            auto now = std::chrono::high_resolution_clock::now();
-            double s = std::chrono::duration<double>(now - t_start).count();
-            printf("[dflash-extract] %zu/%zu seqs, %zu tokens, %.1f tok/s\n",
-                   si + 1, sequences.size(), total_tokens,
-                   s > 0 ? total_tokens / s : 0.0);
+    auto t_start = std::chrono::high_resolution_clock::now();
+    size_t total_tokens = 0;
+
+    if (!use_pipeline) {
+        // ───────────────────── Single-stream path (NB=1) ────────────────────
+        // Original hand-rolled chunked prefill. Kept for the byte-identical
+        // correctness diff (DFLASH_EXTRACT_PIPELINE=0).
+        half* gpu_hidden_half0 = nullptr;
+        cudaSetDevice(0); cudaMalloc(&gpu_hidden_half0, (size_t)H * sizeof(half));
+        float* gpu_hidden_chunk[4] = {};
+        for (int g = 0; g < n_gpus; g++) {
+            cudaSetDevice(g);
+            cudaMalloc(&gpu_hidden_chunk[g], (size_t)CHUNK * H * sizeof(float));
         }
+        float* host_chunk_transfer = nullptr;
+        cudaMallocHost(&host_chunk_transfer, (size_t)CHUNK * H * sizeof(float));
+        std::vector<half> host_C;
+
+        for (size_t si = 0; si < sequences.size(); si++) {
+            const std::vector<int>& ids = sequences[si];
+            int L = (int)ids.size();
+            if (L > (int)max_L) L = (int)max_L;
+
+            // Fresh KV/GDN state + zero the capture buffer region for this seq.
+            model.reset_slot_states(0);
+            cudaSetDevice(0);
+            cudaMemset(model.dflash_cap.gpu0_buf, 0,
+                       (size_t)L * N_TGT * H * sizeof(half));
+
+            int chunk_pos = 0;
+            while (chunk_pos < L) {
+                int chunk_n = std::min(CHUNK, L - chunk_pos);
+                cudaSetDevice(0);
+                for (int t = 0; t < chunk_n; t++) {
+                    int token_id = ids[chunk_pos + t];
+                    if (embd_t->type == GGML_TYPE_Q8_0)
+                        dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half0, token_id, H);
+                    else if (embd_t->type == GGML_TYPE_Q5_K)
+                        dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half0, token_id, H);
+                    else if (embd_t->type == GGML_TYPE_Q6_K)
+                        dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half0, token_id, H);
+                    half_to_float_kernel<<<(H+255)/256, 256>>>(
+                        gpu_hidden_half0, gpu_hidden_chunk[0] + (size_t)t * H, H);
+                }
+                float* h_chunk = gpu_hidden_chunk[0];
+                for (int layer = 0; layer < n_layers; layer++) {
+                    int g = gpu_model.layer_gpu[layer];
+                    int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
+                    if (g != prev_g) {
+                        cudaSetDevice(prev_g);
+                        cudaMemcpy(host_chunk_transfer, h_chunk,
+                                   (size_t)chunk_n * H * sizeof(float), cudaMemcpyDeviceToHost);
+                        cudaSetDevice(g);
+                        cudaMemcpy(gpu_hidden_chunk[g], host_chunk_transfer,
+                                   (size_t)chunk_n * H * sizeof(float), cudaMemcpyHostToDevice);
+                        h_chunk = gpu_hidden_chunk[g];
+                    } else {
+                        cudaSetDevice(g);
+                    }
+                    bool is_attn = model.is_attn_layer(layer);
+                    if (is_attn) model.forward_attn_chunk(layer, h_chunk, chunk_pos, chunk_n, 0);
+                    else         model.forward_gdn_chunk (layer, h_chunk, chunk_n, 0);
+                    if (model.layer_is_moe[layer]) model.forward_moe_chunk(layer, h_chunk, chunk_n, 0);
+                    else                           model.forward_mlp_chunk(layer, h_chunk, chunk_n, 0);
+                    model.dflash_capture_chunk(layer, h_chunk, chunk_pos, chunk_n, g, 0);
+                }
+                cudaSetDevice(last_gpu); cudaDeviceSynchronize();
+                chunk_pos += chunk_n;
+            }
+
+            cudaSetDevice(0); cudaDeviceSynchronize();
+            size_t c_count = (size_t)L * N_TGT * H;
+            host_C.resize(c_count);
+            cudaMemcpy(host_C.data(), model.dflash_cap.gpu0_buf,
+                       c_count * sizeof(half), cudaMemcpyDeviceToHost);
+            write_record(L, ids.data(), host_C.data(), c_count);
+            total_tokens += L;
+
+            if ((si + 1) % 64 == 0 || si + 1 == sequences.size()) {
+                auto now = std::chrono::high_resolution_clock::now();
+                double s = std::chrono::duration<double>(now - t_start).count();
+                printf("[dflash-extract] %zu/%zu seqs, %zu tokens, %.1f tok/s\n",
+                       si + 1, sequences.size(), total_tokens,
+                       s > 0 ? total_tokens / s : 0.0);
+            }
+        }
+        cudaFreeHost(host_chunk_transfer);
+        for (int g = 0; g < n_gpus; g++) { cudaSetDevice(g); cudaFree(gpu_hidden_chunk[g]); }
+        cudaSetDevice(0); cudaFree(gpu_hidden_half0);
+    } else {
+        // ──────────────── Cross-sequence pipelined path (NB slots) ──────────
+        // Multi-threaded, one CPU launch thread per GPU segment (mirrors the
+        // serve PREFILL_PIPELINE_V3 design). Each in-flight sequence owns one
+        // KV/GDN slot + one capture region; while sequence A's chunk is on GPU2
+        // sequence B's chunk runs on GPU1 and sequence C's on GPU0, so all 3
+        // GPU stages stay saturated even though each individual sequence is
+        // only 1 chunk (≤256 tok) → no per-sequence pipeline benefit alone.
+        // Per-GPU compute scratch is shared, so each GPU runs ONE chunk-segment
+        // at a time (FIFO on its compute stream) — exactly like serve.
+
+        // Contiguous (gpu, l_lo, l_hi) layer segments.
+        struct GpuSeg { int g; int l_lo; int l_hi; };
+        std::vector<GpuSeg> gpu_segs;
+        {
+            int cur_g = gpu_model.layer_gpu[0]; int seg_start = 0;
+            for (int l = 1; l < n_layers; l++) {
+                if (gpu_model.layer_gpu[l] != cur_g) {
+                    gpu_segs.push_back({cur_g, seg_start, l});
+                    cur_g = gpu_model.layer_gpu[l]; seg_start = l;
+                }
+            }
+            gpu_segs.push_back({cur_g, seg_start, n_layers});
+        }
+        const int nseg = (int)gpu_segs.size();
+        const int last_seg = nseg - 1;
+        const int g0 = gpu_segs[0].g;
+
+        // Per-GPU streams.
+        cudaStream_t comp_stream[4] = {}, d2h_stream[4] = {};
+        for (int g = 0; g < n_gpus; g++) {
+            cudaSetDevice(g);
+            cudaStreamCreate(&comp_stream[g]);
+            cudaStreamCreate(&d2h_stream[g]);
+        }
+        // Per-slot embed scratch (GPU0) + per-(GPU,slot) hidden chunk buffers.
+        half*  embed_half[16] = {};
+        float* gpu_hidden[4][16] = {};
+        cudaSetDevice(g0);
+        for (int s = 0; s < NB; s++) cudaMalloc(&embed_half[s], (size_t)H * sizeof(half));
+        for (int g = 0; g < n_gpus; g++) {
+            cudaSetDevice(g);
+            for (int s = 0; s < NB; s++)
+                cudaMalloc(&gpu_hidden[g][s], (size_t)CHUNK * H * sizeof(float));
+        }
+        // Pinned host bridge buffers: one per (slot, hop). hop = source segment.
+        float* host_xfer[16][4] = {};
+        for (int s = 0; s < NB; s++)
+            for (int h = 0; h < nseg; h++)
+                cudaMallocHost(&host_xfer[s][h], (size_t)CHUNK * H * sizeof(float));
+        // Events: seg-done[s][slot] (compute) and d2h-done[s][slot] (host coherent).
+        cudaEvent_t ev_sd[4][16] = {}, ev_dh[4][16] = {};
+        for (int s = 0; s < nseg; s++) {
+            cudaSetDevice(gpu_segs[s].g);
+            for (int sl = 0; sl < NB; sl++) {
+                cudaEventCreateWithFlags(&ev_sd[s][sl], cudaEventDisableTiming);
+                cudaEventCreateWithFlags(&ev_dh[s][sl], cudaEventDisableTiming);
+            }
+        }
+
+        // A chunk work item flowing through the stages.
+        struct W { int seq; int slot; int ctx_base; int pos; int n; bool first; bool last; };
+
+        // Run segment `s` on its GPU for work `w`. Resets the slot's segment
+        // state on the FIRST chunk of the sequence (stream-ordered before the
+        // forward kernels), then runs the captured-layer forward exactly like
+        // the serve chunked path.
+        auto run_seg = [&](int s, const W& w){
+            int g = gpu_segs[s].g;
+            cudaSetDevice(g);
+            cudaStream_t cs = comp_stream[g];
+            float* h_chunk = gpu_hidden[g][w.slot];
+            if (w.first)
+                model.reset_slot_segment_stream(w.slot, gpu_segs[s].l_lo, gpu_segs[s].l_hi, g, cs);
+            for (int layer = gpu_segs[s].l_lo; layer < gpu_segs[s].l_hi; layer++) {
+                if (model.is_attn_layer(layer)) model.forward_attn_chunk(layer, h_chunk, w.pos, w.n, cs, w.slot);
+                else                            model.forward_gdn_chunk (layer, h_chunk, w.n, cs, w.slot);
+                if (model.layer_is_moe[layer])  model.forward_moe_chunk(layer, h_chunk, w.n, cs);
+                else                            model.forward_mlp_chunk(layer, h_chunk, w.n, cs);
+                model.dflash_capture_chunk(layer, h_chunk, w.pos, w.n, g, cs, w.ctx_base);
+            }
+            cudaEventRecord(ev_sd[s][w.slot], cs);
+        };
+        auto run_d2h = [&](int s, const W& w){
+            int g = gpu_segs[s].g;
+            cudaSetDevice(g);
+            cudaStreamWaitEvent(d2h_stream[g], ev_sd[s][w.slot], 0);
+            cudaMemcpyAsync(host_xfer[w.slot][s], gpu_hidden[g][w.slot],
+                (size_t)w.n * H * sizeof(float), cudaMemcpyDeviceToHost, d2h_stream[g]);
+            cudaEventRecord(ev_dh[s][w.slot], d2h_stream[g]);
+        };
+        auto run_embed = [&](const W& w){
+            cudaSetDevice(g0);
+            cudaStream_t cs = comp_stream[g0];
+            float* h_in = gpu_hidden[g0][w.slot];
+            const std::vector<int>& ids = sequences[w.seq];
+            for (int t = 0; t < w.n; t++) {
+                int token_id = ids[w.pos + t];
+                if (embd_t->type == GGML_TYPE_Q8_0)
+                    dequant_embd_q8_0_row<<<(H+255)/256,256,0,cs>>>(embd_t->data, embed_half[w.slot], token_id, H);
+                else if (embd_t->type == GGML_TYPE_Q5_K)
+                    dequant_embd_q5k_row_v2<<<(H+255)/256,256,0,cs>>>(embd_t->data, embed_half[w.slot], token_id, H);
+                else if (embd_t->type == GGML_TYPE_Q6_K)
+                    dequant_embd_q6k_row_v2<<<(H+255)/256,256,0,cs>>>(embd_t->data, embed_half[w.slot], token_id, H);
+                half_to_float_kernel<<<(H+255)/256,256,0,cs>>>(embed_half[w.slot], h_in + (size_t)t * H, H);
+            }
+        };
+
+        // Completed-sequence collection: last stage stores each seq's C into a
+        // host buffer; the main thread flushes records in seq order so the
+        // on-disk record order is identical to the single-stream path.
+        std::vector<std::vector<half>> seq_C(sequences.size());
+        std::vector<char> seq_ready(sequences.size(), 0);
+        std::mutex done_mtx;
+
+        // Per-stage work queues + slot free-list.
+        std::mutex mtx; std::condition_variable cv;
+        std::vector<std::deque<W>> q(nseg);
+        std::vector<bool> q_done(nseg, false);
+        std::deque<int> free_slots; for (int s = 0; s < NB; s++) free_slots.push_back(s);
+        // Per-slot count of chunks that have FULLY drained the pipeline (last
+        // stage done). A slot's per-(stage,slot) events + host_xfer bridge
+        // buffers are reused by every chunk of the sequence bound to that slot,
+        // so two chunks of the SAME slot must never be in flight at once
+        // (the slot-scoped events would be re-recorded and the cross-stage
+        // fences would sync the wrong chunk → corruption, manifesting only on
+        // sequences > CHUNK_SIZE tokens). The producer therefore admits a
+        // sequence's chunk cp+1 only after chunk cp has been counted here.
+        // Independent slots stay fully concurrent, so the common single-chunk
+        // case (and cross-sequence overlap) is unaffected.
+        std::vector<int> slot_chunk_done(NB, 0);
+
+        // Consumer threads for stages 1..last_seg.
+        std::vector<std::thread> workers;
+        for (int s = 1; s < nseg; s++) {
+            workers.emplace_back([&, s]{
+                cudaSetDevice(gpu_segs[s].g);
+                for (;;) {
+                    W w;
+                    { std::unique_lock<std::mutex> lk(mtx);
+                      cv.wait(lk, [&]{ return !q[s].empty() || q_done[s]; });
+                      if (q[s].empty()) break;
+                      w = q[s].front(); q[s].pop_front(); }
+                    // Wait for the previous segment's D2H to be host-coherent,
+                    // then H2D into this GPU's slot buffer.
+                    cudaEventSynchronize(ev_dh[s-1][w.slot]);
+                    // Multi-chunk: don't H2D over a buffer whose previous chunk's
+                    // stage-s D2H hasn't read it yet (intermediate stages only).
+                    if (!w.first && s < last_seg) cudaEventSynchronize(ev_dh[s][w.slot]);
+                    cudaSetDevice(gpu_segs[s].g);
+                    cudaMemcpyAsync(gpu_hidden[gpu_segs[s].g][w.slot], host_xfer[w.slot][s-1],
+                        (size_t)w.n * H * sizeof(float), cudaMemcpyHostToDevice, comp_stream[gpu_segs[s].g]);
+                    run_seg(s, w);
+                    if (s < last_seg) {
+                        run_d2h(s, w);
+                        { std::lock_guard<std::mutex> lk(mtx); q[s+1].push_back(w); } cv.notify_all();
+                    } else {
+                        // Last stage: this chunk's captures are now committed to
+                        // gpu0_buf (capture H2D to GPU0 is synchronous inside
+                        // run_seg for src_gpu!=0; ev_sd covers the src_gpu==0
+                        // case). On the sequence's last chunk, read its whole
+                        // C region back and mark it ready + free the slot.
+                        cudaEventSynchronize(ev_sd[last_seg][w.slot]);
+                        if (w.last) {
+                            int L = (int)sequences[w.seq].size();
+                            if (L > (int)max_L) L = (int)max_L;
+                            size_t c_count = (size_t)L * N_TGT * H;
+                            std::vector<half> C(c_count);
+                            cudaSetDevice(0);
+                            cudaMemcpy(C.data(),
+                                model.dflash_cap.gpu0_buf + (size_t)w.ctx_base * N_TGT * H,
+                                c_count * sizeof(half), cudaMemcpyDeviceToHost);
+                            { std::lock_guard<std::mutex> lk(done_mtx);
+                              seq_C[w.seq] = std::move(C); seq_ready[w.seq] = 1; }
+                            { std::lock_guard<std::mutex> lk(mtx); free_slots.push_back(w.slot); }
+                        }
+                        // Signal end-to-end drain of THIS chunk so the producer
+                        // may admit the next chunk of the same slot.
+                        { std::lock_guard<std::mutex> lk(mtx); slot_chunk_done[w.slot]++; }
+                        cv.notify_all();
+                    }
+                }
+                if (s < last_seg) { std::lock_guard<std::mutex> lk(mtx); q_done[s+1] = true; cv.notify_all(); }
+            });
+        }
+
+        // Producer (this thread) = stage 0. Also drains finished sequences in
+        // order to disk while waiting for free slots.
+        size_t flush_next = 0;
+        auto try_flush = [&](){
+            for (;;) {
+                bool ready = false; int L = 0;
+                {
+                    std::lock_guard<std::mutex> lk(done_mtx);
+                    if (flush_next < sequences.size() && seq_ready[flush_next]) ready = true;
+                }
+                if (!ready) break;
+                L = (int)sequences[flush_next].size();
+                if (L > (int)max_L) L = (int)max_L;
+                size_t c_count = (size_t)L * N_TGT * H;
+                write_record(L, sequences[flush_next].data(), seq_C[flush_next].data(), c_count);
+                total_tokens += L;
+                { std::lock_guard<std::mutex> lk(done_mtx); seq_C[flush_next].clear(); seq_C[flush_next].shrink_to_fit(); }
+                flush_next++;
+                if (flush_next % 256 == 0 || flush_next == sequences.size()) {
+                    auto now = std::chrono::high_resolution_clock::now();
+                    double sec = std::chrono::duration<double>(now - t_start).count();
+                    printf("[dflash-extract] %zu/%zu seqs, %zu tokens, %.1f tok/s\n",
+                           flush_next, sequences.size(), total_tokens,
+                           sec > 0 ? total_tokens / sec : 0.0);
+                    fflush(stdout);
+                }
+            }
+        };
+
+        cudaSetDevice(g0);
+        for (size_t si = 0; si < sequences.size(); si++) {
+            int L = (int)sequences[si].size();
+            if (L > (int)max_L) L = (int)max_L;
+            // Acquire a free slot (= capture region = KV/GDN lane).
+            int slot;
+            { std::unique_lock<std::mutex> lk(mtx);
+              cv.wait(lk, [&]{ return !free_slots.empty(); });
+              slot = free_slots.front(); free_slots.pop_front(); }
+            try_flush();
+            int ctx_base = slot * (int)max_L;
+            // Reset this slot's drain counter; we admit chunk #k of this slot
+            // only once chunk #(k-1) has fully drained (last stage done). This
+            // serializes a single sequence's chunks end-to-end through the
+            // pipeline so the slot-scoped events / host_xfer bridge buffers are
+            // never reused by two in-flight chunks (correctness; see above).
+            { std::lock_guard<std::mutex> lk(mtx); slot_chunk_done[slot] = 0; }
+            int chunk_idx = 0;
+            // Emit this sequence's chunks in order through the pipeline.
+            for (int cp = 0; cp < L; cp += CHUNK) {
+                int n = std::min(CHUNK, L - cp);
+                W w{ (int)si, slot, ctx_base, cp, n, (cp == 0), (cp + n >= L) };
+                // Multi-chunk: wait for the previous chunk of THIS slot to fully
+                // drain before reusing the slot's buffers/events/KV. Single-chunk
+                // sequences (the common case) never enter this branch and keep
+                // full cross-sequence overlap.
+                if (chunk_idx > 0) {
+                    if (nseg > 1) {
+                        std::unique_lock<std::mutex> lk(mtx);
+                        cv.wait(lk, [&]{ return slot_chunk_done[slot] >= chunk_idx; });
+                    }
+                    // (single-GPU path drains synchronously below, no wait needed)
+                    cudaSetDevice(g0);
+                }
+                run_embed(w);
+                run_seg(0, w);
+                if (nseg > 1) {
+                    run_d2h(0, w);
+                    { std::lock_guard<std::mutex> lk(mtx); q[1].push_back(w); } cv.notify_all();
+                } else {
+                    // Single-GPU: capture already committed; handle completion here.
+                    cudaEventSynchronize(ev_sd[0][slot]);
+                    if (w.last) {
+                        size_t c_count = (size_t)L * N_TGT * H;
+                        std::vector<half> C(c_count);
+                        cudaSetDevice(0);
+                        cudaMemcpy(C.data(),
+                            model.dflash_cap.gpu0_buf + (size_t)ctx_base * N_TGT * H,
+                            c_count * sizeof(half), cudaMemcpyDeviceToHost);
+                        { std::lock_guard<std::mutex> lk(done_mtx);
+                          seq_C[si] = std::move(C); seq_ready[si] = 1; }
+                        { std::lock_guard<std::mutex> lk(mtx); free_slots.push_back(slot); }
+                        cudaSetDevice(g0);
+                    }
+                }
+                chunk_idx++;
+            }
+        }
+        if (nseg > 1) { std::lock_guard<std::mutex> lk(mtx); q_done[1] = true; cv.notify_all(); }
+        for (auto& t : workers) t.join();
+        for (int g = 0; g < n_gpus; g++) { cudaSetDevice(g); cudaDeviceSynchronize(); }
+        try_flush();  // flush any remaining ready sequences
+
+        // Cleanup pipeline resources.
+        for (int s = 0; s < NB; s++) { cudaSetDevice(g0); cudaFree(embed_half[s]); }
+        for (int g = 0; g < n_gpus; g++) {
+            cudaSetDevice(g);
+            for (int s = 0; s < NB; s++) cudaFree(gpu_hidden[g][s]);
+        }
+        for (int s = 0; s < NB; s++)
+            for (int h = 0; h < nseg; h++) cudaFreeHost(host_xfer[s][h]);
     }
 
     // Close last chunk + write chunks.txt.
@@ -799,10 +1125,6 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
     }
     printf("[dflash-extract] DONE: %zu seqs, %zu tokens, %zu chunk file(s)\n",
            sequences.size(), total_tokens, chunk_index.size());
-
-    cudaFreeHost(host_chunk_transfer);
-    for (int g = 0; g < n_gpus; g++) { cudaSetDevice(g); cudaFree(gpu_hidden_chunk[g]); }
-    cudaSetDevice(0); cudaFree(gpu_hidden_half0);
     return 0;
 }
 
