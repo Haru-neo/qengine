@@ -816,13 +816,22 @@ __global__ void conv_state_commit_chain_kernel(
 ) {
     int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= dim) return;
+    // conv_state holds only the last (kw-1) inputs (slot kw-1 = newest). A
+    // commit can only meaningfully append (kw-1) nodes; anything older slides
+    // out. Guard against accept_len > kw-1 so the rightmost-fill loop never
+    // indexes st[(kw-accept_len)+i] with a negative base (OOB write before the
+    // row → cross-layer conv_state corruption). Callers should pass the
+    // trailing (kw-1) node_ids; this clamp is a safety net.
+    int L = accept_len;
+    if (L > kw - 1) L = kw - 1;
+    if (L <= 0) return;
     float* st = conv_state + d * kw;
-    // Slide left by accept_len.
-    for (int k = 0; k < kw - accept_len; k++) st[k] = st[k + accept_len];
-    // Fill rightmost accept_len slots from qkv_tree[node_ids[i]].
-    for (int i = 0; i < accept_len; i++) {
+    // Slide left by L.
+    for (int k = 0; k < kw - L; k++) st[k] = st[k + L];
+    // Fill rightmost L slots from qkv_tree[node_ids[i]].
+    for (int i = 0; i < L; i++) {
         int node = node_ids[i];
-        st[(kw - accept_len) + i] =
+        st[(kw - L) + i] =
             __half2float(qkv_tree[(size_t)node * dim + d]);
     }
 }

@@ -6075,10 +6075,19 @@ struct QwenModel {
         int kw = 4;
 
         int final_slot = host_slots[path_len - 1];
+        // conv_state only holds the last (kw-1) inputs: trim the committed
+        // path to its trailing (kw-1) nodes to avoid the negative-index OOB
+        // write in conv_state_commit_chain_kernel (see commit_tree_gdn_chain).
+        int conv_len = path_len;
+        const int* conv_src = host_slots;
+        if (conv_len > kw - 1) {
+            conv_len = kw - 1;
+            conv_src = host_slots + (path_len - conv_len);  // trailing nodes
+        }
         for (int g = 0; g < gpu->num_gpus; g++) {
             cudaSetDevice(g);
-            cudaMemcpyAsync(commit_path_node_ids_d[g], host_slots,
-                            (size_t)path_len * sizeof(int),
+            cudaMemcpyAsync(commit_path_node_ids_d[g], conv_src,
+                            (size_t)conv_len * sizeof(int),
                             cudaMemcpyHostToDevice, 0);
         }
         for (int layer = 0; layer < cfg.num_layers; layer++) {
@@ -6095,7 +6104,7 @@ struct QwenModel {
                 gdn_states[layer].conv_state,
                 tree_qkv_persist[layer],
                 commit_path_node_ids_d[g],
-                qkv_dim, kw, path_len);
+                qkv_dim, kw, conv_len);
         }
     }
 
@@ -6117,23 +6126,51 @@ struct QwenModel {
         int qkv_dim = qkv_probe->dims[1];
         int kw = 4;
 
+        // The convolution state only holds the last (kw-1) inputs. When the
+        // accepted chain is longer than (kw-1), only the TRAILING (kw-1) nodes
+        // survive the window slide — committing all `accept_len` nodes makes
+        // conv_state_commit_chain_kernel index st[(kw-accept_len)+i] with a
+        // negative base (out-of-bounds write before the row → corrupts every
+        // GDN layer's conv_state and cascades into garbage output). This is the
+        // budget>kw-1 regime DFlash (budget=16) hits but MTP_TREE (budget<=8,
+        // low accept) never did. Trim to the last (kw-1) accepted nodes.
+        int conv_len = accept_len;
+        if (conv_len > kw - 1) {
+            conv_len = kw - 1;
+            // Trailing node indices: [accept_len-(kw-1) .. accept_len-1].
+            ensure_commit_path_node_ids();
+            std::vector<int> trail(conv_len);
+            for (int i = 0; i < conv_len; i++)
+                trail[i] = accept_len - conv_len + i;
+            for (int g = 0; g < gpu->num_gpus; g++) {
+                cudaSetDevice(g);
+                cudaMemcpy(commit_path_node_ids_d[g], trail.data(),
+                           (size_t)conv_len * sizeof(int), cudaMemcpyHostToDevice);
+            }
+        }
+
         for (int layer = 0; layer < cfg.num_layers; layer++) {
             if (is_attn_layer(layer)) continue;
             int g = gpu->layer_gpu[layer];
             cudaSetDevice(g);
-            // rec_state ← tree_gdn_inter[layer][accept_len - 1]
+            // rec_state ← tree_gdn_inter[layer][accept_len - 1] (full state at
+            // the last accepted node — unaffected by the conv trim).
             float* src = tree_gdn_inter[layer]
                 + (size_t)(accept_len - 1) * num_v * k_dim * v_dim;
             cudaMemcpyAsync(gdn_states[layer].rec_state, src, state_sz,
                             cudaMemcpyDeviceToDevice, 0);
-            // conv_state slide + append (chain-only: node_ids=[0..L-1])
+            // conv_state slide + append. node_ids = [0..L-1] for L<=kw-1, else
+            // the trailing (kw-1) accepted nodes (see trim above).
+            const int* node_ids = (accept_len > kw - 1)
+                                 ? commit_path_node_ids_d[g]
+                                 : commit_chain_node_ids_d[g];
             int threads = 256;
             int blocks  = (qkv_dim + threads - 1) / threads;
             conv_state_commit_chain_kernel<<<blocks, threads, 0, 0>>>(
                 gdn_states[layer].conv_state,
                 tree_qkv_persist[layer],
-                commit_chain_node_ids_d[g],
-                qkv_dim, kw, accept_len);
+                node_ids,
+                qkv_dim, kw, conv_len);
         }
     }
 
