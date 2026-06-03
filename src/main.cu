@@ -2173,9 +2173,15 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
             // — the advanced state IS what the batched path consumes). We only
             // yield once we are past prefill (step >= prompt_len, so `generated`
             // is non-empty and holds the token to embed next).
+            // Poll EVERY iteration (relaxed atomic load ~1ns). The earlier
+            // "every 4 iters" throttle delayed the yield by ~8-12 tokens under
+            // MTP K=2 (2-3 tokens/iter), leaving slot-1 contending and dropping
+            // 2-concurrent aggregate to ~19 t/s; polling each step yields within
+            // one iter so K=2 recovers to the batched ~28.8. dyn_poll_ctr kept
+            // (unused throttle removed) for clarity.
+            (void)dyn_poll_ctr;
             if (dyn_yield_tok && dynamic_router_on
                 && step >= (int)prompt_ids.size()
-                && ((dyn_poll_ctr++ & 0x3) == 0)            // every 4 tokens
                 && router_yield_signal.load(std::memory_order_relaxed)) {
                 *dyn_yield_tok = generated.back();          // token at logical pos `step`
                 if (dyn_yield_pos)           *dyn_yield_pos = step;
