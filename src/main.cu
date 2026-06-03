@@ -12,6 +12,8 @@
 #include "vision.cuh"
 #include "dflash_decode.cuh"
 #include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <csignal>
 #include <poll.h>
 // Vision hooks (shared via global pointers — see main() wiring). When the CLI
@@ -513,6 +515,294 @@ int run_chat(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, const SamplingPara
 
     for (int g = 0; g < n_gpus; g++) { cudaSetDevice(g); cudaFree(gpu_hidden[g]); }
     cudaFree(logits_buf); cudaFree(norm_buf); cudaFreeHost(host_transfer);
+    return 0;
+}
+
+// ============ DFlash drafter training-data extraction (offline) ============
+//
+// --mode dflash-extract: runs the 27B PREFILL over a pre-tokenized corpus and
+// dumps, per sequence, the captured target-layer hidden states C (the DFlash
+// "context features") + the token ids, plus a one-time export of the
+// token-embedding and lm-head weights dequantized to fp16.
+//
+// C is captured via the SAME mechanism inference uses (init_dflash_capture +
+// dflash_capture_chunk), so the layout matches what the drafter sees at
+// inference time exactly:
+//   gpu0_buf[(token_pos * n_slots + slot) * H + h]   n_slots=5, H=5120
+// C for token t = concat over slot=0..4 of gpu0_buf[t,slot,:] = [5*H]=[25600].
+//
+// The prefill loop mirrors the simple chunked BENCH_PREFILL path in run_qwen
+// (embed → per-layer forward_attn/gdn_chunk + forward_mlp/moe_chunk with the
+// cross-GPU host-bridge transfer), and calls dflash_capture_chunk after each
+// layer's full forward — exactly as the serve path does (main.cu:1899).
+//
+// On-disk format (read by the Python trainer — do NOT change):
+//   <dir>/meta.json
+//   <dir>/embed.fp16     [V, H] fp16 row-major  (token_embd dequantized)
+//   <dir>/lm_head.fp16   [V, H] fp16 row-major  (output.weight dequantized)
+//   <dir>/chunk_000.bin, ...  each = concat of per-seq records:
+//       [int32 magic=0x44464331 ("DFC1")][int32 L][int32 tokens[L]][fp16 C[L*5*H]]
+//   <dir>/chunks.txt     listing "<filename> <record_count>" per line.
+int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
+                       const std::string& corpus_path,
+                       const std::string& out_dir,
+                       size_t chunk_bytes) {
+    QwenModel model;
+    model.gpu = &gpu_model;
+    model.init_config(gguf);
+    model.alloc_buffers();
+    model.init_gdn_states();
+
+    const int H = model.cfg.hidden_size;
+    const int V = model.cfg.vocab_size;
+    const int n_layers = model.cfg.num_layers;
+    const int last_gpu = gpu_model.layer_gpu[n_layers - 1];
+    constexpr int CHUNK = QwenModel::CHUNK_SIZE;
+    constexpr int N_TGT = dflash::DraftConfig::n_target_layers;     // 5
+    constexpr int BLOCK_SIZE = dflash::DraftConfig::block_size;     // 16
+    constexpr int MASK_TOKEN = dflash::DraftConfig::mask_token_id;  // 248070
+
+    // ── Read corpus: one line per sequence, space-separated int token ids ──
+    std::vector<std::vector<int>> sequences;
+    {
+        std::ifstream cf(corpus_path);
+        if (!cf) { fprintf(stderr, "[dflash-extract] cannot open corpus %s\n", corpus_path.c_str()); return 1; }
+        std::string line;
+        while (std::getline(cf, line)) {
+            std::vector<int> ids;
+            const char* p = line.c_str();
+            char* end = nullptr;
+            while (*p) {
+                while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+                if (!*p) break;
+                long v = std::strtol(p, &end, 10);
+                if (end == p) break;
+                if (v >= 0 && v < V) ids.push_back((int)v);
+                p = end;
+            }
+            if (!ids.empty()) sequences.push_back(std::move(ids));
+        }
+    }
+    if (sequences.empty()) { fprintf(stderr, "[dflash-extract] corpus has no valid sequences\n"); return 1; }
+    size_t max_L = 0;
+    for (auto& s : sequences) max_L = std::max(max_L, s.size());
+    printf("[dflash-extract] %zu sequences, max_len=%zu, H=%d V=%d layers=%d\n",
+           sequences.size(), max_L, H, V, n_layers);
+
+    // Capture buffer must hold the longest sequence.
+    model.init_attention((int)std::max<size_t>(max_L, 1));
+    model.init_dflash_capture((int)max_L, dflash::kTargetLayerIds, N_TGT);
+
+    // ── Output dir + chunk-stream bookkeeping ──
+    {
+        std::string mk = "mkdir -p '" + out_dir + "'";
+        if (system(mk.c_str()) != 0) { fprintf(stderr, "[dflash-extract] mkdir failed\n"); return 1; }
+    }
+
+    auto* embd_t = gpu_model.get("token_embd.weight");
+    auto* out_w  = gpu_model.get("output.weight");
+    if (!embd_t) { fprintf(stderr, "[dflash-extract] token_embd.weight missing\n"); return 1; }
+    if (!out_w)  { fprintf(stderr, "[dflash-extract] output.weight missing — falling back to token_embd\n"); out_w = embd_t; }
+
+    // ── 1. meta.json ──
+    {
+        std::string meta = out_dir + "/meta.json";
+        FILE* mf = fopen(meta.c_str(), "w");
+        if (!mf) { fprintf(stderr, "[dflash-extract] cannot write meta.json\n"); return 1; }
+        fprintf(mf,
+            "{\"hidden\":%d, \"n_tgt\":%d, \"target_layer_ids\":[%d,%d,%d,%d,%d], "
+            "\"vocab\":%d, \"block_size\":%d, \"mask_token_id\":%d, \"c_dtype\":\"fp16\"}\n",
+            H, N_TGT,
+            dflash::kTargetLayerIds[0], dflash::kTargetLayerIds[1], dflash::kTargetLayerIds[2],
+            dflash::kTargetLayerIds[3], dflash::kTargetLayerIds[4],
+            V, BLOCK_SIZE, MASK_TOKEN);
+        fclose(mf);
+        printf("[dflash-extract] wrote meta.json\n");
+    }
+
+    // ── 2/3. Dequantize embed + lm_head weights → fp16 [V,H] row-major ──
+    // Both are GPU-resident GGUF tensors. We dequant row-by-row on the source
+    // GPU using the existing dequant_embd_q8_0_row kernel, copy to host, write.
+    auto dequant_weight_to_file = [&](GPUTensor* w, const std::string& fname) -> bool {
+        cudaSetDevice(w->gpu_id);
+        half* d_row = nullptr;
+        if (cudaMalloc(&d_row, (size_t)H * sizeof(half)) != cudaSuccess) return false;
+        std::vector<half> h_row(H);
+        std::string path = out_dir + "/" + fname;
+        FILE* f = fopen(path.c_str(), "wb");
+        if (!f) { cudaFree(d_row); return false; }
+        bool ok = true;
+        for (int row = 0; row < V; row++) {
+            if (w->type == GGML_TYPE_Q8_0)
+                dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(w->data, d_row, row, H);
+            else if (w->type == GGML_TYPE_Q5_K)
+                dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(w->data, d_row, row, H);
+            else if (w->type == GGML_TYPE_Q6_K)
+                dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(w->data, d_row, row, H);
+            else { fprintf(stderr, "[dflash-extract] unsupported weight type %d for %s\n", (int)w->type, fname.c_str()); ok = false; break; }
+            cudaMemcpy(h_row.data(), d_row, (size_t)H * sizeof(half), cudaMemcpyDeviceToHost);
+            if (fwrite(h_row.data(), sizeof(half), H, f) != (size_t)H) { ok = false; break; }
+        }
+        fclose(f);
+        cudaFree(d_row);
+        return ok;
+    };
+    if (!dequant_weight_to_file(embd_t, "embed.fp16")) {
+        fprintf(stderr, "[dflash-extract] embed.fp16 export failed\n"); return 1;
+    }
+    printf("[dflash-extract] wrote embed.fp16 (%zu bytes)\n", (size_t)V * H * sizeof(half));
+    if (!dequant_weight_to_file(out_w, "lm_head.fp16")) {
+        fprintf(stderr, "[dflash-extract] lm_head.fp16 export failed\n"); return 1;
+    }
+    printf("[dflash-extract] wrote lm_head.fp16 (%zu bytes)\n", (size_t)V * H * sizeof(half));
+
+    // ── Prefill scratch (mirror BENCH_PREFILL: single stream 0, GPU-walk) ──
+    half* gpu_hidden_half0 = nullptr;
+    cudaSetDevice(0); cudaMalloc(&gpu_hidden_half0, (size_t)H * sizeof(half));
+    float* gpu_hidden_chunk[4] = {};
+    for (int g = 0; g < n_gpus; g++) {
+        cudaSetDevice(g);
+        cudaMalloc(&gpu_hidden_chunk[g], (size_t)CHUNK * H * sizeof(float));
+    }
+    float* host_chunk_transfer = nullptr;
+    cudaMallocHost(&host_chunk_transfer, (size_t)CHUNK * H * sizeof(float));
+
+    // Host buffer for one sequence's C, read back from gpu0_buf.
+    std::vector<half> host_C;
+
+    // ── Chunk-file stream ──
+    std::vector<std::pair<std::string,int>> chunk_index;  // (filename, record_count)
+    FILE* chunk_f = nullptr;
+    int   chunk_idx = -1;
+    char  cur_chunk_name[64] = {0};
+    size_t cur_chunk_bytes = 0;
+    int    cur_chunk_records = 0;
+    // Roll to a fresh chunk file when the current one would exceed chunk_bytes.
+    auto ensure_chunk = [&](size_t need_bytes) {
+        if (chunk_f == nullptr || (cur_chunk_bytes + need_bytes > chunk_bytes && cur_chunk_records > 0)) {
+            if (chunk_f) {
+                fclose(chunk_f);
+                chunk_index.push_back({std::string(cur_chunk_name), cur_chunk_records});
+            }
+            chunk_idx++;
+            snprintf(cur_chunk_name, sizeof(cur_chunk_name), "chunk_%03d.bin", chunk_idx);
+            std::string path = out_dir + "/" + cur_chunk_name;
+            chunk_f = fopen(path.c_str(), "wb");
+            cur_chunk_bytes = 0;
+            cur_chunk_records = 0;
+            printf("[dflash-extract] opened %s\n", cur_chunk_name);
+        }
+    };
+
+    // ── Main extraction loop: prefill each sequence, dump C + tokens ──
+    auto t_start = std::chrono::high_resolution_clock::now();
+    size_t total_tokens = 0;
+    for (size_t si = 0; si < sequences.size(); si++) {
+        const std::vector<int>& ids = sequences[si];
+        int L = (int)ids.size();
+        if (L > (int)max_L) L = (int)max_L;
+
+        // Fresh KV/GDN state + zero the capture buffer region for this seq.
+        model.reset_all_states();
+        cudaSetDevice(0);
+        cudaMemset(model.dflash_cap.gpu0_buf, 0,
+                   (size_t)L * N_TGT * H * sizeof(half));
+
+        int chunk_pos = 0;
+        while (chunk_pos < L) {
+            int chunk_n = std::min(CHUNK, L - chunk_pos);
+
+            // Embed chunk tokens onto GPU0 fp32 buffer.
+            cudaSetDevice(0);
+            for (int t = 0; t < chunk_n; t++) {
+                int token_id = ids[chunk_pos + t];
+                if (embd_t->type == GGML_TYPE_Q8_0)
+                    dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half0, token_id, H);
+                else if (embd_t->type == GGML_TYPE_Q5_K)
+                    dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half0, token_id, H);
+                else if (embd_t->type == GGML_TYPE_Q6_K)
+                    dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half0, token_id, H);
+                half_to_float_kernel<<<(H+255)/256, 256>>>(
+                    gpu_hidden_half0, gpu_hidden_chunk[0] + (size_t)t * H, H);
+            }
+
+            float* h_chunk = gpu_hidden_chunk[0];
+            for (int layer = 0; layer < n_layers; layer++) {
+                int g = gpu_model.layer_gpu[layer];
+                int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
+                if (g != prev_g) {
+                    cudaSetDevice(prev_g);
+                    cudaMemcpy(host_chunk_transfer, h_chunk,
+                               (size_t)chunk_n * H * sizeof(float), cudaMemcpyDeviceToHost);
+                    cudaSetDevice(g);
+                    cudaMemcpy(gpu_hidden_chunk[g], host_chunk_transfer,
+                               (size_t)chunk_n * H * sizeof(float), cudaMemcpyHostToDevice);
+                    h_chunk = gpu_hidden_chunk[g];
+                } else {
+                    cudaSetDevice(g);
+                }
+                bool is_attn = model.is_attn_layer(layer);
+                if (is_attn) model.forward_attn_chunk(layer, h_chunk, chunk_pos, chunk_n, 0);
+                else         model.forward_gdn_chunk (layer, h_chunk, chunk_n, 0);
+                if (model.layer_is_moe[layer]) model.forward_moe_chunk(layer, h_chunk, chunk_n, 0);
+                else                           model.forward_mlp_chunk(layer, h_chunk, chunk_n, 0);
+                // Capture exactly as the serve path (main.cu:1899): residual
+                // stream output of each captured layer → gpu0_buf.
+                model.dflash_capture_chunk(layer, h_chunk, chunk_pos, chunk_n, g, 0);
+            }
+            cudaSetDevice(last_gpu); cudaDeviceSynchronize();
+            chunk_pos += chunk_n;
+        }
+
+        // Read back C for the whole sequence: [L * N_TGT * H] fp16 from GPU0.
+        cudaSetDevice(0); cudaDeviceSynchronize();
+        size_t c_count = (size_t)L * N_TGT * H;
+        host_C.resize(c_count);
+        cudaMemcpy(host_C.data(), model.dflash_cap.gpu0_buf,
+                   c_count * sizeof(half), cudaMemcpyDeviceToHost);
+
+        // Write record: [magic][L][tokens[L]][C[L*5*H]]
+        size_t rec_bytes = sizeof(int32_t) * 2 + (size_t)L * sizeof(int32_t)
+                         + c_count * sizeof(half);
+        ensure_chunk(rec_bytes);
+        int32_t magic = 0x44464331;  // "DFC1"
+        int32_t Lw = L;
+        fwrite(&magic, sizeof(int32_t), 1, chunk_f);
+        fwrite(&Lw,    sizeof(int32_t), 1, chunk_f);
+        fwrite(ids.data(), sizeof(int32_t), L, chunk_f);
+        fwrite(host_C.data(), sizeof(half), c_count, chunk_f);
+        cur_chunk_bytes += rec_bytes;
+        cur_chunk_records++;
+        total_tokens += L;
+
+        if ((si + 1) % 64 == 0 || si + 1 == sequences.size()) {
+            auto now = std::chrono::high_resolution_clock::now();
+            double s = std::chrono::duration<double>(now - t_start).count();
+            printf("[dflash-extract] %zu/%zu seqs, %zu tokens, %.1f tok/s\n",
+                   si + 1, sequences.size(), total_tokens,
+                   s > 0 ? total_tokens / s : 0.0);
+        }
+    }
+
+    // Close last chunk + write chunks.txt.
+    if (chunk_f) {
+        fclose(chunk_f);
+        chunk_index.push_back({std::string(cur_chunk_name), cur_chunk_records});
+    }
+    {
+        std::string ct = out_dir + "/chunks.txt";
+        FILE* cf = fopen(ct.c_str(), "w");
+        if (cf) {
+            for (auto& e : chunk_index) fprintf(cf, "%s %d\n", e.first.c_str(), e.second);
+            fclose(cf);
+        }
+    }
+    printf("[dflash-extract] DONE: %zu seqs, %zu tokens, %zu chunk file(s)\n",
+           sequences.size(), total_tokens, chunk_index.size());
+
+    cudaFreeHost(host_chunk_transfer);
+    for (int g = 0; g < n_gpus; g++) { cudaSetDevice(g); cudaFree(gpu_hidden_chunk[g]); }
+    cudaSetDevice(0); cudaFree(gpu_hidden_half0);
     return 0;
 }
 
@@ -4849,6 +5139,9 @@ int main(int argc, char** argv) {
     std::string proxy_embed_url, proxy_rerank_url;
     std::string prompt_text, api_key;
     std::string vision_mmproj_path, vision_test_image, image_raw_path;
+    // DFlash drafter training-data extraction (--mode dflash-extract).
+    std::string dflash_corpus_path, dflash_out_dir;
+    size_t dflash_chunk_bytes = 18000000000ULL;  // ~18 GB default
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--serve") == 0 && i + 1 < argc) {
             serve_port = atoi(argv[++i]);
@@ -4890,6 +5183,12 @@ int main(int argc, char** argv) {
             proxy_embed_url = argv[++i];
         } else if (strcmp(argv[i], "--proxy-rerank") == 0 && i + 1 < argc) {
             proxy_rerank_url = argv[++i];
+        } else if (strcmp(argv[i], "--dflash-corpus") == 0 && i + 1 < argc) {
+            dflash_corpus_path = argv[++i];
+        } else if (strcmp(argv[i], "--dflash-out") == 0 && i + 1 < argc) {
+            dflash_out_dir = argv[++i];
+        } else if (strcmp(argv[i], "--dflash-chunk-bytes") == 0 && i + 1 < argc) {
+            dflash_chunk_bytes = strtoull(argv[++i], nullptr, 10);
         }
     }
 
@@ -5096,7 +5395,15 @@ int main(int argc, char** argv) {
     { size_t s = model_name.rfind('/'); if (s != std::string::npos) model_name = model_name.substr(s+1);
       size_t d = model_name.find(".gguf"); if (d != std::string::npos) model_name = model_name.substr(0, d); }
 
-    if (serve_port > 0 && service_mode == "embed") {
+    if (service_mode == "dflash-extract") {
+        if (dflash_corpus_path.empty() || dflash_out_dir.empty()) {
+            fprintf(stderr, "[dflash-extract] requires --dflash-corpus <file> and --dflash-out <dir>\n");
+            ret = 1;
+        } else {
+            ret = run_dflash_extract(gguf, gpu_model, n_gpus,
+                                     dflash_corpus_path, dflash_out_dir, dflash_chunk_bytes);
+        }
+    } else if (serve_port > 0 && service_mode == "embed") {
         ret = serve_embed(gguf, gpu_model, n_gpus, serve_port, tokenizer, model_name);
     } else if (serve_port > 0 && service_mode == "rerank") {
         ret = serve_rerank(gguf, gpu_model, n_gpus, serve_port, tokenizer, model_name);
