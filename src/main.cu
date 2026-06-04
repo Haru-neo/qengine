@@ -1756,7 +1756,18 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
             // MVP: chain-only verify (budget = block_size = 16). KV slot ↔
             // absolute pos identity holds, so accept_len truncation is free.
             // Tree-branching (budget=22) needs KV/GDN rebuild and lands later.
-            tree_budget = dflash::DraftConfig::block_size;  // 16
+            // Verify budget = how many of the drafter's 16 predicted tokens we
+            // actually forward through the 27B per iteration. The verify is the
+            // dominant cost (~76% of gen time, partly compute-bound in the MLP),
+            // so over-verifying past the real accept length (AL) is pure waste.
+            // DFLASH_BUDGET tunes it (<= block_size=16). Default 8: measured sweet
+            // spot for the AL~5 drafter (16.5->24 t/s, lossless — output is byte-
+            // identical to budget=16, only faster). Raise it for a higher-AL drafter.
+            tree_budget = 8;
+            if (const char* e = getenv("DFLASH_BUDGET")) {
+                int b = atoi(e);
+                if (b >= 2 && b <= dflash::DraftConfig::block_size) tree_budget = b;
+            }
             dflash_state.budget = tree_budget;
             // Disable MTP paths — DFlash has its own draft.
             spec_enabled = spec_k2_enabled = spec_tree_enabled = false;
@@ -1798,17 +1809,26 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         printf("[SPEC-K2] MTP K=2 speculative decoding enabled (self-chained draft, N=3 batched verify)\n");
     }
     if (spec_tree_enabled || dflash_enabled) {
+        // These buffers serve BOTH the draft lm_head (which always uses the full
+        // block_size=16 slots) AND the verify (tree_budget <= block_size slots).
+        // Size them by the MAX (block_size); using tree_budget under-allocates when
+        // DFLASH_BUDGET<16 -> the 16-slot draft lm_head overflows -> draft_chain
+        // corrupts to garbage -> accept collapses (the budget<16 bug). tree_budget
+        // still controls the verify LOOP counts elsewhere.
+        int tb_alloc = dflash_enabled
+                     ? std::max(tree_budget, (int)dflash::DraftConfig::block_size)
+                     : tree_budget;
         for (int g = 0; g < n_gpus; g++) {
             cudaSetDevice(g);
-            cudaMalloc(&tree_hidden[g],      (size_t)tree_budget * H * sizeof(float));
-            cudaMalloc(&tree_hidden_half[g], (size_t)tree_budget * H * sizeof(half));
+            cudaMalloc(&tree_hidden[g],      (size_t)tb_alloc * H * sizeof(float));
+            cudaMalloc(&tree_hidden_half[g], (size_t)tb_alloc * H * sizeof(half));
         }
         cudaSetDevice(last_gpu);
-        cudaMalloc(&tree_norm_buf,   (size_t)tree_budget * H * sizeof(half));
-        cudaMalloc(&tree_logits_buf, (size_t)tree_budget * V * sizeof(half));
-        cudaMalloc(&tree_d_argmax,   (size_t)tree_budget * sizeof(int));
-        cudaMallocHost(&tree_h_argmax, (size_t)tree_budget * sizeof(int));
-        cudaMallocHost(&tree_host_transfer, (size_t)tree_budget * H * sizeof(float));
+        cudaMalloc(&tree_norm_buf,   (size_t)tb_alloc * H * sizeof(half));
+        cudaMalloc(&tree_logits_buf, (size_t)tb_alloc * V * sizeof(half));
+        cudaMalloc(&tree_d_argmax,   (size_t)tb_alloc * sizeof(int));
+        cudaMallocHost(&tree_h_argmax, (size_t)tb_alloc * sizeof(int));
+        cudaMallocHost(&tree_host_transfer, (size_t)tb_alloc * H * sizeof(float));
         if (!h_final_draft1) cudaMalloc(&h_final_draft1, H * sizeof(half));   // reused for self-chain MTP
         // Second ping-pong buffer for chain depths > 3 (budget > 3).
         // We always alloc one so budget=3 path stays simple.
@@ -2044,6 +2064,8 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         const bool do_gen_prof = gen_prof_env && gen_prof_env[0] == '1';
         double g_embed = 0, g_xfer = 0, g_attn = 0, g_gdn = 0, g_mlp = 0,
                g_logits = 0, g_mtp = 0, g_other = 0;
+        // DFlash tree-verify sub-phase timers (the untimed 27B 16-token forward).
+        double g_tv_xfer = 0, g_tv_attn = 0, g_tv_gdn = 0, g_tv_mlp = 0, g_tv_cap = 0;
         int g_steps = 0, g_spec_iters = 0;
         // PROFILE_FA=1 zeroes the device-side fused-FA phase cycle counters
         // (g_fa_phase_cyc[0..4]: decode/score/softmax/value/tile_cnt) on each
@@ -3129,6 +3151,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                             int g_l = gpu_model.layer_gpu[layer];
                             int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
                             if (g_l != prev_g) {
+                                auto tvx = prof_now();
                                 cudaSetDevice(prev_g);
                                 cudaMemcpy(tree_host_transfer, h_tree,
                                            (size_t)tree_budget * H * sizeof(float),
@@ -3138,20 +3161,29 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                                            (size_t)tree_budget * H * sizeof(float),
                                            cudaMemcpyHostToDevice);
                                 h_tree = tree_hidden[g_l];
+                                if (do_gen_prof) g_tv_xfer += prof_sync_ms(tvx, g_l);
                             } else cudaSetDevice(g_l);
 
                             bool is_attn_t = model.is_attn_layer(layer);
-                            if (is_attn_t)
+                            auto tvl = prof_now();
+                            if (is_attn_t) {
                                 model.forward_attn_tree(layer, h_tree, step + 1, tree_budget,
                                                         model.tree_parent_ids_d[g_l], 0);
-                            else
+                                if (do_gen_prof) g_tv_attn += prof_sync_ms(tvl, g_l);
+                            } else {
                                 model.forward_gdn_tree(layer, h_tree, tree_budget,
                                                        model.tree_parent_ids_d[g_l], 0);
+                                if (do_gen_prof) g_tv_gdn += prof_sync_ms(tvl, g_l);
+                            }
+                            auto tvm = prof_now();
                             model.forward_mlp_tree(layer, h_tree, tree_budget,
                                                    model.tree_parent_ids_d[g_l], 0);
+                            if (do_gen_prof) g_tv_mlp += prof_sync_ms(tvm, g_l);
                             // Capture this layer's per-slot hidden into scratch
                             // (no-op unless layer ∈ {1, 16, 31, 46, 61}).
+                            auto tvc = prof_now();
                             model.dflash_capture_tree_layer(layer, h_tree, tree_budget, g_l, 0);
+                            if (do_gen_prof) g_tv_cap += prof_sync_ms(tvc, g_l);
                         }
 
                         // (6c) Batched lm_head per slot.
@@ -3894,6 +3926,14 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 }
             }
         }
+        if (dflash_enabled) {
+            long long iters = tree_accept_full_count + tree_accept_partial_count + tree_reject_count;
+            double al = iters ? 1.0 + (double)spec_accept_count / (double)iters : 0.0;
+            printf("[DFLASH] budget=%d iters=%lld accepted_drafts=%lld  AL(tokens/iter)=%.2f  "
+                   "full=%lld partial=%lld reject=%lld\n",
+                   tree_budget, iters, spec_accept_count, al,
+                   tree_accept_full_count, tree_accept_partial_count, tree_reject_count);
+        }
         if (do_gen_prof) {
             double total = g_embed + g_xfer + g_attn + g_gdn + g_mlp + g_logits + g_mtp;
             printf("[GEN PROF] steps=%d spec_iters=%d  total=%.1fms  "
@@ -3904,6 +3944,12 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                    g_attn, 100.0*g_attn/total, g_gdn, 100.0*g_gdn/total,
                    g_mlp, 100.0*g_mlp/total, g_logits, 100.0*g_logits/total,
                    g_mtp, 100.0*g_mtp/total);
+            double tv = g_tv_xfer + g_tv_attn + g_tv_gdn + g_tv_mlp + g_tv_cap;
+            printf("[GEN PROF TREE-VERIFY] total=%.1fms  xfer=%.1f(%.0f%%) attn=%.1f(%.0f%%) "
+                   "gdn=%.1f(%.0f%%) mlp=%.1f(%.0f%%) capture=%.1f(%.0f%%)  (= the 16-tok 27B verify, was untimed)\n",
+                   tv, g_tv_xfer, 100.0*g_tv_xfer/tv, g_tv_attn, 100.0*g_tv_attn/tv,
+                   g_tv_gdn, 100.0*g_tv_gdn/tv, g_tv_mlp, 100.0*g_tv_mlp/tv,
+                   g_tv_cap, 100.0*g_tv_cap/tv);
             fflush(stdout);
         }
         if (g_profile_attn && g_pt_calls > 0) {
