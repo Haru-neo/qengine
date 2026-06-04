@@ -128,6 +128,25 @@ static double bench_warp(void* dW, const block_q8_1* dX, half* dY,
     return ms / iters;
 }
 
+// warp4: production kernel from quant_gemv.cuh (4 rows/warp, input reuse).
+template<int NB, int WPB>
+static double bench_warp4(void* dW, const block_q8_1* dX, half* dY,
+                          int K, int M, int N, int iters) {
+    dim3 grid(((M / 4) + WPB - 1) / WPB);
+    int threads = 32 * WPB;
+    for (int w = 0; w < 3; w++)
+        gemv_q8_0_q8_warp4<NB, WPB><<<grid, threads>>>(dW, dX, dY, K, M, N);
+    cudaDeviceSynchronize();
+    cudaEvent_t t0, t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
+    cudaEventRecord(t0);
+    for (int i = 0; i < iters; i++)
+        gemv_q8_0_q8_warp4<NB, WPB><<<grid, threads>>>(dW, dX, dY, K, M, N);
+    cudaEventRecord(t1); cudaEventSynchronize(t1);
+    float ms = 0; cudaEventElapsedTime(&ms, t0, t1);
+    cudaEventDestroy(t0); cudaEventDestroy(t1);
+    return ms / iters;
+}
+
 static double bench_gemm(void* dW, const block_q8_1* dX, half* dY,
                          int K, int M, int N, int iters) {
     const int v2_mode = 9;  // default winner: 32x128 2x8 BK=4
@@ -228,17 +247,13 @@ int main(int argc, char** argv) {
     half* h_cmp = (half*)malloc(y_bytes);
 
     // Dispatch the warp-per-row candidate for the N values the verify uses.
-    int WPB_ENV = getenv("WPB") ? atoi(getenv("WPB")) : 4;
+    // WARP4=1 (default) benches the production warp4 kernel; WARP4=0 the older
+    // 1-row warp, to A/B the input-reuse win.
+    int use_w4 = getenv("WARP4") ? atoi(getenv("WARP4")) : 1;
     auto run_warp = [&](int K, int M, int N, int iters) -> double {
-        // WPB chosen via env for the sweep; integrate the winner afterward.
-        if (WPB_ENV == 2) {
-            if (N==4) return bench_warp<4,2>(dW,dX,dY2,K,M,N,iters);
-            if (N==8) return bench_warp<8,2>(dW,dX,dY2,K,M,N,iters);
-            if (N==12||N==16) return bench_warp<16,2>(dW,dX,dY2,K,M,N,iters);
-        } else if (WPB_ENV == 8) {
-            if (N==4) return bench_warp<4,8>(dW,dX,dY2,K,M,N,iters);
-            if (N==8) return bench_warp<8,8>(dW,dX,dY2,K,M,N,iters);
-            if (N==12||N==16) return bench_warp<16,8>(dW,dX,dY2,K,M,N,iters);
+        if (use_w4) {
+            if (N==8) return bench_warp4<8,4>(dW,dX,dY2,K,M,N,iters);
+            if (N==4||N==12||N==16) return bench_warp4<16,4>(dW,dX,dY2,K,M,N,iters);
         } else {
             if (N==4) return bench_warp<4,4>(dW,dX,dY2,K,M,N,iters);
             if (N==8) return bench_warp<8,4>(dW,dX,dY2,K,M,N,iters);

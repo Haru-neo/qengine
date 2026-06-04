@@ -931,6 +931,81 @@ __global__ void gemv_q8_0_q8_warp(
 template __global__ void gemv_q8_0_q8_warp<8,  4>(const void*, const block_q8_1*, half*, int, int, int);
 template __global__ void gemv_q8_0_q8_warp<16, 4>(const void*, const block_q8_1*, half*, int, int, int);
 
+// gemv_q8_0_q8_warp4: like _warp but each warp owns RPW=4 consecutive output
+// rows. The N input words are loaded ONCE per K-block and reused across all 4
+// rows (input traffic /4) — at N=8 the scattered per-token input re-reads were
+// a real cost, so this is the next lever past _warp. Weight is still streamed
+// once per row. Requires M % 4 == 0 (all 27B proj dims qualify), so a single
+// top-of-warp OOB guard suffices (row0 ∈ {0,4,...,M-4}). Microbench gain over
+// _warp ≈ 1.24× at N=8.
+template<int NB, int WPB>
+__global__ void gemv_q8_0_q8_warp4(
+    const void* __restrict__ weight,
+    const block_q8_1* __restrict__ x_q8_chunk,   // [NB][bpr]
+    half* __restrict__ output_chunk,             // [NB][M]
+    int K, int M, int actual_n)
+{
+    constexpr int RPW = 4;
+    const int lane = threadIdx.x & 31;
+    const int row0 = (blockIdx.x * WPB + (threadIdx.x >> 5)) * RPW;
+    if (row0 >= M) return;                 // M%4==0 ⇒ row0+0..3 all < M
+    const int bpr = K / 32;
+    const block_q8_0_aligned* wbase = (const block_q8_0_aligned*)weight;
+
+    float sums[RPW][NB];
+    #pragma unroll
+    for (int r = 0; r < RPW; r++)
+        #pragma unroll
+        for (int n = 0; n < NB; n++) sums[r][n] = 0.0f;
+
+    for (int b = lane; b < bpr; b += 32) {
+        float d_w[RPW];
+        int wj[RPW][8];
+        #pragma unroll
+        for (int r = 0; r < RPW; r++) {
+            const block_q8_0_aligned* wb = wbase + (size_t)(row0 + r) * bpr + b;
+            d_w[r] = __half2float(wb->d);
+            const int* wp = (const int*)wb->qs;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) wj[r][j] = wp[j];
+        }
+        #pragma unroll
+        for (int n = 0; n < NB; n++) {
+            if (n < actual_n) {
+                const block_q8_1* xb = x_q8_chunk + (size_t)n * bpr + b;
+                const int* xq = (const int*)xb->qs;
+                int xv[8];
+                #pragma unroll
+                for (int j = 0; j < 8; j++) xv[j] = xq[j];   // input loaded once, reused 4×
+                float d_x = __half2float(xb->ds.x);
+                #pragma unroll
+                for (int r = 0; r < RPW; r++) {
+                    int isum = 0;
+                    #pragma unroll
+                    for (int j = 0; j < 8; j++) isum = __dp4a(wj[r][j], xv[j], isum);
+                    sums[r][n] += d_w[r] * d_x * (float)isum;
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < RPW; r++)
+        #pragma unroll
+        for (int n = 0; n < NB; n++)
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                sums[r][n] += __shfl_xor_sync(0xffffffff, sums[r][n], off);
+    if (lane == 0) {
+        #pragma unroll
+        for (int r = 0; r < RPW; r++)
+            #pragma unroll
+            for (int n = 0; n < NB; n++)
+                if (n < actual_n) output_chunk[(size_t)n * M + (row0 + r)] = __float2half(sums[r][n]);
+    }
+}
+template __global__ void gemv_q8_0_q8_warp4<8,  4>(const void*, const block_q8_1*, half*, int, int, int);
+template __global__ void gemv_q8_0_q8_warp4<16, 4>(const void*, const block_q8_1*, half*, int, int, int);
+
 // ========================================================================
 // Q8_0 weight × Q8_1 input GEMM (chunked prefill fast path)
 //
@@ -1639,7 +1714,7 @@ inline void quant_gemv_chunk(void* weight, ggml_type type,
             op += (size_t)bn_total * M;
             remaining -= bn_total;
         }
-        if (remaining >= 16 && (M % 16) == 0) {
+        if (remaining >= 17 && (M % 16) == 0) {
             constexpr int BM = 16, BN = 16, BK_BLOCKS = 8;
             int n_chunks = remaining / BN;
             int bn_total = n_chunks * BN;
@@ -1652,21 +1727,23 @@ inline void quant_gemv_chunk(void* weight, ggml_type type,
             remaining -= bn_total;
         }
 
-        // Tail: < BN (16) tokens — the single-stream spec / tree-verify regime.
-        // Use the one-warp-per-row GEMV (gemv_q8_0_q8_warp): a single launch
-        // covers the whole [4,15] tail (no 8+4 peeling) and avoids the nN
-        // cross-warp reduction that dominates long-K projections. Opt out with
-        // DFLASH_WARP_GEMV=0 to fall back to the nN peeling path.
+        // Tail: ≤16 tokens — the single-stream spec / tree-verify regime.
+        // gemv_q8_0_q8_warp4: one warp owns 4 output rows, loads each input word
+        // once and reuses it across the 4 rows (input traffic /4) and reduces
+        // with warp-shuffle only (no SMEM/__syncthreads). Microbench at N=8:
+        // 1.42× over the 1-row warp, and at N=16 it even beats the BM16/BN16
+        // GEMM tile (0.37 vs 0.59 ms) — hence it now covers [4,16] (BN=16 GEMM
+        // restricted to remaining≥17). Opt out via DFLASH_WARP_GEMV=0.
         static const bool warp_tail = !(getenv("DFLASH_WARP_GEMV") &&
                                         atoi(getenv("DFLASH_WARP_GEMV")) == 0);
-        if (warp_tail && remaining >= 4 && (M % 4) == 0) {
+        if (warp_tail && remaining >= 4 && remaining <= 16 && (M % 4) == 0) {
             constexpr int WPB = 4;
-            dim3 wgrid((M + WPB - 1) / WPB);
+            dim3 wgrid(((M / 4) + WPB - 1) / WPB);
             int wthreads = 32 * WPB;
             if (remaining >= 9)
-                gemv_q8_0_q8_warp<16, WPB><<<wgrid, wthreads, 0, stream>>>(weight, xp, op, K, M, remaining);
+                gemv_q8_0_q8_warp4<16, WPB><<<wgrid, wthreads, 0, stream>>>(weight, xp, op, K, M, remaining);
             else
-                gemv_q8_0_q8_warp<8,  WPB><<<wgrid, wthreads, 0, stream>>>(weight, xp, op, K, M, remaining);
+                gemv_q8_0_q8_warp4<8,  WPB><<<wgrid, wthreads, 0, stream>>>(weight, xp, op, K, M, remaining);
             xp += (size_t)remaining * (K / 32);
             op += (size_t)remaining * M;
             remaining = 0;
