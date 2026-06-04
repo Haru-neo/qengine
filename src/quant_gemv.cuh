@@ -868,6 +868,70 @@ template __global__ void gemv_q8_0_q8_nN<8>(const void*, const block_q8_1*, half
 template __global__ void gemv_q8_0_q8_nN<16>(const void*, const block_q8_1*, half*, int, int, int);
 
 // ========================================================================
+// Small-batch GEMV: one warp per output row (WPB warps/block).
+//
+// gemv_q8_0_q8_nN<NB> uses grid=M, 128 threads, and reduces NB separate sums
+// with BOTH warp-shuffle AND a cross-warp __syncthreads/SMEM step. For the
+// long-K projections (down K=17408, GDN qkv/out) that cross-warp reduction is
+// 8× the work and dominates: N=8 stalls at ~2.8 TFLOPs / 195 GB/s.
+//
+// Here one warp owns one row: each lane strides the K blocks, the weight word
+// is loaded once into registers and reused across NB tokens, and the NB sums
+// need only a warp-shuffle reduce (no __syncthreads, no SMEM). Microbench at
+// N=8 (CMP 100-210): down 0.515→0.341ms (1.51×), gate/up 0.302→0.275 (1.10×).
+// Loses to the GEMM tile for N≥16, so this is used only for the N∈[4,15] tail
+// that single-stream spec/tree-verify decode actually exercises.
+template<int NB, int WPB>
+__global__ void gemv_q8_0_q8_warp(
+    const void* __restrict__ weight,
+    const block_q8_1* __restrict__ x_q8_chunk,   // [NB][bpr]
+    half* __restrict__ output_chunk,             // [NB][M]
+    int K, int M, int actual_n)
+{
+    const int lane = threadIdx.x & 31;
+    const int row  = blockIdx.x * WPB + (threadIdx.x >> 5);
+    if (row >= M) return;
+    const int bpr = K / 32;
+    const block_q8_0_aligned* w_row = (const block_q8_0_aligned*)weight + (size_t)row * bpr;
+
+    float sums[NB];
+    #pragma unroll
+    for (int n = 0; n < NB; n++) sums[n] = 0.0f;
+
+    for (int b = lane; b < bpr; b += 32) {
+        const block_q8_0_aligned* wb = &w_row[b];
+        float d_w = __half2float(wb->d);
+        const int* wp = (const int*)wb->qs;
+        int wj[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) wj[j] = wp[j];
+        #pragma unroll
+        for (int n = 0; n < NB; n++) {
+            if (n < actual_n) {
+                const block_q8_1* xb = x_q8_chunk + (size_t)n * bpr + b;
+                const int* xq = (const int*)xb->qs;
+                int isum = 0;
+                #pragma unroll
+                for (int j = 0; j < 8; j++) isum = __dp4a(wj[j], xq[j], isum);
+                sums[n] += d_w * __half2float(xb->ds.x) * (float)isum;
+            }
+        }
+    }
+    #pragma unroll
+    for (int n = 0; n < NB; n++)
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            sums[n] += __shfl_xor_sync(0xffffffff, sums[n], off);
+    if (lane == 0) {
+        #pragma unroll
+        for (int n = 0; n < NB; n++)
+            if (n < actual_n) output_chunk[(size_t)n * M + row] = __float2half(sums[n]);
+    }
+}
+template __global__ void gemv_q8_0_q8_warp<8,  4>(const void*, const block_q8_1*, half*, int, int, int);
+template __global__ void gemv_q8_0_q8_warp<16, 4>(const void*, const block_q8_1*, half*, int, int, int);
+
+// ========================================================================
 // Q8_0 weight × Q8_1 input GEMM (chunked prefill fast path)
 //
 // True GEMM with shared-memory tiling, so each global Q8_0 weight block
@@ -1588,7 +1652,25 @@ inline void quant_gemv_chunk(void* weight, ggml_type type,
             remaining -= bn_total;
         }
 
-        // Tail: < BN tokens. Fall back to N-batched GEMV peeling.
+        // Tail: < BN (16) tokens — the single-stream spec / tree-verify regime.
+        // Use the one-warp-per-row GEMV (gemv_q8_0_q8_warp): a single launch
+        // covers the whole [4,15] tail (no 8+4 peeling) and avoids the nN
+        // cross-warp reduction that dominates long-K projections. Opt out with
+        // DFLASH_WARP_GEMV=0 to fall back to the nN peeling path.
+        static const bool warp_tail = !(getenv("DFLASH_WARP_GEMV") &&
+                                        atoi(getenv("DFLASH_WARP_GEMV")) == 0);
+        if (warp_tail && remaining >= 4 && (M % 4) == 0) {
+            constexpr int WPB = 4;
+            dim3 wgrid((M + WPB - 1) / WPB);
+            int wthreads = 32 * WPB;
+            if (remaining >= 9)
+                gemv_q8_0_q8_warp<16, WPB><<<wgrid, wthreads, 0, stream>>>(weight, xp, op, K, M, remaining);
+            else
+                gemv_q8_0_q8_warp<8,  WPB><<<wgrid, wthreads, 0, stream>>>(weight, xp, op, K, M, remaining);
+            xp += (size_t)remaining * (K / 32);
+            op += (size_t)remaining * M;
+            remaining = 0;
+        }
         while (remaining >= 8) {
             gemv_q8_0_q8_nN<8><<<M, threads, 0, stream>>>(weight, xp, op, K, M, 8);
             xp += 8 * (K / 32);
