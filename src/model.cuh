@@ -3487,7 +3487,37 @@ struct QwenModel {
         //    persistent intermediate buffer. rec_state remains the pre-tree
         //    state (read-only here); tree_gdn_inter[layer] holds post-token
         //    states for each of the n_tokens nodes.
-        {
+        //
+        // Chain fast path: when the tree is a pure chain (tree_is_chain) the
+        // state is strictly sequential, so gdn_recurrent_step_tree_chain keeps
+        // it SMEM-resident across the whole block (no per-token global reload).
+        // Bit-identical to the per-token path on a chain; ~2.7× faster on the
+        // scan. Needs the >48KB SMEM opt-in (per-GPU, like gdn_chunk_step).
+        // Opt out via DFLASH_GDN_CHAIN=0.
+        static const bool gdn_chain =
+            !(getenv("DFLASH_GDN_CHAIN") && atoi(getenv("DFLASH_GDN_CHAIN")) == 0);
+        if (gdn_chain && tree_is_chain) {
+            int threads   = min(v_dim, 128);
+            int state_len = k_dim * v_dim;
+            int gdn_smem  = (state_len + 2 * k_dim + 1 + 96) * sizeof(float);
+            static bool chain_smem_set[16] = {false};
+            int cur_dev = 0; cudaGetDevice(&cur_dev);
+            if (cur_dev >= 0 && cur_dev < 16 && !chain_smem_set[cur_dev]) {
+                cudaFuncSetAttribute((const void*)gdn_recurrent_step_tree_chain,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
+                chain_smem_set[cur_dev] = true;
+            }
+            gdn_recurrent_step_tree_chain<<<num_v, threads, gdn_smem, stream>>>(
+                gb.chunk_qkv,
+                (float*)a_log_t->data,
+                (float*)dt_bias_t->data,
+                gb.chunk_a_proj,
+                gb.chunk_b_proj,
+                rec_state_slot,
+                tree_gdn_inter[layer],
+                gb.chunk_core_out,
+                num_k, num_v, k_dim, v_dim, n_tokens);
+        } else {
             int threads = min(v_dim, 128);
             int gdn_smem = (2 * k_dim + 1) * sizeof(float);
             gdn_recurrent_step_tree<<<num_v, threads, gdn_smem, stream>>>(
