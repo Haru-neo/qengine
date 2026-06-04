@@ -1,0 +1,1537 @@
+layer,q_head,chosen,best_l2
+0,0,DENSE(no_dump),nan
+0,1,DENSE(no_dump),nan
+0,2,DENSE(no_dump),nan
+0,3,DENSE(no_dump),nan
+0,4,DENSE(no_dump),nan
+0,5,DENSE(no_dump),nan
+0,6,DENSE(no_dump),nan
+0,7,DENSE(no_dump),nan
+0,8,DENSE(no_dump),nan
+0,9,DENSE(no_dump),nan
+0,10,DENSE(no_dump),nan
+0,11,DENSE(no_dump),nan
+0,12,DENSE(no_dump),nan
+0,13,DENSE(no_dump),nan
+0,14,DENSE(no_dump),nan
+0,15,DENSE(no_dump),nan
+0,16,DENSE(no_dump),nan
+0,17,DENSE(no_dump),nan
+0,18,DENSE(no_dump),nan
+0,19,DENSE(no_dump),nan
+0,20,DENSE(no_dump),nan
+0,21,DENSE(no_dump),nan
+0,22,DENSE(no_dump),nan
+0,23,DENSE(no_dump),nan
+1,0,DENSE(no_dump),nan
+1,1,DENSE(no_dump),nan
+1,2,DENSE(no_dump),nan
+1,3,DENSE(no_dump),nan
+1,4,DENSE(no_dump),nan
+1,5,DENSE(no_dump),nan
+1,6,DENSE(no_dump),nan
+1,7,DENSE(no_dump),nan
+1,8,DENSE(no_dump),nan
+1,9,DENSE(no_dump),nan
+1,10,DENSE(no_dump),nan
+1,11,DENSE(no_dump),nan
+1,12,DENSE(no_dump),nan
+1,13,DENSE(no_dump),nan
+1,14,DENSE(no_dump),nan
+1,15,DENSE(no_dump),nan
+1,16,DENSE(no_dump),nan
+1,17,DENSE(no_dump),nan
+1,18,DENSE(no_dump),nan
+1,19,DENSE(no_dump),nan
+1,20,DENSE(no_dump),nan
+1,21,DENSE(no_dump),nan
+1,22,DENSE(no_dump),nan
+1,23,DENSE(no_dump),nan
+2,0,DENSE(no_dump),nan
+2,1,DENSE(no_dump),nan
+2,2,DENSE(no_dump),nan
+2,3,DENSE(no_dump),nan
+2,4,DENSE(no_dump),nan
+2,5,DENSE(no_dump),nan
+2,6,DENSE(no_dump),nan
+2,7,DENSE(no_dump),nan
+2,8,DENSE(no_dump),nan
+2,9,DENSE(no_dump),nan
+2,10,DENSE(no_dump),nan
+2,11,DENSE(no_dump),nan
+2,12,DENSE(no_dump),nan
+2,13,DENSE(no_dump),nan
+2,14,DENSE(no_dump),nan
+2,15,DENSE(no_dump),nan
+2,16,DENSE(no_dump),nan
+2,17,DENSE(no_dump),nan
+2,18,DENSE(no_dump),nan
+2,19,DENSE(no_dump),nan
+2,20,DENSE(no_dump),nan
+2,21,DENSE(no_dump),nan
+2,22,DENSE(no_dump),nan
+2,23,DENSE(no_dump),nan
+3,0,BLOCK_SPARSE@0.050,0.0499
+3,1,A_SHAPE@s64w1024,0.0295
+3,2,A_SHAPE@s64w1024,0.0399
+3,3,A_SHAPE@s64w1024,0.0473
+3,4,A_SHAPE@s64w1024,0.0489
+3,5,A_SHAPE@s64w1024,0.0405
+3,6,BLOCK_SPARSE@0.050,0.0369
+3,7,BLOCK_SPARSE@0.050,0.0415
+3,8,A_SHAPE@s64w1024,0.0297
+3,9,BLOCK_SPARSE@0.050,0.0486
+3,10,A_SHAPE@s64w1024,0.0348
+3,11,BLOCK_SPARSE@0.050,0.0414
+3,12,BLOCK_SPARSE@0.050,0.0407
+3,13,A_SHAPE@s64w1024,0.0447
+3,14,A_SHAPE@s64w1024,0.0375
+3,15,A_SHAPE@s64w1024,0.0253
+3,16,BLOCK_SPARSE@0.050,0.0278
+3,17,A_SHAPE@s64w1024,0.0378
+3,18,BLOCK_SPARSE@0.050,0.0426
+3,19,BLOCK_SPARSE@0.050,0.0325
+3,20,A_SHAPE@s64w1024,0.0290
+3,21,BLOCK_SPARSE@0.050,0.0126
+3,22,A_SHAPE@s64w1024,0.0316
+3,23,BLOCK_SPARSE@0.050,0.0249
+4,0,DENSE(no_dump),nan
+4,1,DENSE(no_dump),nan
+4,2,DENSE(no_dump),nan
+4,3,DENSE(no_dump),nan
+4,4,DENSE(no_dump),nan
+4,5,DENSE(no_dump),nan
+4,6,DENSE(no_dump),nan
+4,7,DENSE(no_dump),nan
+4,8,DENSE(no_dump),nan
+4,9,DENSE(no_dump),nan
+4,10,DENSE(no_dump),nan
+4,11,DENSE(no_dump),nan
+4,12,DENSE(no_dump),nan
+4,13,DENSE(no_dump),nan
+4,14,DENSE(no_dump),nan
+4,15,DENSE(no_dump),nan
+4,16,DENSE(no_dump),nan
+4,17,DENSE(no_dump),nan
+4,18,DENSE(no_dump),nan
+4,19,DENSE(no_dump),nan
+4,20,DENSE(no_dump),nan
+4,21,DENSE(no_dump),nan
+4,22,DENSE(no_dump),nan
+4,23,DENSE(no_dump),nan
+5,0,DENSE(no_dump),nan
+5,1,DENSE(no_dump),nan
+5,2,DENSE(no_dump),nan
+5,3,DENSE(no_dump),nan
+5,4,DENSE(no_dump),nan
+5,5,DENSE(no_dump),nan
+5,6,DENSE(no_dump),nan
+5,7,DENSE(no_dump),nan
+5,8,DENSE(no_dump),nan
+5,9,DENSE(no_dump),nan
+5,10,DENSE(no_dump),nan
+5,11,DENSE(no_dump),nan
+5,12,DENSE(no_dump),nan
+5,13,DENSE(no_dump),nan
+5,14,DENSE(no_dump),nan
+5,15,DENSE(no_dump),nan
+5,16,DENSE(no_dump),nan
+5,17,DENSE(no_dump),nan
+5,18,DENSE(no_dump),nan
+5,19,DENSE(no_dump),nan
+5,20,DENSE(no_dump),nan
+5,21,DENSE(no_dump),nan
+5,22,DENSE(no_dump),nan
+5,23,DENSE(no_dump),nan
+6,0,DENSE(no_dump),nan
+6,1,DENSE(no_dump),nan
+6,2,DENSE(no_dump),nan
+6,3,DENSE(no_dump),nan
+6,4,DENSE(no_dump),nan
+6,5,DENSE(no_dump),nan
+6,6,DENSE(no_dump),nan
+6,7,DENSE(no_dump),nan
+6,8,DENSE(no_dump),nan
+6,9,DENSE(no_dump),nan
+6,10,DENSE(no_dump),nan
+6,11,DENSE(no_dump),nan
+6,12,DENSE(no_dump),nan
+6,13,DENSE(no_dump),nan
+6,14,DENSE(no_dump),nan
+6,15,DENSE(no_dump),nan
+6,16,DENSE(no_dump),nan
+6,17,DENSE(no_dump),nan
+6,18,DENSE(no_dump),nan
+6,19,DENSE(no_dump),nan
+6,20,DENSE(no_dump),nan
+6,21,DENSE(no_dump),nan
+6,22,DENSE(no_dump),nan
+6,23,DENSE(no_dump),nan
+7,0,BLOCK_SPARSE@0.050,0.0403
+7,1,A_SHAPE@s64w1024,0.0428
+7,2,BLOCK_SPARSE@0.050,0.0246
+7,3,BLOCK_SPARSE@0.050,0.0260
+7,4,BLOCK_SPARSE@0.050,0.0490
+7,5,A_SHAPE@s64w1024,0.0416
+7,6,A_SHAPE@s64w1024,0.0158
+7,7,DENSE(best_was A_SHAPE@s64w1024),0.07635755091905594
+7,8,A_SHAPE@s64w1024,0.0069
+7,9,BLOCK_SPARSE@0.050,0.0241
+7,10,BLOCK_SPARSE@0.050,0.0335
+7,11,BLOCK_SPARSE@0.050,0.0245
+7,12,BLOCK_SPARSE@0.050,0.0384
+7,13,DENSE(best_was VERT_SLASH@V16S8),0.05680127814412117
+7,14,BLOCK_SPARSE@0.050,0.0293
+7,15,BLOCK_SPARSE@0.050,0.0397
+7,16,BLOCK_SPARSE@0.050,0.0327
+7,17,BLOCK_SPARSE@0.050,0.0340
+7,18,A_SHAPE@s64w1024,0.0455
+7,19,A_SHAPE@s64w1024,0.0289
+7,20,A_SHAPE@s64w1024,0.0457
+7,21,A_SHAPE@s64w1024,0.0222
+7,22,A_SHAPE@s64w1024,0.0271
+7,23,A_SHAPE@s64w1024,0.0437
+8,0,DENSE(no_dump),nan
+8,1,DENSE(no_dump),nan
+8,2,DENSE(no_dump),nan
+8,3,DENSE(no_dump),nan
+8,4,DENSE(no_dump),nan
+8,5,DENSE(no_dump),nan
+8,6,DENSE(no_dump),nan
+8,7,DENSE(no_dump),nan
+8,8,DENSE(no_dump),nan
+8,9,DENSE(no_dump),nan
+8,10,DENSE(no_dump),nan
+8,11,DENSE(no_dump),nan
+8,12,DENSE(no_dump),nan
+8,13,DENSE(no_dump),nan
+8,14,DENSE(no_dump),nan
+8,15,DENSE(no_dump),nan
+8,16,DENSE(no_dump),nan
+8,17,DENSE(no_dump),nan
+8,18,DENSE(no_dump),nan
+8,19,DENSE(no_dump),nan
+8,20,DENSE(no_dump),nan
+8,21,DENSE(no_dump),nan
+8,22,DENSE(no_dump),nan
+8,23,DENSE(no_dump),nan
+9,0,DENSE(no_dump),nan
+9,1,DENSE(no_dump),nan
+9,2,DENSE(no_dump),nan
+9,3,DENSE(no_dump),nan
+9,4,DENSE(no_dump),nan
+9,5,DENSE(no_dump),nan
+9,6,DENSE(no_dump),nan
+9,7,DENSE(no_dump),nan
+9,8,DENSE(no_dump),nan
+9,9,DENSE(no_dump),nan
+9,10,DENSE(no_dump),nan
+9,11,DENSE(no_dump),nan
+9,12,DENSE(no_dump),nan
+9,13,DENSE(no_dump),nan
+9,14,DENSE(no_dump),nan
+9,15,DENSE(no_dump),nan
+9,16,DENSE(no_dump),nan
+9,17,DENSE(no_dump),nan
+9,18,DENSE(no_dump),nan
+9,19,DENSE(no_dump),nan
+9,20,DENSE(no_dump),nan
+9,21,DENSE(no_dump),nan
+9,22,DENSE(no_dump),nan
+9,23,DENSE(no_dump),nan
+10,0,DENSE(no_dump),nan
+10,1,DENSE(no_dump),nan
+10,2,DENSE(no_dump),nan
+10,3,DENSE(no_dump),nan
+10,4,DENSE(no_dump),nan
+10,5,DENSE(no_dump),nan
+10,6,DENSE(no_dump),nan
+10,7,DENSE(no_dump),nan
+10,8,DENSE(no_dump),nan
+10,9,DENSE(no_dump),nan
+10,10,DENSE(no_dump),nan
+10,11,DENSE(no_dump),nan
+10,12,DENSE(no_dump),nan
+10,13,DENSE(no_dump),nan
+10,14,DENSE(no_dump),nan
+10,15,DENSE(no_dump),nan
+10,16,DENSE(no_dump),nan
+10,17,DENSE(no_dump),nan
+10,18,DENSE(no_dump),nan
+10,19,DENSE(no_dump),nan
+10,20,DENSE(no_dump),nan
+10,21,DENSE(no_dump),nan
+10,22,DENSE(no_dump),nan
+10,23,DENSE(no_dump),nan
+11,0,A_SHAPE@s64w1024,0.0407
+11,1,A_SHAPE@s64w1024,0.0450
+11,2,A_SHAPE@s64w1024,0.0435
+11,3,A_SHAPE@s64w1024,0.0288
+11,4,A_SHAPE@s64w1024,0.0381
+11,5,DENSE(best_was A_SHAPE@s64w1024),0.05150438845157623
+11,6,DENSE(best_was VERT_SLASH@V16S8),0.0764428898692131
+11,7,A_SHAPE@s64w1024,0.0262
+11,8,VERT_SLASH@V16S8,0.0487
+11,9,A_SHAPE@s64w1024,0.0174
+11,10,A_SHAPE@s64w1024,0.0241
+11,11,A_SHAPE@s64w1024,0.0375
+11,12,DENSE(best_was A_SHAPE@s64w1024),0.08972715586423874
+11,13,A_SHAPE@s64w1024,0.0497
+11,14,A_SHAPE@s64w1024,0.0157
+11,15,A_SHAPE@s64w1024,0.0229
+11,16,A_SHAPE@s64w1024,0.0180
+11,17,A_SHAPE@s64w1024,0.0170
+11,18,A_SHAPE@s64w1024,0.0186
+11,19,A_SHAPE@s64w1024,0.0202
+11,20,A_SHAPE@s64w1024,0.0165
+11,21,A_SHAPE@s64w1024,0.0194
+11,22,A_SHAPE@s64w1024,0.0160
+11,23,A_SHAPE@s64w1024,0.0203
+12,0,DENSE(no_dump),nan
+12,1,DENSE(no_dump),nan
+12,2,DENSE(no_dump),nan
+12,3,DENSE(no_dump),nan
+12,4,DENSE(no_dump),nan
+12,5,DENSE(no_dump),nan
+12,6,DENSE(no_dump),nan
+12,7,DENSE(no_dump),nan
+12,8,DENSE(no_dump),nan
+12,9,DENSE(no_dump),nan
+12,10,DENSE(no_dump),nan
+12,11,DENSE(no_dump),nan
+12,12,DENSE(no_dump),nan
+12,13,DENSE(no_dump),nan
+12,14,DENSE(no_dump),nan
+12,15,DENSE(no_dump),nan
+12,16,DENSE(no_dump),nan
+12,17,DENSE(no_dump),nan
+12,18,DENSE(no_dump),nan
+12,19,DENSE(no_dump),nan
+12,20,DENSE(no_dump),nan
+12,21,DENSE(no_dump),nan
+12,22,DENSE(no_dump),nan
+12,23,DENSE(no_dump),nan
+13,0,DENSE(no_dump),nan
+13,1,DENSE(no_dump),nan
+13,2,DENSE(no_dump),nan
+13,3,DENSE(no_dump),nan
+13,4,DENSE(no_dump),nan
+13,5,DENSE(no_dump),nan
+13,6,DENSE(no_dump),nan
+13,7,DENSE(no_dump),nan
+13,8,DENSE(no_dump),nan
+13,9,DENSE(no_dump),nan
+13,10,DENSE(no_dump),nan
+13,11,DENSE(no_dump),nan
+13,12,DENSE(no_dump),nan
+13,13,DENSE(no_dump),nan
+13,14,DENSE(no_dump),nan
+13,15,DENSE(no_dump),nan
+13,16,DENSE(no_dump),nan
+13,17,DENSE(no_dump),nan
+13,18,DENSE(no_dump),nan
+13,19,DENSE(no_dump),nan
+13,20,DENSE(no_dump),nan
+13,21,DENSE(no_dump),nan
+13,22,DENSE(no_dump),nan
+13,23,DENSE(no_dump),nan
+14,0,DENSE(no_dump),nan
+14,1,DENSE(no_dump),nan
+14,2,DENSE(no_dump),nan
+14,3,DENSE(no_dump),nan
+14,4,DENSE(no_dump),nan
+14,5,DENSE(no_dump),nan
+14,6,DENSE(no_dump),nan
+14,7,DENSE(no_dump),nan
+14,8,DENSE(no_dump),nan
+14,9,DENSE(no_dump),nan
+14,10,DENSE(no_dump),nan
+14,11,DENSE(no_dump),nan
+14,12,DENSE(no_dump),nan
+14,13,DENSE(no_dump),nan
+14,14,DENSE(no_dump),nan
+14,15,DENSE(no_dump),nan
+14,16,DENSE(no_dump),nan
+14,17,DENSE(no_dump),nan
+14,18,DENSE(no_dump),nan
+14,19,DENSE(no_dump),nan
+14,20,DENSE(no_dump),nan
+14,21,DENSE(no_dump),nan
+14,22,DENSE(no_dump),nan
+14,23,DENSE(no_dump),nan
+15,0,DENSE(best_was VERT_SLASH@V16S8),0.06611598283052444
+15,1,A_SHAPE@s64w1024,0.0372
+15,2,A_SHAPE@s64w1024,0.0387
+15,3,A_SHAPE@s64w1024,0.0292
+15,4,A_SHAPE@s64w1024,0.0412
+15,5,A_SHAPE@s64w1024,0.0358
+15,6,A_SHAPE@s64w1024,0.0276
+15,7,A_SHAPE@s64w1024,0.0449
+15,8,A_SHAPE@s64w1024,0.0321
+15,9,A_SHAPE@s64w1024,0.0205
+15,10,A_SHAPE@s64w1024,0.0345
+15,11,A_SHAPE@s64w1024,0.0472
+15,12,A_SHAPE@s64w1024,0.0362
+15,13,A_SHAPE@s64w1024,0.0297
+15,14,A_SHAPE@s64w1024,0.0314
+15,15,A_SHAPE@s64w1024,0.0324
+15,16,A_SHAPE@s64w1024,0.0492
+15,17,A_SHAPE@s64w1024,0.0431
+15,18,A_SHAPE@s64w1024,0.0262
+15,19,A_SHAPE@s64w1024,0.0171
+15,20,A_SHAPE@s64w1024,0.0261
+15,21,A_SHAPE@s64w1024,0.0130
+15,22,A_SHAPE@s64w1024,0.0181
+15,23,A_SHAPE@s64w1024,0.0224
+16,0,DENSE(no_dump),nan
+16,1,DENSE(no_dump),nan
+16,2,DENSE(no_dump),nan
+16,3,DENSE(no_dump),nan
+16,4,DENSE(no_dump),nan
+16,5,DENSE(no_dump),nan
+16,6,DENSE(no_dump),nan
+16,7,DENSE(no_dump),nan
+16,8,DENSE(no_dump),nan
+16,9,DENSE(no_dump),nan
+16,10,DENSE(no_dump),nan
+16,11,DENSE(no_dump),nan
+16,12,DENSE(no_dump),nan
+16,13,DENSE(no_dump),nan
+16,14,DENSE(no_dump),nan
+16,15,DENSE(no_dump),nan
+16,16,DENSE(no_dump),nan
+16,17,DENSE(no_dump),nan
+16,18,DENSE(no_dump),nan
+16,19,DENSE(no_dump),nan
+16,20,DENSE(no_dump),nan
+16,21,DENSE(no_dump),nan
+16,22,DENSE(no_dump),nan
+16,23,DENSE(no_dump),nan
+17,0,DENSE(no_dump),nan
+17,1,DENSE(no_dump),nan
+17,2,DENSE(no_dump),nan
+17,3,DENSE(no_dump),nan
+17,4,DENSE(no_dump),nan
+17,5,DENSE(no_dump),nan
+17,6,DENSE(no_dump),nan
+17,7,DENSE(no_dump),nan
+17,8,DENSE(no_dump),nan
+17,9,DENSE(no_dump),nan
+17,10,DENSE(no_dump),nan
+17,11,DENSE(no_dump),nan
+17,12,DENSE(no_dump),nan
+17,13,DENSE(no_dump),nan
+17,14,DENSE(no_dump),nan
+17,15,DENSE(no_dump),nan
+17,16,DENSE(no_dump),nan
+17,17,DENSE(no_dump),nan
+17,18,DENSE(no_dump),nan
+17,19,DENSE(no_dump),nan
+17,20,DENSE(no_dump),nan
+17,21,DENSE(no_dump),nan
+17,22,DENSE(no_dump),nan
+17,23,DENSE(no_dump),nan
+18,0,DENSE(no_dump),nan
+18,1,DENSE(no_dump),nan
+18,2,DENSE(no_dump),nan
+18,3,DENSE(no_dump),nan
+18,4,DENSE(no_dump),nan
+18,5,DENSE(no_dump),nan
+18,6,DENSE(no_dump),nan
+18,7,DENSE(no_dump),nan
+18,8,DENSE(no_dump),nan
+18,9,DENSE(no_dump),nan
+18,10,DENSE(no_dump),nan
+18,11,DENSE(no_dump),nan
+18,12,DENSE(no_dump),nan
+18,13,DENSE(no_dump),nan
+18,14,DENSE(no_dump),nan
+18,15,DENSE(no_dump),nan
+18,16,DENSE(no_dump),nan
+18,17,DENSE(no_dump),nan
+18,18,DENSE(no_dump),nan
+18,19,DENSE(no_dump),nan
+18,20,DENSE(no_dump),nan
+18,21,DENSE(no_dump),nan
+18,22,DENSE(no_dump),nan
+18,23,DENSE(no_dump),nan
+19,0,DENSE(best_was BLOCK_SPARSE@0.200),0.12505339086055756
+19,1,DENSE(best_was BLOCK_SPARSE@0.200),0.13246990740299225
+19,2,DENSE(best_was BLOCK_SPARSE@0.200),0.1125955879688263
+19,3,DENSE(best_was BLOCK_SPARSE@0.200),0.12457229942083359
+19,4,DENSE(best_was BLOCK_SPARSE@0.200),0.11235687136650085
+19,5,DENSE(best_was BLOCK_SPARSE@0.200),0.13138094544410706
+19,6,DENSE(best_was A_SHAPE@s64w1024),0.08606378734111786
+19,7,DENSE(best_was A_SHAPE@s64w1024),0.07644558697938919
+19,8,DENSE(best_was A_SHAPE@s64w1024),0.10947717726230621
+19,9,DENSE(best_was BLOCK_SPARSE@0.200),0.07659198343753815
+19,10,DENSE(best_was BLOCK_SPARSE@0.200),0.06295343488454819
+19,11,DENSE(best_was BLOCK_SPARSE@0.200),0.08690132200717926
+19,12,DENSE(best_was A_SHAPE@s64w1024),0.11348164826631546
+19,13,DENSE(best_was A_SHAPE@s64w1024),0.13623002171516418
+19,14,DENSE(best_was A_SHAPE@s64w1024),0.10249494761228561
+19,15,DENSE(best_was BLOCK_SPARSE@0.200),0.1435716599225998
+19,16,DENSE(best_was BLOCK_SPARSE@0.200),0.1292766034603119
+19,17,DENSE(best_was BLOCK_SPARSE@0.200),0.13663412630558014
+19,18,DENSE(best_was BLOCK_SPARSE@0.200),0.07000242918729782
+19,19,DENSE(best_was BLOCK_SPARSE@0.200),0.07950437813997269
+19,20,DENSE(best_was BLOCK_SPARSE@0.200),0.06782551854848862
+19,21,DENSE(best_was A_SHAPE@s64w1024),0.0930902287364006
+19,22,BLOCK_SPARSE@0.200,0.0478
+19,23,DENSE(best_was BLOCK_SPARSE@0.200),0.0575190968811512
+20,0,DENSE(no_dump),nan
+20,1,DENSE(no_dump),nan
+20,2,DENSE(no_dump),nan
+20,3,DENSE(no_dump),nan
+20,4,DENSE(no_dump),nan
+20,5,DENSE(no_dump),nan
+20,6,DENSE(no_dump),nan
+20,7,DENSE(no_dump),nan
+20,8,DENSE(no_dump),nan
+20,9,DENSE(no_dump),nan
+20,10,DENSE(no_dump),nan
+20,11,DENSE(no_dump),nan
+20,12,DENSE(no_dump),nan
+20,13,DENSE(no_dump),nan
+20,14,DENSE(no_dump),nan
+20,15,DENSE(no_dump),nan
+20,16,DENSE(no_dump),nan
+20,17,DENSE(no_dump),nan
+20,18,DENSE(no_dump),nan
+20,19,DENSE(no_dump),nan
+20,20,DENSE(no_dump),nan
+20,21,DENSE(no_dump),nan
+20,22,DENSE(no_dump),nan
+20,23,DENSE(no_dump),nan
+21,0,DENSE(no_dump),nan
+21,1,DENSE(no_dump),nan
+21,2,DENSE(no_dump),nan
+21,3,DENSE(no_dump),nan
+21,4,DENSE(no_dump),nan
+21,5,DENSE(no_dump),nan
+21,6,DENSE(no_dump),nan
+21,7,DENSE(no_dump),nan
+21,8,DENSE(no_dump),nan
+21,9,DENSE(no_dump),nan
+21,10,DENSE(no_dump),nan
+21,11,DENSE(no_dump),nan
+21,12,DENSE(no_dump),nan
+21,13,DENSE(no_dump),nan
+21,14,DENSE(no_dump),nan
+21,15,DENSE(no_dump),nan
+21,16,DENSE(no_dump),nan
+21,17,DENSE(no_dump),nan
+21,18,DENSE(no_dump),nan
+21,19,DENSE(no_dump),nan
+21,20,DENSE(no_dump),nan
+21,21,DENSE(no_dump),nan
+21,22,DENSE(no_dump),nan
+21,23,DENSE(no_dump),nan
+22,0,DENSE(no_dump),nan
+22,1,DENSE(no_dump),nan
+22,2,DENSE(no_dump),nan
+22,3,DENSE(no_dump),nan
+22,4,DENSE(no_dump),nan
+22,5,DENSE(no_dump),nan
+22,6,DENSE(no_dump),nan
+22,7,DENSE(no_dump),nan
+22,8,DENSE(no_dump),nan
+22,9,DENSE(no_dump),nan
+22,10,DENSE(no_dump),nan
+22,11,DENSE(no_dump),nan
+22,12,DENSE(no_dump),nan
+22,13,DENSE(no_dump),nan
+22,14,DENSE(no_dump),nan
+22,15,DENSE(no_dump),nan
+22,16,DENSE(no_dump),nan
+22,17,DENSE(no_dump),nan
+22,18,DENSE(no_dump),nan
+22,19,DENSE(no_dump),nan
+22,20,DENSE(no_dump),nan
+22,21,DENSE(no_dump),nan
+22,22,DENSE(no_dump),nan
+22,23,DENSE(no_dump),nan
+23,0,DENSE(best_was BLOCK_SPARSE@0.200),0.16525928676128387
+23,1,DENSE(best_was BLOCK_SPARSE@0.200),0.13635258376598358
+23,2,DENSE(best_was BLOCK_SPARSE@0.200),0.1473149210214615
+23,3,DENSE(best_was BLOCK_SPARSE@0.200),0.1694537252187729
+23,4,DENSE(best_was BLOCK_SPARSE@0.200),0.16321472823619843
+23,5,DENSE(best_was BLOCK_SPARSE@0.200),0.13148517906665802
+23,6,DENSE(best_was BLOCK_SPARSE@0.200),0.11920727789402008
+23,7,DENSE(best_was BLOCK_SPARSE@0.200),0.16414189338684082
+23,8,DENSE(best_was BLOCK_SPARSE@0.200),0.1620398461818695
+23,9,DENSE(best_was BLOCK_SPARSE@0.200),0.16178320348262787
+23,10,DENSE(best_was BLOCK_SPARSE@0.200),0.16457374393939972
+23,11,DENSE(best_was BLOCK_SPARSE@0.200),0.16762509942054749
+23,12,DENSE(best_was BLOCK_SPARSE@0.200),0.11975117772817612
+23,13,DENSE(best_was BLOCK_SPARSE@0.200),0.12306222319602966
+23,14,DENSE(best_was BLOCK_SPARSE@0.200),0.13556034862995148
+23,15,DENSE(best_was BLOCK_SPARSE@0.200),0.12641024589538574
+23,16,DENSE(best_was BLOCK_SPARSE@0.200),0.10828902572393417
+23,17,DENSE(best_was BLOCK_SPARSE@0.200),0.1469828337430954
+23,18,DENSE(best_was BLOCK_SPARSE@0.200),0.1105780228972435
+23,19,DENSE(best_was A_SHAPE@s64w1024),0.11108530312776566
+23,20,DENSE(best_was A_SHAPE@s64w1024),0.14500698447227478
+23,21,DENSE(best_was BLOCK_SPARSE@0.200),0.10099373012781143
+23,22,DENSE(best_was A_SHAPE@s64w1024),0.13148513436317444
+23,23,DENSE(best_was BLOCK_SPARSE@0.200),0.14251306653022766
+24,0,DENSE(no_dump),nan
+24,1,DENSE(no_dump),nan
+24,2,DENSE(no_dump),nan
+24,3,DENSE(no_dump),nan
+24,4,DENSE(no_dump),nan
+24,5,DENSE(no_dump),nan
+24,6,DENSE(no_dump),nan
+24,7,DENSE(no_dump),nan
+24,8,DENSE(no_dump),nan
+24,9,DENSE(no_dump),nan
+24,10,DENSE(no_dump),nan
+24,11,DENSE(no_dump),nan
+24,12,DENSE(no_dump),nan
+24,13,DENSE(no_dump),nan
+24,14,DENSE(no_dump),nan
+24,15,DENSE(no_dump),nan
+24,16,DENSE(no_dump),nan
+24,17,DENSE(no_dump),nan
+24,18,DENSE(no_dump),nan
+24,19,DENSE(no_dump),nan
+24,20,DENSE(no_dump),nan
+24,21,DENSE(no_dump),nan
+24,22,DENSE(no_dump),nan
+24,23,DENSE(no_dump),nan
+25,0,DENSE(no_dump),nan
+25,1,DENSE(no_dump),nan
+25,2,DENSE(no_dump),nan
+25,3,DENSE(no_dump),nan
+25,4,DENSE(no_dump),nan
+25,5,DENSE(no_dump),nan
+25,6,DENSE(no_dump),nan
+25,7,DENSE(no_dump),nan
+25,8,DENSE(no_dump),nan
+25,9,DENSE(no_dump),nan
+25,10,DENSE(no_dump),nan
+25,11,DENSE(no_dump),nan
+25,12,DENSE(no_dump),nan
+25,13,DENSE(no_dump),nan
+25,14,DENSE(no_dump),nan
+25,15,DENSE(no_dump),nan
+25,16,DENSE(no_dump),nan
+25,17,DENSE(no_dump),nan
+25,18,DENSE(no_dump),nan
+25,19,DENSE(no_dump),nan
+25,20,DENSE(no_dump),nan
+25,21,DENSE(no_dump),nan
+25,22,DENSE(no_dump),nan
+25,23,DENSE(no_dump),nan
+26,0,DENSE(no_dump),nan
+26,1,DENSE(no_dump),nan
+26,2,DENSE(no_dump),nan
+26,3,DENSE(no_dump),nan
+26,4,DENSE(no_dump),nan
+26,5,DENSE(no_dump),nan
+26,6,DENSE(no_dump),nan
+26,7,DENSE(no_dump),nan
+26,8,DENSE(no_dump),nan
+26,9,DENSE(no_dump),nan
+26,10,DENSE(no_dump),nan
+26,11,DENSE(no_dump),nan
+26,12,DENSE(no_dump),nan
+26,13,DENSE(no_dump),nan
+26,14,DENSE(no_dump),nan
+26,15,DENSE(no_dump),nan
+26,16,DENSE(no_dump),nan
+26,17,DENSE(no_dump),nan
+26,18,DENSE(no_dump),nan
+26,19,DENSE(no_dump),nan
+26,20,DENSE(no_dump),nan
+26,21,DENSE(no_dump),nan
+26,22,DENSE(no_dump),nan
+26,23,DENSE(no_dump),nan
+27,0,DENSE(best_was BLOCK_SPARSE@0.200),0.16752192378044128
+27,1,DENSE(best_was BLOCK_SPARSE@0.200),0.2134721875190735
+27,2,DENSE(best_was BLOCK_SPARSE@0.200),0.19850431382656097
+27,3,DENSE(best_was BLOCK_SPARSE@0.200),0.21965213119983673
+27,4,DENSE(best_was BLOCK_SPARSE@0.200),0.2215065360069275
+27,5,DENSE(best_was BLOCK_SPARSE@0.200),0.20463594794273376
+27,6,DENSE(best_was BLOCK_SPARSE@0.200),0.2025352269411087
+27,7,DENSE(best_was BLOCK_SPARSE@0.200),0.23189975321292877
+27,8,DENSE(best_was BLOCK_SPARSE@0.200),0.21150118112564087
+27,9,DENSE(best_was BLOCK_SPARSE@0.200),0.24104560911655426
+27,10,DENSE(best_was BLOCK_SPARSE@0.200),0.2595773935317993
+27,11,DENSE(best_was BLOCK_SPARSE@0.200),0.23543362319469452
+27,12,DENSE(best_was BLOCK_SPARSE@0.200),0.19573724269866943
+27,13,DENSE(best_was BLOCK_SPARSE@0.200),0.15082094073295593
+27,14,DENSE(best_was BLOCK_SPARSE@0.200),0.15452110767364502
+27,15,DENSE(best_was BLOCK_SPARSE@0.200),0.14939531683921814
+27,16,DENSE(best_was BLOCK_SPARSE@0.200),0.16691787540912628
+27,17,DENSE(best_was BLOCK_SPARSE@0.200),0.17239734530448914
+27,18,DENSE(best_was BLOCK_SPARSE@0.200),0.201625794172287
+27,19,DENSE(best_was BLOCK_SPARSE@0.200),0.2551364004611969
+27,20,DENSE(best_was BLOCK_SPARSE@0.200),0.22134026885032654
+27,21,DENSE(best_was BLOCK_SPARSE@0.200),0.22617079317569733
+27,22,DENSE(best_was BLOCK_SPARSE@0.200),0.2517235279083252
+27,23,DENSE(best_was BLOCK_SPARSE@0.200),0.2166883647441864
+28,0,DENSE(no_dump),nan
+28,1,DENSE(no_dump),nan
+28,2,DENSE(no_dump),nan
+28,3,DENSE(no_dump),nan
+28,4,DENSE(no_dump),nan
+28,5,DENSE(no_dump),nan
+28,6,DENSE(no_dump),nan
+28,7,DENSE(no_dump),nan
+28,8,DENSE(no_dump),nan
+28,9,DENSE(no_dump),nan
+28,10,DENSE(no_dump),nan
+28,11,DENSE(no_dump),nan
+28,12,DENSE(no_dump),nan
+28,13,DENSE(no_dump),nan
+28,14,DENSE(no_dump),nan
+28,15,DENSE(no_dump),nan
+28,16,DENSE(no_dump),nan
+28,17,DENSE(no_dump),nan
+28,18,DENSE(no_dump),nan
+28,19,DENSE(no_dump),nan
+28,20,DENSE(no_dump),nan
+28,21,DENSE(no_dump),nan
+28,22,DENSE(no_dump),nan
+28,23,DENSE(no_dump),nan
+29,0,DENSE(no_dump),nan
+29,1,DENSE(no_dump),nan
+29,2,DENSE(no_dump),nan
+29,3,DENSE(no_dump),nan
+29,4,DENSE(no_dump),nan
+29,5,DENSE(no_dump),nan
+29,6,DENSE(no_dump),nan
+29,7,DENSE(no_dump),nan
+29,8,DENSE(no_dump),nan
+29,9,DENSE(no_dump),nan
+29,10,DENSE(no_dump),nan
+29,11,DENSE(no_dump),nan
+29,12,DENSE(no_dump),nan
+29,13,DENSE(no_dump),nan
+29,14,DENSE(no_dump),nan
+29,15,DENSE(no_dump),nan
+29,16,DENSE(no_dump),nan
+29,17,DENSE(no_dump),nan
+29,18,DENSE(no_dump),nan
+29,19,DENSE(no_dump),nan
+29,20,DENSE(no_dump),nan
+29,21,DENSE(no_dump),nan
+29,22,DENSE(no_dump),nan
+29,23,DENSE(no_dump),nan
+30,0,DENSE(no_dump),nan
+30,1,DENSE(no_dump),nan
+30,2,DENSE(no_dump),nan
+30,3,DENSE(no_dump),nan
+30,4,DENSE(no_dump),nan
+30,5,DENSE(no_dump),nan
+30,6,DENSE(no_dump),nan
+30,7,DENSE(no_dump),nan
+30,8,DENSE(no_dump),nan
+30,9,DENSE(no_dump),nan
+30,10,DENSE(no_dump),nan
+30,11,DENSE(no_dump),nan
+30,12,DENSE(no_dump),nan
+30,13,DENSE(no_dump),nan
+30,14,DENSE(no_dump),nan
+30,15,DENSE(no_dump),nan
+30,16,DENSE(no_dump),nan
+30,17,DENSE(no_dump),nan
+30,18,DENSE(no_dump),nan
+30,19,DENSE(no_dump),nan
+30,20,DENSE(no_dump),nan
+30,21,DENSE(no_dump),nan
+30,22,DENSE(no_dump),nan
+30,23,DENSE(no_dump),nan
+31,0,DENSE(best_was BLOCK_SPARSE@0.200),0.310631662607193
+31,1,DENSE(best_was BLOCK_SPARSE@0.200),0.3634417951107025
+31,2,DENSE(best_was BLOCK_SPARSE@0.200),0.2798228859901428
+31,3,DENSE(best_was BLOCK_SPARSE@0.200),0.3369165062904358
+31,4,DENSE(best_was BLOCK_SPARSE@0.200),0.33890947699546814
+31,5,DENSE(best_was BLOCK_SPARSE@0.200),0.3079163134098053
+31,6,DENSE(best_was BLOCK_SPARSE@0.200),0.37256792187690735
+31,7,DENSE(best_was BLOCK_SPARSE@0.200),0.2810313403606415
+31,8,DENSE(best_was BLOCK_SPARSE@0.200),0.3158523440361023
+31,9,DENSE(best_was BLOCK_SPARSE@0.200),0.30692824721336365
+31,10,DENSE(best_was BLOCK_SPARSE@0.200),0.35507524013519287
+31,11,DENSE(best_was BLOCK_SPARSE@0.200),0.3071911931037903
+31,12,DENSE(best_was BLOCK_SPARSE@0.200),0.2797013521194458
+31,13,DENSE(best_was BLOCK_SPARSE@0.200),0.2922276258468628
+31,14,DENSE(best_was BLOCK_SPARSE@0.200),0.35432085394859314
+31,15,DENSE(best_was BLOCK_SPARSE@0.200),0.3421609103679657
+31,16,DENSE(best_was BLOCK_SPARSE@0.200),0.3718946576118469
+31,17,DENSE(best_was BLOCK_SPARSE@0.200),0.3402881622314453
+31,18,DENSE(best_was BLOCK_SPARSE@0.200),0.22157388925552368
+31,19,DENSE(best_was BLOCK_SPARSE@0.200),0.29060858488082886
+31,20,DENSE(best_was BLOCK_SPARSE@0.200),0.26202988624572754
+31,21,DENSE(best_was BLOCK_SPARSE@0.200),0.2655239403247833
+31,22,DENSE(best_was A_SHAPE@s64w1024),0.2253226935863495
+31,23,DENSE(best_was BLOCK_SPARSE@0.200),0.2702573835849762
+32,0,DENSE(no_dump),nan
+32,1,DENSE(no_dump),nan
+32,2,DENSE(no_dump),nan
+32,3,DENSE(no_dump),nan
+32,4,DENSE(no_dump),nan
+32,5,DENSE(no_dump),nan
+32,6,DENSE(no_dump),nan
+32,7,DENSE(no_dump),nan
+32,8,DENSE(no_dump),nan
+32,9,DENSE(no_dump),nan
+32,10,DENSE(no_dump),nan
+32,11,DENSE(no_dump),nan
+32,12,DENSE(no_dump),nan
+32,13,DENSE(no_dump),nan
+32,14,DENSE(no_dump),nan
+32,15,DENSE(no_dump),nan
+32,16,DENSE(no_dump),nan
+32,17,DENSE(no_dump),nan
+32,18,DENSE(no_dump),nan
+32,19,DENSE(no_dump),nan
+32,20,DENSE(no_dump),nan
+32,21,DENSE(no_dump),nan
+32,22,DENSE(no_dump),nan
+32,23,DENSE(no_dump),nan
+33,0,DENSE(no_dump),nan
+33,1,DENSE(no_dump),nan
+33,2,DENSE(no_dump),nan
+33,3,DENSE(no_dump),nan
+33,4,DENSE(no_dump),nan
+33,5,DENSE(no_dump),nan
+33,6,DENSE(no_dump),nan
+33,7,DENSE(no_dump),nan
+33,8,DENSE(no_dump),nan
+33,9,DENSE(no_dump),nan
+33,10,DENSE(no_dump),nan
+33,11,DENSE(no_dump),nan
+33,12,DENSE(no_dump),nan
+33,13,DENSE(no_dump),nan
+33,14,DENSE(no_dump),nan
+33,15,DENSE(no_dump),nan
+33,16,DENSE(no_dump),nan
+33,17,DENSE(no_dump),nan
+33,18,DENSE(no_dump),nan
+33,19,DENSE(no_dump),nan
+33,20,DENSE(no_dump),nan
+33,21,DENSE(no_dump),nan
+33,22,DENSE(no_dump),nan
+33,23,DENSE(no_dump),nan
+34,0,DENSE(no_dump),nan
+34,1,DENSE(no_dump),nan
+34,2,DENSE(no_dump),nan
+34,3,DENSE(no_dump),nan
+34,4,DENSE(no_dump),nan
+34,5,DENSE(no_dump),nan
+34,6,DENSE(no_dump),nan
+34,7,DENSE(no_dump),nan
+34,8,DENSE(no_dump),nan
+34,9,DENSE(no_dump),nan
+34,10,DENSE(no_dump),nan
+34,11,DENSE(no_dump),nan
+34,12,DENSE(no_dump),nan
+34,13,DENSE(no_dump),nan
+34,14,DENSE(no_dump),nan
+34,15,DENSE(no_dump),nan
+34,16,DENSE(no_dump),nan
+34,17,DENSE(no_dump),nan
+34,18,DENSE(no_dump),nan
+34,19,DENSE(no_dump),nan
+34,20,DENSE(no_dump),nan
+34,21,DENSE(no_dump),nan
+34,22,DENSE(no_dump),nan
+34,23,DENSE(no_dump),nan
+35,0,DENSE(best_was BLOCK_SPARSE@0.200),0.4461454749107361
+35,1,DENSE(best_was BLOCK_SPARSE@0.200),0.4225882589817047
+35,2,DENSE(best_was BLOCK_SPARSE@0.200),0.4227340817451477
+35,3,DENSE(best_was BLOCK_SPARSE@0.200),0.4255446195602417
+35,4,DENSE(best_was BLOCK_SPARSE@0.200),0.44454047083854675
+35,5,DENSE(best_was BLOCK_SPARSE@0.200),0.43807584047317505
+35,6,DENSE(best_was BLOCK_SPARSE@0.200),0.4256080985069275
+35,7,DENSE(best_was BLOCK_SPARSE@0.200),0.3761100172996521
+35,8,DENSE(best_was BLOCK_SPARSE@0.200),0.42952319979667664
+35,9,DENSE(best_was BLOCK_SPARSE@0.200),0.3894253671169281
+35,10,DENSE(best_was BLOCK_SPARSE@0.200),0.42438191175460815
+35,11,DENSE(best_was BLOCK_SPARSE@0.200),0.46323323249816895
+35,12,DENSE(best_was BLOCK_SPARSE@0.200),0.3966796100139618
+35,13,DENSE(best_was BLOCK_SPARSE@0.200),0.5026290416717529
+35,14,DENSE(best_was BLOCK_SPARSE@0.200),0.40598148107528687
+35,15,DENSE(best_was BLOCK_SPARSE@0.200),0.480781227350235
+35,16,DENSE(best_was BLOCK_SPARSE@0.200),0.4598129689693451
+35,17,DENSE(best_was BLOCK_SPARSE@0.200),0.45081067085266113
+35,18,DENSE(best_was BLOCK_SPARSE@0.200),0.38089293241500854
+35,19,DENSE(best_was BLOCK_SPARSE@0.200),0.3118588328361511
+35,20,DENSE(best_was BLOCK_SPARSE@0.200),0.36589983105659485
+35,21,DENSE(best_was BLOCK_SPARSE@0.200),0.34145310521125793
+35,22,DENSE(best_was BLOCK_SPARSE@0.200),0.38750600814819336
+35,23,DENSE(best_was BLOCK_SPARSE@0.200),0.3501512408256531
+36,0,DENSE(no_dump),nan
+36,1,DENSE(no_dump),nan
+36,2,DENSE(no_dump),nan
+36,3,DENSE(no_dump),nan
+36,4,DENSE(no_dump),nan
+36,5,DENSE(no_dump),nan
+36,6,DENSE(no_dump),nan
+36,7,DENSE(no_dump),nan
+36,8,DENSE(no_dump),nan
+36,9,DENSE(no_dump),nan
+36,10,DENSE(no_dump),nan
+36,11,DENSE(no_dump),nan
+36,12,DENSE(no_dump),nan
+36,13,DENSE(no_dump),nan
+36,14,DENSE(no_dump),nan
+36,15,DENSE(no_dump),nan
+36,16,DENSE(no_dump),nan
+36,17,DENSE(no_dump),nan
+36,18,DENSE(no_dump),nan
+36,19,DENSE(no_dump),nan
+36,20,DENSE(no_dump),nan
+36,21,DENSE(no_dump),nan
+36,22,DENSE(no_dump),nan
+36,23,DENSE(no_dump),nan
+37,0,DENSE(no_dump),nan
+37,1,DENSE(no_dump),nan
+37,2,DENSE(no_dump),nan
+37,3,DENSE(no_dump),nan
+37,4,DENSE(no_dump),nan
+37,5,DENSE(no_dump),nan
+37,6,DENSE(no_dump),nan
+37,7,DENSE(no_dump),nan
+37,8,DENSE(no_dump),nan
+37,9,DENSE(no_dump),nan
+37,10,DENSE(no_dump),nan
+37,11,DENSE(no_dump),nan
+37,12,DENSE(no_dump),nan
+37,13,DENSE(no_dump),nan
+37,14,DENSE(no_dump),nan
+37,15,DENSE(no_dump),nan
+37,16,DENSE(no_dump),nan
+37,17,DENSE(no_dump),nan
+37,18,DENSE(no_dump),nan
+37,19,DENSE(no_dump),nan
+37,20,DENSE(no_dump),nan
+37,21,DENSE(no_dump),nan
+37,22,DENSE(no_dump),nan
+37,23,DENSE(no_dump),nan
+38,0,DENSE(no_dump),nan
+38,1,DENSE(no_dump),nan
+38,2,DENSE(no_dump),nan
+38,3,DENSE(no_dump),nan
+38,4,DENSE(no_dump),nan
+38,5,DENSE(no_dump),nan
+38,6,DENSE(no_dump),nan
+38,7,DENSE(no_dump),nan
+38,8,DENSE(no_dump),nan
+38,9,DENSE(no_dump),nan
+38,10,DENSE(no_dump),nan
+38,11,DENSE(no_dump),nan
+38,12,DENSE(no_dump),nan
+38,13,DENSE(no_dump),nan
+38,14,DENSE(no_dump),nan
+38,15,DENSE(no_dump),nan
+38,16,DENSE(no_dump),nan
+38,17,DENSE(no_dump),nan
+38,18,DENSE(no_dump),nan
+38,19,DENSE(no_dump),nan
+38,20,DENSE(no_dump),nan
+38,21,DENSE(no_dump),nan
+38,22,DENSE(no_dump),nan
+38,23,DENSE(no_dump),nan
+39,0,DENSE(best_was BLOCK_SPARSE@0.200),0.43418338894844055
+39,1,DENSE(best_was BLOCK_SPARSE@0.200),0.5112389922142029
+39,2,DENSE(best_was BLOCK_SPARSE@0.200),0.4927085041999817
+39,3,DENSE(best_was BLOCK_SPARSE@0.200),0.478517085313797
+39,4,DENSE(best_was BLOCK_SPARSE@0.200),0.49441778659820557
+39,5,DENSE(best_was BLOCK_SPARSE@0.200),0.42531895637512207
+39,6,DENSE(best_was BLOCK_SPARSE@0.200),0.46448010206222534
+39,7,DENSE(best_was BLOCK_SPARSE@0.200),0.5215016603469849
+39,8,DENSE(best_was BLOCK_SPARSE@0.200),0.5038038492202759
+39,9,DENSE(best_was BLOCK_SPARSE@0.200),0.47901925444602966
+39,10,DENSE(best_was BLOCK_SPARSE@0.200),0.4638313055038452
+39,11,DENSE(best_was BLOCK_SPARSE@0.200),0.4908776581287384
+39,12,DENSE(best_was BLOCK_SPARSE@0.200),0.3318679928779602
+39,13,DENSE(best_was BLOCK_SPARSE@0.200),0.3449550271034241
+39,14,DENSE(best_was BLOCK_SPARSE@0.200),0.32434070110321045
+39,15,DENSE(best_was BLOCK_SPARSE@0.200),0.38142821192741394
+39,16,DENSE(best_was BLOCK_SPARSE@0.200),0.3077945411205292
+39,17,DENSE(best_was BLOCK_SPARSE@0.200),0.36316996812820435
+39,18,DENSE(best_was BLOCK_SPARSE@0.200),0.3175468444824219
+39,19,DENSE(best_was BLOCK_SPARSE@0.200),0.4273892641067505
+39,20,DENSE(best_was BLOCK_SPARSE@0.200),0.4576461613178253
+39,21,DENSE(best_was BLOCK_SPARSE@0.200),0.40967437624931335
+39,22,DENSE(best_was BLOCK_SPARSE@0.200),0.3902059495449066
+39,23,DENSE(best_was BLOCK_SPARSE@0.200),0.4353688061237335
+40,0,DENSE(no_dump),nan
+40,1,DENSE(no_dump),nan
+40,2,DENSE(no_dump),nan
+40,3,DENSE(no_dump),nan
+40,4,DENSE(no_dump),nan
+40,5,DENSE(no_dump),nan
+40,6,DENSE(no_dump),nan
+40,7,DENSE(no_dump),nan
+40,8,DENSE(no_dump),nan
+40,9,DENSE(no_dump),nan
+40,10,DENSE(no_dump),nan
+40,11,DENSE(no_dump),nan
+40,12,DENSE(no_dump),nan
+40,13,DENSE(no_dump),nan
+40,14,DENSE(no_dump),nan
+40,15,DENSE(no_dump),nan
+40,16,DENSE(no_dump),nan
+40,17,DENSE(no_dump),nan
+40,18,DENSE(no_dump),nan
+40,19,DENSE(no_dump),nan
+40,20,DENSE(no_dump),nan
+40,21,DENSE(no_dump),nan
+40,22,DENSE(no_dump),nan
+40,23,DENSE(no_dump),nan
+41,0,DENSE(no_dump),nan
+41,1,DENSE(no_dump),nan
+41,2,DENSE(no_dump),nan
+41,3,DENSE(no_dump),nan
+41,4,DENSE(no_dump),nan
+41,5,DENSE(no_dump),nan
+41,6,DENSE(no_dump),nan
+41,7,DENSE(no_dump),nan
+41,8,DENSE(no_dump),nan
+41,9,DENSE(no_dump),nan
+41,10,DENSE(no_dump),nan
+41,11,DENSE(no_dump),nan
+41,12,DENSE(no_dump),nan
+41,13,DENSE(no_dump),nan
+41,14,DENSE(no_dump),nan
+41,15,DENSE(no_dump),nan
+41,16,DENSE(no_dump),nan
+41,17,DENSE(no_dump),nan
+41,18,DENSE(no_dump),nan
+41,19,DENSE(no_dump),nan
+41,20,DENSE(no_dump),nan
+41,21,DENSE(no_dump),nan
+41,22,DENSE(no_dump),nan
+41,23,DENSE(no_dump),nan
+42,0,DENSE(no_dump),nan
+42,1,DENSE(no_dump),nan
+42,2,DENSE(no_dump),nan
+42,3,DENSE(no_dump),nan
+42,4,DENSE(no_dump),nan
+42,5,DENSE(no_dump),nan
+42,6,DENSE(no_dump),nan
+42,7,DENSE(no_dump),nan
+42,8,DENSE(no_dump),nan
+42,9,DENSE(no_dump),nan
+42,10,DENSE(no_dump),nan
+42,11,DENSE(no_dump),nan
+42,12,DENSE(no_dump),nan
+42,13,DENSE(no_dump),nan
+42,14,DENSE(no_dump),nan
+42,15,DENSE(no_dump),nan
+42,16,DENSE(no_dump),nan
+42,17,DENSE(no_dump),nan
+42,18,DENSE(no_dump),nan
+42,19,DENSE(no_dump),nan
+42,20,DENSE(no_dump),nan
+42,21,DENSE(no_dump),nan
+42,22,DENSE(no_dump),nan
+42,23,DENSE(no_dump),nan
+43,0,DENSE(best_was BLOCK_SPARSE@0.200),0.40270301699638367
+43,1,DENSE(best_was BLOCK_SPARSE@0.200),0.41967517137527466
+43,2,DENSE(best_was BLOCK_SPARSE@0.200),0.4034644365310669
+43,3,DENSE(best_was BLOCK_SPARSE@0.200),0.42390477657318115
+43,4,DENSE(best_was BLOCK_SPARSE@0.200),0.465337336063385
+43,5,DENSE(best_was BLOCK_SPARSE@0.200),0.39493077993392944
+43,6,DENSE(best_was BLOCK_SPARSE@0.200),0.37991029024124146
+43,7,DENSE(best_was BLOCK_SPARSE@0.200),0.4828822612762451
+43,8,DENSE(best_was BLOCK_SPARSE@0.200),0.4435421824455261
+43,9,DENSE(best_was BLOCK_SPARSE@0.200),0.474837064743042
+43,10,DENSE(best_was BLOCK_SPARSE@0.200),0.5070549249649048
+43,11,DENSE(best_was BLOCK_SPARSE@0.200),0.4503372609615326
+43,12,DENSE(best_was BLOCK_SPARSE@0.200),0.3431423008441925
+43,13,DENSE(best_was BLOCK_SPARSE@0.200),0.31196165084838867
+43,14,DENSE(best_was BLOCK_SPARSE@0.200),0.4116813838481903
+43,15,DENSE(best_was BLOCK_SPARSE@0.200),0.29930758476257324
+43,16,DENSE(best_was BLOCK_SPARSE@0.200),0.3064008951187134
+43,17,DENSE(best_was BLOCK_SPARSE@0.200),0.44338640570640564
+43,18,DENSE(best_was BLOCK_SPARSE@0.200),0.439018189907074
+43,19,DENSE(best_was BLOCK_SPARSE@0.200),0.48350653052330017
+43,20,DENSE(best_was BLOCK_SPARSE@0.200),0.45225346088409424
+43,21,DENSE(best_was BLOCK_SPARSE@0.200),0.46692192554473877
+43,22,DENSE(best_was BLOCK_SPARSE@0.200),0.5004305839538574
+43,23,DENSE(best_was BLOCK_SPARSE@0.200),0.4351872205734253
+44,0,DENSE(no_dump),nan
+44,1,DENSE(no_dump),nan
+44,2,DENSE(no_dump),nan
+44,3,DENSE(no_dump),nan
+44,4,DENSE(no_dump),nan
+44,5,DENSE(no_dump),nan
+44,6,DENSE(no_dump),nan
+44,7,DENSE(no_dump),nan
+44,8,DENSE(no_dump),nan
+44,9,DENSE(no_dump),nan
+44,10,DENSE(no_dump),nan
+44,11,DENSE(no_dump),nan
+44,12,DENSE(no_dump),nan
+44,13,DENSE(no_dump),nan
+44,14,DENSE(no_dump),nan
+44,15,DENSE(no_dump),nan
+44,16,DENSE(no_dump),nan
+44,17,DENSE(no_dump),nan
+44,18,DENSE(no_dump),nan
+44,19,DENSE(no_dump),nan
+44,20,DENSE(no_dump),nan
+44,21,DENSE(no_dump),nan
+44,22,DENSE(no_dump),nan
+44,23,DENSE(no_dump),nan
+45,0,DENSE(no_dump),nan
+45,1,DENSE(no_dump),nan
+45,2,DENSE(no_dump),nan
+45,3,DENSE(no_dump),nan
+45,4,DENSE(no_dump),nan
+45,5,DENSE(no_dump),nan
+45,6,DENSE(no_dump),nan
+45,7,DENSE(no_dump),nan
+45,8,DENSE(no_dump),nan
+45,9,DENSE(no_dump),nan
+45,10,DENSE(no_dump),nan
+45,11,DENSE(no_dump),nan
+45,12,DENSE(no_dump),nan
+45,13,DENSE(no_dump),nan
+45,14,DENSE(no_dump),nan
+45,15,DENSE(no_dump),nan
+45,16,DENSE(no_dump),nan
+45,17,DENSE(no_dump),nan
+45,18,DENSE(no_dump),nan
+45,19,DENSE(no_dump),nan
+45,20,DENSE(no_dump),nan
+45,21,DENSE(no_dump),nan
+45,22,DENSE(no_dump),nan
+45,23,DENSE(no_dump),nan
+46,0,DENSE(no_dump),nan
+46,1,DENSE(no_dump),nan
+46,2,DENSE(no_dump),nan
+46,3,DENSE(no_dump),nan
+46,4,DENSE(no_dump),nan
+46,5,DENSE(no_dump),nan
+46,6,DENSE(no_dump),nan
+46,7,DENSE(no_dump),nan
+46,8,DENSE(no_dump),nan
+46,9,DENSE(no_dump),nan
+46,10,DENSE(no_dump),nan
+46,11,DENSE(no_dump),nan
+46,12,DENSE(no_dump),nan
+46,13,DENSE(no_dump),nan
+46,14,DENSE(no_dump),nan
+46,15,DENSE(no_dump),nan
+46,16,DENSE(no_dump),nan
+46,17,DENSE(no_dump),nan
+46,18,DENSE(no_dump),nan
+46,19,DENSE(no_dump),nan
+46,20,DENSE(no_dump),nan
+46,21,DENSE(no_dump),nan
+46,22,DENSE(no_dump),nan
+46,23,DENSE(no_dump),nan
+47,0,DENSE(best_was BLOCK_SPARSE@0.200),0.44659361243247986
+47,1,DENSE(best_was BLOCK_SPARSE@0.200),0.5545240640640259
+47,2,DENSE(best_was BLOCK_SPARSE@0.200),0.530839741230011
+47,3,DENSE(best_was BLOCK_SPARSE@0.200),0.5702250599861145
+47,4,DENSE(best_was BLOCK_SPARSE@0.200),0.5187044143676758
+47,5,DENSE(best_was BLOCK_SPARSE@0.200),0.47173988819122314
+47,6,DENSE(best_was A_SHAPE@s64w1024),0.27550697326660156
+47,7,DENSE(best_was BLOCK_SPARSE@0.200),0.5218183994293213
+47,8,DENSE(best_was BLOCK_SPARSE@0.200),0.4524528980255127
+47,9,DENSE(best_was BLOCK_SPARSE@0.200),0.4295180141925812
+47,10,DENSE(best_was BLOCK_SPARSE@0.200),0.52604079246521
+47,11,DENSE(best_was BLOCK_SPARSE@0.200),0.5004361867904663
+47,12,DENSE(best_was BLOCK_SPARSE@0.200),0.4760644733905792
+47,13,DENSE(best_was BLOCK_SPARSE@0.200),0.4997541010379791
+47,14,DENSE(best_was BLOCK_SPARSE@0.200),0.5354620814323425
+47,15,DENSE(best_was BLOCK_SPARSE@0.200),0.45445317029953003
+47,16,DENSE(best_was BLOCK_SPARSE@0.200),0.5004573464393616
+47,17,DENSE(best_was BLOCK_SPARSE@0.200),0.5011965036392212
+47,18,DENSE(best_was BLOCK_SPARSE@0.200),0.4481719434261322
+47,19,DENSE(best_was BLOCK_SPARSE@0.200),0.2835548222064972
+47,20,DENSE(best_was BLOCK_SPARSE@0.200),0.4212731122970581
+47,21,DENSE(best_was BLOCK_SPARSE@0.200),0.39884766936302185
+47,22,DENSE(best_was BLOCK_SPARSE@0.200),0.34118589758872986
+47,23,DENSE(best_was BLOCK_SPARSE@0.200),0.39014098048210144
+48,0,DENSE(no_dump),nan
+48,1,DENSE(no_dump),nan
+48,2,DENSE(no_dump),nan
+48,3,DENSE(no_dump),nan
+48,4,DENSE(no_dump),nan
+48,5,DENSE(no_dump),nan
+48,6,DENSE(no_dump),nan
+48,7,DENSE(no_dump),nan
+48,8,DENSE(no_dump),nan
+48,9,DENSE(no_dump),nan
+48,10,DENSE(no_dump),nan
+48,11,DENSE(no_dump),nan
+48,12,DENSE(no_dump),nan
+48,13,DENSE(no_dump),nan
+48,14,DENSE(no_dump),nan
+48,15,DENSE(no_dump),nan
+48,16,DENSE(no_dump),nan
+48,17,DENSE(no_dump),nan
+48,18,DENSE(no_dump),nan
+48,19,DENSE(no_dump),nan
+48,20,DENSE(no_dump),nan
+48,21,DENSE(no_dump),nan
+48,22,DENSE(no_dump),nan
+48,23,DENSE(no_dump),nan
+49,0,DENSE(no_dump),nan
+49,1,DENSE(no_dump),nan
+49,2,DENSE(no_dump),nan
+49,3,DENSE(no_dump),nan
+49,4,DENSE(no_dump),nan
+49,5,DENSE(no_dump),nan
+49,6,DENSE(no_dump),nan
+49,7,DENSE(no_dump),nan
+49,8,DENSE(no_dump),nan
+49,9,DENSE(no_dump),nan
+49,10,DENSE(no_dump),nan
+49,11,DENSE(no_dump),nan
+49,12,DENSE(no_dump),nan
+49,13,DENSE(no_dump),nan
+49,14,DENSE(no_dump),nan
+49,15,DENSE(no_dump),nan
+49,16,DENSE(no_dump),nan
+49,17,DENSE(no_dump),nan
+49,18,DENSE(no_dump),nan
+49,19,DENSE(no_dump),nan
+49,20,DENSE(no_dump),nan
+49,21,DENSE(no_dump),nan
+49,22,DENSE(no_dump),nan
+49,23,DENSE(no_dump),nan
+50,0,DENSE(no_dump),nan
+50,1,DENSE(no_dump),nan
+50,2,DENSE(no_dump),nan
+50,3,DENSE(no_dump),nan
+50,4,DENSE(no_dump),nan
+50,5,DENSE(no_dump),nan
+50,6,DENSE(no_dump),nan
+50,7,DENSE(no_dump),nan
+50,8,DENSE(no_dump),nan
+50,9,DENSE(no_dump),nan
+50,10,DENSE(no_dump),nan
+50,11,DENSE(no_dump),nan
+50,12,DENSE(no_dump),nan
+50,13,DENSE(no_dump),nan
+50,14,DENSE(no_dump),nan
+50,15,DENSE(no_dump),nan
+50,16,DENSE(no_dump),nan
+50,17,DENSE(no_dump),nan
+50,18,DENSE(no_dump),nan
+50,19,DENSE(no_dump),nan
+50,20,DENSE(no_dump),nan
+50,21,DENSE(no_dump),nan
+50,22,DENSE(no_dump),nan
+50,23,DENSE(no_dump),nan
+51,0,DENSE(best_was BLOCK_SPARSE@0.200),0.5407055020332336
+51,1,DENSE(best_was BLOCK_SPARSE@0.200),0.470569908618927
+51,2,DENSE(best_was BLOCK_SPARSE@0.200),0.5042714476585388
+51,3,DENSE(best_was BLOCK_SPARSE@0.200),0.5603595972061157
+51,4,DENSE(best_was BLOCK_SPARSE@0.200),0.5627931952476501
+51,5,DENSE(best_was BLOCK_SPARSE@0.200),0.5191220641136169
+51,6,DENSE(best_was BLOCK_SPARSE@0.200),0.4612925052642822
+51,7,DENSE(best_was BLOCK_SPARSE@0.200),0.41050300002098083
+51,8,DENSE(best_was BLOCK_SPARSE@0.200),0.3977380394935608
+51,9,DENSE(best_was BLOCK_SPARSE@0.200),0.334078311920166
+51,10,DENSE(best_was BLOCK_SPARSE@0.200),0.29800865054130554
+51,11,DENSE(best_was BLOCK_SPARSE@0.200),0.40964406728744507
+51,12,DENSE(best_was BLOCK_SPARSE@0.200),0.45869916677474976
+51,13,DENSE(best_was BLOCK_SPARSE@0.200),0.553346574306488
+51,14,DENSE(best_was BLOCK_SPARSE@0.200),0.513801634311676
+51,15,DENSE(best_was BLOCK_SPARSE@0.200),0.5345700979232788
+51,16,DENSE(best_was BLOCK_SPARSE@0.200),0.5953851342201233
+51,17,DENSE(best_was BLOCK_SPARSE@0.200),0.5442603826522827
+51,18,DENSE(best_was BLOCK_SPARSE@0.200),0.30265340209007263
+51,19,DENSE(best_was BLOCK_SPARSE@0.200),0.3620556890964508
+51,20,DENSE(best_was BLOCK_SPARSE@0.200),0.3851413428783417
+51,21,DENSE(best_was BLOCK_SPARSE@0.200),0.3542769253253937
+51,22,DENSE(best_was BLOCK_SPARSE@0.200),0.44132086634635925
+51,23,DENSE(best_was BLOCK_SPARSE@0.200),0.48217517137527466
+52,0,DENSE(no_dump),nan
+52,1,DENSE(no_dump),nan
+52,2,DENSE(no_dump),nan
+52,3,DENSE(no_dump),nan
+52,4,DENSE(no_dump),nan
+52,5,DENSE(no_dump),nan
+52,6,DENSE(no_dump),nan
+52,7,DENSE(no_dump),nan
+52,8,DENSE(no_dump),nan
+52,9,DENSE(no_dump),nan
+52,10,DENSE(no_dump),nan
+52,11,DENSE(no_dump),nan
+52,12,DENSE(no_dump),nan
+52,13,DENSE(no_dump),nan
+52,14,DENSE(no_dump),nan
+52,15,DENSE(no_dump),nan
+52,16,DENSE(no_dump),nan
+52,17,DENSE(no_dump),nan
+52,18,DENSE(no_dump),nan
+52,19,DENSE(no_dump),nan
+52,20,DENSE(no_dump),nan
+52,21,DENSE(no_dump),nan
+52,22,DENSE(no_dump),nan
+52,23,DENSE(no_dump),nan
+53,0,DENSE(no_dump),nan
+53,1,DENSE(no_dump),nan
+53,2,DENSE(no_dump),nan
+53,3,DENSE(no_dump),nan
+53,4,DENSE(no_dump),nan
+53,5,DENSE(no_dump),nan
+53,6,DENSE(no_dump),nan
+53,7,DENSE(no_dump),nan
+53,8,DENSE(no_dump),nan
+53,9,DENSE(no_dump),nan
+53,10,DENSE(no_dump),nan
+53,11,DENSE(no_dump),nan
+53,12,DENSE(no_dump),nan
+53,13,DENSE(no_dump),nan
+53,14,DENSE(no_dump),nan
+53,15,DENSE(no_dump),nan
+53,16,DENSE(no_dump),nan
+53,17,DENSE(no_dump),nan
+53,18,DENSE(no_dump),nan
+53,19,DENSE(no_dump),nan
+53,20,DENSE(no_dump),nan
+53,21,DENSE(no_dump),nan
+53,22,DENSE(no_dump),nan
+53,23,DENSE(no_dump),nan
+54,0,DENSE(no_dump),nan
+54,1,DENSE(no_dump),nan
+54,2,DENSE(no_dump),nan
+54,3,DENSE(no_dump),nan
+54,4,DENSE(no_dump),nan
+54,5,DENSE(no_dump),nan
+54,6,DENSE(no_dump),nan
+54,7,DENSE(no_dump),nan
+54,8,DENSE(no_dump),nan
+54,9,DENSE(no_dump),nan
+54,10,DENSE(no_dump),nan
+54,11,DENSE(no_dump),nan
+54,12,DENSE(no_dump),nan
+54,13,DENSE(no_dump),nan
+54,14,DENSE(no_dump),nan
+54,15,DENSE(no_dump),nan
+54,16,DENSE(no_dump),nan
+54,17,DENSE(no_dump),nan
+54,18,DENSE(no_dump),nan
+54,19,DENSE(no_dump),nan
+54,20,DENSE(no_dump),nan
+54,21,DENSE(no_dump),nan
+54,22,DENSE(no_dump),nan
+54,23,DENSE(no_dump),nan
+55,0,DENSE(best_was BLOCK_SPARSE@0.200),0.6278952360153198
+55,1,DENSE(best_was BLOCK_SPARSE@0.200),0.44655007123947144
+55,2,DENSE(best_was BLOCK_SPARSE@0.200),0.5490471720695496
+55,3,DENSE(best_was BLOCK_SPARSE@0.200),0.5395253300666809
+55,4,DENSE(best_was BLOCK_SPARSE@0.200),0.47999778389930725
+55,5,DENSE(best_was BLOCK_SPARSE@0.200),0.42944908142089844
+55,6,DENSE(best_was BLOCK_SPARSE@0.200),0.4990048408508301
+55,7,DENSE(best_was BLOCK_SPARSE@0.200),0.449338436126709
+55,8,DENSE(best_was BLOCK_SPARSE@0.200),0.5152307152748108
+55,9,DENSE(best_was BLOCK_SPARSE@0.200),0.48522505164146423
+55,10,DENSE(best_was BLOCK_SPARSE@0.200),0.5080980658531189
+55,11,DENSE(best_was BLOCK_SPARSE@0.200),0.46950221061706543
+55,12,DENSE(best_was BLOCK_SPARSE@0.200),0.15877361595630646
+55,13,DENSE(best_was BLOCK_SPARSE@0.200),0.24830470979213715
+55,14,DENSE(best_was BLOCK_SPARSE@0.200),0.19509436190128326
+55,15,DENSE(best_was BLOCK_SPARSE@0.200),0.2470226287841797
+55,16,DENSE(best_was BLOCK_SPARSE@0.200),0.21355301141738892
+55,17,DENSE(best_was BLOCK_SPARSE@0.200),0.23350906372070312
+55,18,DENSE(best_was BLOCK_SPARSE@0.200),0.23069873452186584
+55,19,DENSE(best_was BLOCK_SPARSE@0.200),0.263842910528183
+55,20,DENSE(best_was BLOCK_SPARSE@0.200),0.34547337889671326
+55,21,DENSE(best_was BLOCK_SPARSE@0.200),0.28668156266212463
+55,22,DENSE(best_was BLOCK_SPARSE@0.200),0.28415536880493164
+55,23,DENSE(best_was BLOCK_SPARSE@0.200),0.37087926268577576
+56,0,DENSE(no_dump),nan
+56,1,DENSE(no_dump),nan
+56,2,DENSE(no_dump),nan
+56,3,DENSE(no_dump),nan
+56,4,DENSE(no_dump),nan
+56,5,DENSE(no_dump),nan
+56,6,DENSE(no_dump),nan
+56,7,DENSE(no_dump),nan
+56,8,DENSE(no_dump),nan
+56,9,DENSE(no_dump),nan
+56,10,DENSE(no_dump),nan
+56,11,DENSE(no_dump),nan
+56,12,DENSE(no_dump),nan
+56,13,DENSE(no_dump),nan
+56,14,DENSE(no_dump),nan
+56,15,DENSE(no_dump),nan
+56,16,DENSE(no_dump),nan
+56,17,DENSE(no_dump),nan
+56,18,DENSE(no_dump),nan
+56,19,DENSE(no_dump),nan
+56,20,DENSE(no_dump),nan
+56,21,DENSE(no_dump),nan
+56,22,DENSE(no_dump),nan
+56,23,DENSE(no_dump),nan
+57,0,DENSE(no_dump),nan
+57,1,DENSE(no_dump),nan
+57,2,DENSE(no_dump),nan
+57,3,DENSE(no_dump),nan
+57,4,DENSE(no_dump),nan
+57,5,DENSE(no_dump),nan
+57,6,DENSE(no_dump),nan
+57,7,DENSE(no_dump),nan
+57,8,DENSE(no_dump),nan
+57,9,DENSE(no_dump),nan
+57,10,DENSE(no_dump),nan
+57,11,DENSE(no_dump),nan
+57,12,DENSE(no_dump),nan
+57,13,DENSE(no_dump),nan
+57,14,DENSE(no_dump),nan
+57,15,DENSE(no_dump),nan
+57,16,DENSE(no_dump),nan
+57,17,DENSE(no_dump),nan
+57,18,DENSE(no_dump),nan
+57,19,DENSE(no_dump),nan
+57,20,DENSE(no_dump),nan
+57,21,DENSE(no_dump),nan
+57,22,DENSE(no_dump),nan
+57,23,DENSE(no_dump),nan
+58,0,DENSE(no_dump),nan
+58,1,DENSE(no_dump),nan
+58,2,DENSE(no_dump),nan
+58,3,DENSE(no_dump),nan
+58,4,DENSE(no_dump),nan
+58,5,DENSE(no_dump),nan
+58,6,DENSE(no_dump),nan
+58,7,DENSE(no_dump),nan
+58,8,DENSE(no_dump),nan
+58,9,DENSE(no_dump),nan
+58,10,DENSE(no_dump),nan
+58,11,DENSE(no_dump),nan
+58,12,DENSE(no_dump),nan
+58,13,DENSE(no_dump),nan
+58,14,DENSE(no_dump),nan
+58,15,DENSE(no_dump),nan
+58,16,DENSE(no_dump),nan
+58,17,DENSE(no_dump),nan
+58,18,DENSE(no_dump),nan
+58,19,DENSE(no_dump),nan
+58,20,DENSE(no_dump),nan
+58,21,DENSE(no_dump),nan
+58,22,DENSE(no_dump),nan
+58,23,DENSE(no_dump),nan
+59,0,DENSE(best_was BLOCK_SPARSE@0.200),0.18391573429107666
+59,1,DENSE(best_was BLOCK_SPARSE@0.200),0.30137935280799866
+59,2,DENSE(best_was BLOCK_SPARSE@0.200),0.12737566232681274
+59,3,DENSE(best_was BLOCK_SPARSE@0.200),0.2835571765899658
+59,4,DENSE(best_was BLOCK_SPARSE@0.200),0.2159365564584732
+59,5,DENSE(best_was BLOCK_SPARSE@0.200),0.2935526371002197
+59,6,A_SHAPE@s64w1024,0.0436
+59,7,DENSE(best_was BLOCK_SPARSE@0.200),0.06502237170934677
+59,8,A_SHAPE@s64w1024,0.0396
+59,9,DENSE(best_was A_SHAPE@s64w1024),0.056495074182748795
+59,10,A_SHAPE@s64w1024,0.0492
+59,11,A_SHAPE@s64w1024,0.0480
+59,12,DENSE(best_was BLOCK_SPARSE@0.200),0.16764533519744873
+59,13,DENSE(best_was BLOCK_SPARSE@0.200),0.1305350512266159
+59,14,DENSE(best_was BLOCK_SPARSE@0.200),0.26247286796569824
+59,15,DENSE(best_was BLOCK_SPARSE@0.200),0.155508890748024
+59,16,DENSE(best_was BLOCK_SPARSE@0.200),0.1953873485326767
+59,17,DENSE(best_was BLOCK_SPARSE@0.200),0.19092628359794617
+59,18,DENSE(best_was BLOCK_SPARSE@0.200),0.1023128554224968
+59,19,DENSE(best_was BLOCK_SPARSE@0.200),0.16857223212718964
+59,20,DENSE(best_was BLOCK_SPARSE@0.200),0.12065664678812027
+59,21,DENSE(best_was BLOCK_SPARSE@0.200),0.17992748320102692
+59,22,DENSE(best_was BLOCK_SPARSE@0.200),0.11144855618476868
+59,23,DENSE(best_was BLOCK_SPARSE@0.200),0.15816734731197357
+60,0,DENSE(no_dump),nan
+60,1,DENSE(no_dump),nan
+60,2,DENSE(no_dump),nan
+60,3,DENSE(no_dump),nan
+60,4,DENSE(no_dump),nan
+60,5,DENSE(no_dump),nan
+60,6,DENSE(no_dump),nan
+60,7,DENSE(no_dump),nan
+60,8,DENSE(no_dump),nan
+60,9,DENSE(no_dump),nan
+60,10,DENSE(no_dump),nan
+60,11,DENSE(no_dump),nan
+60,12,DENSE(no_dump),nan
+60,13,DENSE(no_dump),nan
+60,14,DENSE(no_dump),nan
+60,15,DENSE(no_dump),nan
+60,16,DENSE(no_dump),nan
+60,17,DENSE(no_dump),nan
+60,18,DENSE(no_dump),nan
+60,19,DENSE(no_dump),nan
+60,20,DENSE(no_dump),nan
+60,21,DENSE(no_dump),nan
+60,22,DENSE(no_dump),nan
+60,23,DENSE(no_dump),nan
+61,0,DENSE(no_dump),nan
+61,1,DENSE(no_dump),nan
+61,2,DENSE(no_dump),nan
+61,3,DENSE(no_dump),nan
+61,4,DENSE(no_dump),nan
+61,5,DENSE(no_dump),nan
+61,6,DENSE(no_dump),nan
+61,7,DENSE(no_dump),nan
+61,8,DENSE(no_dump),nan
+61,9,DENSE(no_dump),nan
+61,10,DENSE(no_dump),nan
+61,11,DENSE(no_dump),nan
+61,12,DENSE(no_dump),nan
+61,13,DENSE(no_dump),nan
+61,14,DENSE(no_dump),nan
+61,15,DENSE(no_dump),nan
+61,16,DENSE(no_dump),nan
+61,17,DENSE(no_dump),nan
+61,18,DENSE(no_dump),nan
+61,19,DENSE(no_dump),nan
+61,20,DENSE(no_dump),nan
+61,21,DENSE(no_dump),nan
+61,22,DENSE(no_dump),nan
+61,23,DENSE(no_dump),nan
+62,0,DENSE(no_dump),nan
+62,1,DENSE(no_dump),nan
+62,2,DENSE(no_dump),nan
+62,3,DENSE(no_dump),nan
+62,4,DENSE(no_dump),nan
+62,5,DENSE(no_dump),nan
+62,6,DENSE(no_dump),nan
+62,7,DENSE(no_dump),nan
+62,8,DENSE(no_dump),nan
+62,9,DENSE(no_dump),nan
+62,10,DENSE(no_dump),nan
+62,11,DENSE(no_dump),nan
+62,12,DENSE(no_dump),nan
+62,13,DENSE(no_dump),nan
+62,14,DENSE(no_dump),nan
+62,15,DENSE(no_dump),nan
+62,16,DENSE(no_dump),nan
+62,17,DENSE(no_dump),nan
+62,18,DENSE(no_dump),nan
+62,19,DENSE(no_dump),nan
+62,20,DENSE(no_dump),nan
+62,21,DENSE(no_dump),nan
+62,22,DENSE(no_dump),nan
+62,23,DENSE(no_dump),nan
+63,0,DENSE(best_was BLOCK_SPARSE@0.200),0.07233618199825287
+63,1,BLOCK_SPARSE@0.200,0.0484
+63,2,A_SHAPE@s64w1024,0.0458
+63,3,A_SHAPE@s64w1024,0.0491
+63,4,DENSE(best_was BLOCK_SPARSE@0.200),0.07348860800266266
+63,5,DENSE(best_was BLOCK_SPARSE@0.200),0.0596366710960865
+63,6,A_SHAPE@s64w1024,0.0496
+63,7,A_SHAPE@s64w1024,0.0404
+63,8,DENSE(best_was BLOCK_SPARSE@0.200),0.054451651871204376
+63,9,DENSE(best_was BLOCK_SPARSE@0.200),0.05057105794548988
+63,10,A_SHAPE@s64w1024,0.0126
+63,11,A_SHAPE@s64w1024,0.0420
+63,12,DENSE(best_was BLOCK_SPARSE@0.200),0.0753222182393074
+63,13,DENSE(best_was BLOCK_SPARSE@0.200),0.1669321358203888
+63,14,DENSE(best_was BLOCK_SPARSE@0.200),0.07662905007600784
+63,15,DENSE(best_was BLOCK_SPARSE@0.200),0.18236546218395233
+63,16,DENSE(best_was BLOCK_SPARSE@0.200),0.11295703053474426
+63,17,DENSE(best_was BLOCK_SPARSE@0.200),0.07355701178312302
+63,18,DENSE(best_was BLOCK_SPARSE@0.200),0.14297452569007874
+63,19,DENSE(best_was BLOCK_SPARSE@0.200),0.05305242910981178
+63,20,DENSE(best_was BLOCK_SPARSE@0.200),0.11070030182600021
+63,21,DENSE(best_was BLOCK_SPARSE@0.200),0.09201105684041977
+63,22,DENSE(best_was BLOCK_SPARSE@0.200),0.08204551041126251
+63,23,DENSE(best_was BLOCK_SPARSE@0.200),0.06795763224363327

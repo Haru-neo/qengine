@@ -3557,6 +3557,40 @@ struct QwenModel {
                            const int* parent_ids_dev, cudaStream_t stream, int slot = 0) {
         (void)parent_ids_dev;
         int H = cfg.hidden_size;
+
+        // Chain fast path: route through forward_attn_step_batched. Each of the
+        // n_tokens chain nodes goes to the same KV slot at consecutive positions
+        // pos_base+0..pos_base+n-1; the batched per-slot attention seq_len cutoff
+        // (pos+1) reproduces the chain ancestor mask exactly. Projections (Q/K/V,
+        // RoPE, output) are batched across all nodes = the win. fp16 KV only
+        // (the batched scatter path); TQ/Q8 fall through to the per-token loop.
+        static const bool batch_chain =
+            !(getenv("DFLASH_ATTN_BATCH") && atoi(getenv("DFLASH_ATTN_BATCH")) == 0);
+        if (batch_chain && tree_is_chain && !use_turboquant && !use_q8_kv
+            && tree_chain_pos_ready && n_tokens > 1) {
+            int g = gpu->layer_gpu[layer];
+            int base_off = (int)kv_slot_offset(slot);
+            // Reuse host scratch sized to budget (set once; positions shift per
+            // iter so we refill, but it's tiny — n_tokens ints).
+            tree_chain_slot_ids_h.assign(n_tokens, slot);
+            tree_chain_pos_h.resize(n_tokens);
+            tree_chain_dst_h.resize(n_tokens);
+            for (int i = 0; i < n_tokens; i++) {
+                tree_chain_pos_h[i] = pos_base + i;
+                tree_chain_dst_h[i] = base_off + pos_base + i;
+            }
+            cudaSetDevice(g);
+            cudaMemcpyAsync(tree_chain_pos_d[g], tree_chain_pos_h.data(),
+                            n_tokens * sizeof(int), cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(tree_chain_dst_d[g], tree_chain_dst_h.data(),
+                            n_tokens * sizeof(int), cudaMemcpyHostToDevice, stream);
+            forward_attn_step_batched(layer, hidden_tree, n_tokens,
+                                      tree_chain_slot_ids_h.data(),
+                                      tree_chain_pos_h.data(),
+                                      tree_chain_dst_d[g], tree_chain_pos_d[g], stream);
+            return;
+        }
+
         for (int t = 0; t < n_tokens; t++) {
             int rope_pos = pos_base + tree_depth_host[t];
             int kv_slot  = pos_base + t;
@@ -5993,6 +6027,17 @@ struct QwenModel {
     // along the accepted chain.
     std::vector<half*> tree_qkv_persist;
     bool  tree_qkv_persist_ready = false;
+    // Chain-shaped tree → batched attn fast path. tree_is_chain is set in
+    // upload_parent_ids (parent[t]==t-1). tree_chain_pos_d / tree_chain_dst_d
+    // are per-GPU [budget] scratch holding RoPE positions and KV destinations
+    // for the single-slot consecutive-position verify (see forward_attn_tree).
+    bool  tree_is_chain = false;
+    std::vector<int*> tree_chain_pos_d;
+    std::vector<int*> tree_chain_dst_d;
+    bool  tree_chain_pos_ready = false;
+    std::vector<int> tree_chain_slot_ids_h;
+    std::vector<int> tree_chain_pos_h;
+    std::vector<int> tree_chain_dst_h;
 
     void alloc_tree_decode(int budget) {
         if (tree_ready) return;
@@ -6010,10 +6055,15 @@ struct QwenModel {
             total += per_layer_sz;
         }
         tree_parent_ids_d.assign(gpu->num_gpus, nullptr);
+        tree_chain_pos_d.assign(gpu->num_gpus, nullptr);
+        tree_chain_dst_d.assign(gpu->num_gpus, nullptr);
         for (int g = 0; g < gpu->num_gpus; g++) {
             cudaSetDevice(g);
             cudaMalloc(&tree_parent_ids_d[g], (size_t)budget * sizeof(int));
+            cudaMalloc(&tree_chain_pos_d[g],  (size_t)budget * sizeof(int));
+            cudaMalloc(&tree_chain_dst_d[g],  (size_t)budget * sizeof(int));
         }
+        tree_chain_pos_ready = true;
         // Persistent per-GDN-layer qkv_half storage.
         auto* qkv_probe = t("blk.0.attn_qkv.weight");
         if (qkv_probe) {
@@ -6048,6 +6098,7 @@ struct QwenModel {
         }
         tree_depth_host.assign(tree_budget, 0);
         tree_ancestor_bits_host.assign(tree_budget, 0u);
+        bool is_chain = (host_parent_ids[0] < 0);
         for (int t = 0; t < tree_budget; t++) {
             int p = host_parent_ids[t];
             if (p < 0) {
@@ -6057,7 +6108,13 @@ struct QwenModel {
                 tree_depth_host[t] = tree_depth_host[p] + 1;
                 tree_ancestor_bits_host[t] = tree_ancestor_bits_host[p] | (1u << t);
             }
+            if (t > 0 && host_parent_ids[t] != t - 1) is_chain = false;
         }
+        // Pure chain (parents = [-1,0,1,...,n-2]) → token t lives at depth t and
+        // attends exactly to slots 0..t. That equals positional causal masking
+        // over consecutive KV positions, so the batched single-slot attn path
+        // is bit-equivalent and far faster than the per-token loop.
+        tree_is_chain = is_chain;
     }
 
     // Scratch per-GPU buffers for chain commit's node_ids, lazily sized to
