@@ -48,6 +48,14 @@ struct GPUModel {
             int b1=15,b2=32,b3=49; sscanf(bounds_env, "%d,%d,%d", &b1,&b2,&b3);
             for (int i = 0; i < num_layers; i++)
                 layer_gpu[i] = (i<b1)?0 : (i<b2)?1 : (i<b3)?2 : 3;
+        } else if (n_gpus == 3 && num_layers == 65 && bounds_env) {
+            // 3-GPU rebalance: PP_LAYER_BOUNDS="b1,b2" -> [0,b1)->GPU0,
+            // [b1,b2)->GPU1, [b2,N)->GPU2. Used to thin GPU 0 (token_embd +
+            // its layers) so the DFlash drafter (~1.8 GB) fits alongside a
+            // 256K KV cache. e.g. "17,42".
+            int b1=17, b2=42; sscanf(bounds_env, "%d,%d", &b1, &b2);
+            for (int i = 0; i < num_layers; i++)
+                layer_gpu[i] = (i<b1)?0 : (i<b2)?1 : 2;
         } else if (n_gpus == 4 && num_layers == 65) {
             // v2-MTP Q8_0: GPU 0 has token_embd, GPU 3 has output+MTP.
             // Shift layers away from GPU 0/3 to avoid repack-peak OOM.
