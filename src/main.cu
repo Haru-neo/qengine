@@ -626,6 +626,21 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
     if (!embd_t) { fprintf(stderr, "[dflash-extract] token_embd.weight missing\n"); return 1; }
     if (!out_w)  { fprintf(stderr, "[dflash-extract] output.weight missing — falling back to token_embd\n"); out_w = embd_t; }
 
+    // DFLASH_EXTRACT_TGT=1: also store the 27B greedy argmax per position (DFC2
+    // record) so the drafter trains on the TARGET's distribution (knowledge
+    // distillation), not the raw training-corpus next-token. Training-only:
+    // serving/verify/accept is untouched. MVP = single-stream path only (the
+    // pipeline path's per-GPU worker threads would race the shared argmax
+    // scratch), so require DFLASH_EXTRACT_PIPELINE=0.
+    const bool extract_tgt = (getenv("DFLASH_EXTRACT_TGT") != nullptr);
+    auto* out_norm_t = gpu_model.get("output_norm.weight");
+    if (extract_tgt && !out_norm_t) {
+        fprintf(stderr, "[dflash-extract] DFLASH_EXTRACT_TGT set but output_norm.weight missing\n"); return 1;
+    }
+    if (extract_tgt && use_pipeline) {
+        fprintf(stderr, "[dflash-extract] DFLASH_EXTRACT_TGT requires DFLASH_EXTRACT_PIPELINE=0 (single-stream)\n"); return 1;
+    }
+
     // ── 1. meta.json ──
     {
         std::string meta = out_dir + "/meta.json";
@@ -633,11 +648,11 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
         if (!mf) { fprintf(stderr, "[dflash-extract] cannot write meta.json\n"); return 1; }
         fprintf(mf,
             "{\"hidden\":%d, \"n_tgt\":%d, \"target_layer_ids\":[%d,%d,%d,%d,%d], "
-            "\"vocab\":%d, \"block_size\":%d, \"mask_token_id\":%d, \"c_dtype\":\"fp16\"}\n",
+            "\"vocab\":%d, \"block_size\":%d, \"mask_token_id\":%d, \"c_dtype\":\"fp16\", \"format\":\"%s\"}\n",
             H, N_TGT,
             dflash::kTargetLayerIds[0], dflash::kTargetLayerIds[1], dflash::kTargetLayerIds[2],
             dflash::kTargetLayerIds[3], dflash::kTargetLayerIds[4],
-            V, BLOCK_SIZE, MASK_TOKEN);
+            V, BLOCK_SIZE, MASK_TOKEN, extract_tgt ? "DFC2" : "DFC1");
         fclose(mf);
         printf("[dflash-extract] wrote meta.json\n");
     }
@@ -719,16 +734,20 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
     };
     // Write one record from a host-side C buffer (byte-identical layout to the
     // single-stream path). Used by BOTH paths.
-    auto write_record = [&](int L, const int* ids_ptr, const half* C, size_t c_count) {
+    auto write_record = [&](int L, const int* ids_ptr, const half* C, size_t c_count,
+                            const int* tgt = nullptr) {
+        bool has_tgt = (tgt != nullptr);
         size_t rec_bytes = sizeof(int32_t) * 2 + (size_t)L * sizeof(int32_t)
-                         + c_count * sizeof(half);
+                         + c_count * sizeof(half)
+                         + (has_tgt ? (size_t)L * sizeof(int32_t) : 0);
         ensure_chunk(rec_bytes);
-        int32_t magic = 0x44464331;  // "DFC1"
+        int32_t magic = has_tgt ? 0x44464332 : 0x44464331;  // "DFC2" : "DFC1"
         int32_t Lw = L;
         fwrite(&magic, sizeof(int32_t), 1, chunk_f);
         fwrite(&Lw,    sizeof(int32_t), 1, chunk_f);
         fwrite(ids_ptr, sizeof(int32_t), L, chunk_f);
         fwrite(C, sizeof(half), c_count, chunk_f);
+        if (has_tgt) fwrite(tgt, sizeof(int32_t), L, chunk_f);   // 27B greedy argmax[L]
         cur_chunk_bytes += rec_bytes;
         cur_chunk_records++;
     };
@@ -750,6 +769,32 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
         float* host_chunk_transfer = nullptr;
         cudaMallocHost(&host_chunk_transfer, (size_t)CHUNK * H * sizeof(float));
         std::vector<half> host_C;
+
+        // KD (DFLASH_EXTRACT_TGT): per-chunk scratch on last_gpu to compute the
+        // 27B greedy argmax (same out_norm + lm_head + argmax the serve path uses)
+        // from each chunk's post-final-layer hidden, plus a per-seq host buffer.
+        std::vector<int> host_tgt;
+        half* tgt_norm_buf = nullptr; half* tgt_logits_buf = nullptr; int* tgt_d_argmax = nullptr;
+        QuantInput tgt_qi;
+        if (extract_tgt) {
+            cudaSetDevice(last_gpu);
+            cudaMalloc(&tgt_norm_buf,   (size_t)CHUNK * H * sizeof(half));
+            cudaMalloc(&tgt_logits_buf, (size_t)CHUNK * V * sizeof(half));
+            cudaMalloc(&tgt_d_argmax,   (size_t)CHUNK * sizeof(int));
+        }
+        // h_final[chunk_n,H] (fp32, on last_gpu) -> per-row 27B greedy id into out_host.
+        auto compute_tgt_chunk = [&](const float* h_final, int chunk_n, int* out_host) {
+            cudaSetDevice(last_gpu);
+            if (out_norm_t->type == GGML_TYPE_F32)
+                rms_norm_f32in_f32w(tgt_norm_buf, h_final, (float*)out_norm_t->data, chunk_n, H, model.cfg.rms_norm_eps, 0);
+            else
+                rms_norm_f32in(tgt_norm_buf, h_final, (half*)out_norm_t->data, chunk_n, H, model.cfg.rms_norm_eps, 0);
+            tgt_qi.quantize_chunk(tgt_norm_buf, H, chunk_n, 0);
+            quant_gemv_chunk(out_w->data, out_w->type, tgt_qi.q8_buf, tgt_logits_buf, H, V, chunk_n, 0);
+            for (int t = 0; t < chunk_n; t++)
+                argmax_half_kernel<<<1, 1024>>>(tgt_logits_buf + (size_t)t * V, V, tgt_d_argmax + t);
+            cudaMemcpy(out_host, tgt_d_argmax, (size_t)chunk_n * sizeof(int), cudaMemcpyDeviceToHost);
+        };
 
         for (size_t si = 0; si < sequences.size(); si++) {
             const std::vector<int>& ids = sequences[si];
@@ -800,6 +845,12 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
                     model.dflash_capture_chunk(layer, h_chunk, chunk_pos, chunk_n, g, 0);
                 }
                 cudaSetDevice(last_gpu); cudaDeviceSynchronize();
+                // KD: h_chunk now holds the post-final-layer hidden for these
+                // chunk_n positions on last_gpu → 27B greedy argmax at p=chunk_pos+t.
+                if (extract_tgt) {
+                    if ((int)host_tgt.size() < L) host_tgt.resize(L);
+                    compute_tgt_chunk(h_chunk, chunk_n, host_tgt.data() + chunk_pos);
+                }
                 chunk_pos += chunk_n;
             }
 
@@ -808,7 +859,8 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
             host_C.resize(c_count);
             cudaMemcpy(host_C.data(), model.dflash_cap.gpu0_buf,
                        c_count * sizeof(half), cudaMemcpyDeviceToHost);
-            write_record(L, ids.data(), host_C.data(), c_count);
+            write_record(L, ids.data(), host_C.data(), c_count,
+                         extract_tgt ? host_tgt.data() : nullptr);
             total_tokens += L;
 
             if ((si + 1) % 64 == 0 || si + 1 == sequences.size()) {
@@ -822,6 +874,12 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
         cudaFreeHost(host_chunk_transfer);
         for (int g = 0; g < n_gpus; g++) { cudaSetDevice(g); cudaFree(gpu_hidden_chunk[g]); }
         cudaSetDevice(0); cudaFree(gpu_hidden_half0);
+        if (extract_tgt) {
+            cudaSetDevice(last_gpu);
+            if (tgt_norm_buf)   cudaFree(tgt_norm_buf);
+            if (tgt_logits_buf) cudaFree(tgt_logits_buf);
+            if (tgt_d_argmax)   cudaFree(tgt_d_argmax);
+        }
     } else {
         // ──────────────── Cross-sequence pipelined path (NB slots) ──────────
         // Multi-threaded, one CPU launch thread per GPU segment (mirrors the
@@ -2827,6 +2885,144 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
 
             int token_id = step < (int)prompt_ids.size() ? prompt_ids[step] : generated.back();
 
+            // ===================== DFlash PIPELINED-FOLD (opt-in) =====================
+            // Removes the standalone per-token forward of the just-committed token by
+            // making it tree-verify SLOT 0: slot0 (anchor_tok=generated.back()@step) is
+            // forwarded inside the batched verify, capturing its own C[step] and yielding
+            // posterior[0] = the 27B greedy at step+1 (the max_idx the per-token forward
+            // used to produce). Draft conditions on C[0..step-1] (ctx_len_draft=step) since
+            // the bonus's C isn't available pre-verify -> needs the ctx-drop1 fold drafter.
+            // Lossless: emit = 27B greedy posterior[0..accept_drafts]. Byte-identical to the
+            // non-fold path's output for ANY drafter (only AL/speed differ) -> logic-checkable.
+            // Pipelined-fold default ON (opt out with DFLASH_FOLD=0). +15-22% t/s,
+            // quality-equivalent (verified: identical C++ coding pass-rate + reasoning
+            // accuracy vs the non-fold path) but NOT bit-identical — the anchor is
+            // forwarded via the batched tree-verify kernel instead of the single-token
+            // kernel, so near-tie argmax can differ. DFLASH_FOLD=0 = bit-exact (slower).
+            static const bool dflash_fold_enabled = !getenv("DFLASH_FOLD") || atoi(getenv("DFLASH_FOLD")) != 0;
+            if (dflash_fold_enabled && slot == 0 && dflash_enabled
+                && sampler.grammar == nullptr && step >= (int)prompt_ids.size()) {
+                auto df0 = prof_now();
+                int B = dflash::DraftConfig::block_size;       // 16
+                int ctx_len_draft = step;                      // C[0..step-1] (NO bonus C)
+                int anchor_tok = token_id;                     // committed bonus @ position step
+
+                // (1) noise = [embed(anchor_tok), embed(MASK)*15]
+                cudaSetDevice(0);
+                half* noise = dflash_state.d_noise_embed;
+                auto fold_embed_row = [&](half* dst, int tok) {
+                    if (embd_t->type == GGML_TYPE_Q8_0)      dequant_embd_q8_0_row<<<(H+255)/256,256>>>(embd_t->data, dst, tok, H);
+                    else if (embd_t->type == GGML_TYPE_Q5_K) dequant_embd_q5k_row_v2<<<(H+255)/256,256>>>(embd_t->data, dst, tok, H);
+                    else if (embd_t->type == GGML_TYPE_Q6_K) dequant_embd_q6k_row_v2<<<(H+255)/256,256>>>(embd_t->data, dst, tok, H);
+                };
+                fold_embed_row(noise, anchor_tok);
+                for (int i = 1; i < B; i++) fold_embed_row(noise + (size_t)i*H, dflash::DraftConfig::mask_token_id);
+
+                // (2) positions + (3) draft forward over C[0..step-1]
+                dflash::prepare_positions(dflash_state, ctx_len_draft);
+                dflash::draft_forward(dflash_state.draft, model.dflash_cap.gpu0_buf, noise,
+                                      dflash_state.d_pos_q, dflash_state.d_pos_k, ctx_len_draft, 0);
+
+                // (4) draft lm_head -> draft_chain[d] = draft pred @ step+1+d (slots 1..15)
+                static half* host_pinned_draft_f = nullptr;
+                if (!host_pinned_draft_f) cudaMallocHost(&host_pinned_draft_f, (size_t)B*H*sizeof(half));
+                cudaSetDevice(0); cudaDeviceSynchronize();
+                cudaMemcpy(host_pinned_draft_f, dflash_state.draft.h_buf, (size_t)B*H*sizeof(half), cudaMemcpyDeviceToHost);
+                cudaSetDevice(last_gpu);
+                cudaMemcpy(tree_norm_buf, host_pinned_draft_f, (size_t)B*H*sizeof(half), cudaMemcpyHostToDevice);
+                qi_logits_tree.quantize_chunk(tree_norm_buf, H, B, 0);
+                quant_gemv_chunk(out_w->data, out_w->type, qi_logits_tree.q8_buf, tree_logits_buf, H, V, B, 0);
+                for (int b = 0; b < B; b++)
+                    argmax_half_kernel<<<1,1024>>>(tree_logits_buf + (size_t)b*V, V, tree_d_argmax + b);
+                cudaMemcpy(tree_h_argmax, tree_d_argmax, (size_t)B*sizeof(int), cudaMemcpyDeviceToHost);
+                int fold_chain[16];
+                for (int d = 0; d < B-1; d++) fold_chain[d] = tree_h_argmax[d+1];
+                if (do_gen_prof) g_mtp += prof_sync_ms(df0, last_gpu);
+
+                // (5) verify: tokens=[anchor_tok, fold_chain[0..14]] @ pos_base=step
+                std::vector<int> tokens_h(tree_budget), host_parents(tree_budget);
+                tokens_h[0] = anchor_tok; host_parents[0] = -1;
+                for (int t = 1; t < tree_budget; t++) { tokens_h[t] = fold_chain[t-1]; host_parents[t] = t-1; }
+                cudaSetDevice(0);
+                auto se0 = prof_now();
+                for (int b = 0; b < tree_budget; b++) {
+                    half* dst = tree_hidden_half[0] + (size_t)b*H;
+                    if (embd_t->type == GGML_TYPE_Q8_0)      dequant_embd_q8_0_row<<<(H+255)/256,256>>>(embd_t->data, dst, tokens_h[b], H);
+                    else if (embd_t->type == GGML_TYPE_Q5_K) dequant_embd_q5k_row_v2<<<(H+255)/256,256>>>(embd_t->data, dst, tokens_h[b], H);
+                    else if (embd_t->type == GGML_TYPE_Q6_K) dequant_embd_q6k_row_v2<<<(H+255)/256,256>>>(embd_t->data, dst, tokens_h[b], H);
+                }
+                half_to_float_kernel<<<(tree_budget*H+255)/256,256>>>(tree_hidden_half[0], tree_hidden[0], tree_budget*H);
+                if (do_gen_prof) g_embed += prof_sync_ms(se0, 0);
+                model.upload_parent_ids(host_parents.data(), 0);
+
+                float* h_tree = tree_hidden[0];
+                for (int layer = 0; layer < model.cfg.num_layers; layer++) {
+                    int g_l = gpu_model.layer_gpu[layer];
+                    int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer-1];
+                    if (g_l != prev_g) {
+                        auto tvx = prof_now();
+                        cudaSetDevice(prev_g);
+                        cudaMemcpy(tree_host_transfer, h_tree, (size_t)tree_budget*H*sizeof(float), cudaMemcpyDeviceToHost);
+                        cudaSetDevice(g_l);
+                        cudaMemcpy(tree_hidden[g_l], tree_host_transfer, (size_t)tree_budget*H*sizeof(float), cudaMemcpyHostToDevice);
+                        h_tree = tree_hidden[g_l];
+                        if (do_gen_prof) g_tv_xfer += prof_sync_ms(tvx, g_l);
+                    } else cudaSetDevice(g_l);
+                    bool is_attn_t = model.is_attn_layer(layer);
+                    auto tvl = prof_now();
+                    if (is_attn_t) { model.forward_attn_tree(layer, h_tree, step, tree_budget, model.tree_parent_ids_d[g_l], 0); if (do_gen_prof) g_tv_attn += prof_sync_ms(tvl, g_l); }
+                    else           { model.forward_gdn_tree(layer, h_tree, tree_budget, model.tree_parent_ids_d[g_l], 0);        if (do_gen_prof) g_tv_gdn  += prof_sync_ms(tvl, g_l); }
+                    auto tvm = prof_now();
+                    model.forward_mlp_tree(layer, h_tree, tree_budget, model.tree_parent_ids_d[g_l], 0);
+                    if (do_gen_prof) g_tv_mlp += prof_sync_ms(tvm, g_l);
+                    auto tvc = prof_now();
+                    model.dflash_capture_tree_layer(layer, h_tree, tree_budget, g_l, 0);
+                    if (do_gen_prof) g_tv_cap += prof_sync_ms(tvc, g_l);
+                }
+                cudaSetDevice(last_gpu); cudaDeviceSynchronize();
+                auto sl0 = prof_now();
+                if (out_norm_t->type == GGML_TYPE_F32)
+                    rms_norm_f32in_f32w(tree_norm_buf, h_tree, (float*)out_norm_t->data, tree_budget, H, model.cfg.rms_norm_eps, 0);
+                else
+                    rms_norm_f32in(tree_norm_buf, h_tree, (half*)out_norm_t->data, tree_budget, H, model.cfg.rms_norm_eps, 0);
+                qi_logits_tree.quantize_chunk(tree_norm_buf, H, tree_budget, 0);
+                quant_gemv_chunk(out_w->data, out_w->type, qi_logits_tree.q8_buf, tree_logits_buf, H, V, tree_budget, 0);
+                for (int b = 0; b < tree_budget; b++)
+                    argmax_half_kernel<<<1,1024>>>(tree_logits_buf + (size_t)b*V, V, tree_d_argmax + b);
+                cudaMemcpy(tree_h_argmax, tree_d_argmax, (size_t)tree_budget*sizeof(int), cudaMemcpyDeviceToHost);
+                if (do_gen_prof) { g_logits += prof_sync_ms(sl0, last_gpu); g_spec_iters++; g_steps++; }
+
+                // (6) accept: posterior[i]=tree_h_argmax[i]=27B greedy @ step+1+i.
+                //     accept_drafts = largest m s.t. fold_chain[i]==posterior[i] for i<m.
+                int accept_drafts = 0;
+                for (int i = 0; i < tree_budget - 1; i++) {
+                    if (tree_h_argmax[i] == fold_chain[i]) accept_drafts++;
+                    else break;
+                }
+                int accept_len_slots = accept_drafts + 1;     // slots 0..accept_drafts (positions step..step+accept_drafts)
+                model.commit_tree_gdn_chain(accept_len_slots);
+                std::vector<int> commit_slots(accept_len_slots);
+                for (int i = 0; i < accept_len_slots; i++) commit_slots[i] = i;
+                model.dflash_commit_tree_capture(commit_slots.data(), accept_len_slots, step);  // C[step..step+accept]
+
+                if (accept_drafts == tree_budget - 1) tree_accept_full_count++;
+                else if (accept_drafts > 0)            tree_accept_partial_count++;
+                else                                    tree_reject_count++;
+                spec_accept_count += accept_drafts;
+
+                // (7) emit posterior[0..accept_drafts] = 27B greedy tokens @ step+1..step+1+accept_drafts.
+                if (!got_first_tok) { t_first = std::chrono::high_resolution_clock::now(); got_first_tok = true; }
+                bool stopped_fold = false;
+                for (int i = 0; i <= accept_drafts && !stopped_fold; i++) {
+                    if (emit_tok(tree_h_argmax[i])) stopped_fold = true;
+                }
+                // (8) step advance. New slot0 = posterior[accept_drafts] @ step+1+accept_drafts.
+                //     step += accept_drafts; outer ++ -> next step = step+accept_drafts+1 = step+1+accept_drafts.
+                step += accept_drafts;
+                if (stopped_fold) break;
+                continue;
+            }
+
             cudaSetDevice(0);
             auto ge0 = prof_now();
             // Dequant embedding into fp16 scratch, then convert to fp32 hidden
@@ -3211,10 +3407,25 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
 
                         // (6d) Chain accept: largest d such that posterior[i] == chain[i] for i<d.
                         // posterior[i] = tree_h_argmax[i] = prediction for pos step+2+i.
+                        // DFLASH_POS_ACCEPT=1: bucket per-position conditional accept
+                        // (reached[i] = chain survived to draft pos i; matched[i] = matched at i).
+                        // p_{i+1} = matched[i]/reached[i] = the decay curve.
+                        static const bool pos_accept = getenv("DFLASH_POS_ACCEPT") != nullptr;
+                        static long pos_reached[16] = {0}, pos_matched[16] = {0};
                         int accept_drafts = 0;
                         for (int i = 0; i < tree_budget - 1; i++) {
-                            if (tree_h_argmax[i] == draft_chain[i]) accept_drafts++;
+                            if (pos_accept) pos_reached[i]++;
+                            if (tree_h_argmax[i] == draft_chain[i]) { accept_drafts++; if (pos_accept) pos_matched[i]++; }
                             else break;
+                        }
+                        if (pos_accept) {
+                            static int pa_cnt = 0;
+                            if (++pa_cnt % 40 == 0) {  // periodic dump
+                                printf("[POS-ACCEPT] p_k (k=1..%d): ", tree_budget - 1);
+                                for (int i = 0; i < tree_budget - 1; i++)
+                                    printf("%.2f ", pos_reached[i] ? (double)pos_matched[i] / pos_reached[i] : 0.0);
+                                printf("\n"); fflush(stdout);
+                            }
                         }
                         // Bonus = posterior at slot accept_drafts (= chain[accept_drafts] if matched, or tree_h_argmax[accept_drafts] if rejected).
                         int bonus = tree_h_argmax[accept_drafts];
