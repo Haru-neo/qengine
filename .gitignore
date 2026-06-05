@@ -44,3 +44,13 @@ venv/
 *.bin
 mtp_work/
 models/
+
+# compiled dev-tool binaries (rebuild from the .cu sources)
+/tools/*
+!/tools/*.cu
+!/tools/*.cuh
+!/tools/*.h
+!/tools/*.sh
+!/tools/*.py
+!/tools/*.md
+!/tools/*.txt
