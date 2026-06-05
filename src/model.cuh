@@ -3857,13 +3857,23 @@ struct QwenModel {
             int smem16 = 4 * HD * sizeof(half) + 2 * BM * HD * sizeof(half) + 4 * BM * sizeof(float);
             dim3 fg(num_kv, N, K_SPLITS);
             dim3 mg(num_kv, N);
+            // Optional sink+window sparse verify (DFLASH_VERIFY_SPARSE=1). Makes
+            // the verify TQ-decode O(sink+window) instead of O(context) so the
+            // long-context gen curve flattens. The drafter is windowed to ~4096,
+            // so window>=that verifies its predictions over the same span. Lossy
+            // for far-middle-context tasks → default OFF (dense). Tunable:
+            // DFLASH_VERIFY_SINK (tok, def 256), DFLASH_VERIFY_WINDOW (tok, def 4096).
+            static const int vsink = []{ const char* e=getenv("DFLASH_VERIFY_SPARSE");
+                if (!e || atoi(e)==0) return 0; const char* s=getenv("DFLASH_VERIFY_SINK"); return s?atoi(s):256; }();
+            static const int vwin  = []{ const char* e=getenv("DFLASH_VERIFY_SPARSE");
+                if (!e || atoi(e)==0) return 0; const char* w=getenv("DFLASH_VERIFY_WINDOW"); return w?atoi(w):4096; }();
             if (num_q == 24) {
                 constexpr int GQA = 6;
                 flash_attn_chunk_fused_split_tq3<HD, GQA, BM, BLOCK, K_SPLITS>
                     <<<fg, BLOCK, smem24, stream>>>(
                         ab.attn_chunk_q_post, tq_k_slot, tq_v_slot,
                         ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
-                        num_q, num_kv, pos_base, N, ATTN_NB, active_end_max, scale);
+                        num_q, num_kv, pos_base, N, ATTN_NB, active_end_max, scale, vsink, vwin);
                 flash_attn_split_merge<HD, GQA, BLOCK, K_SPLITS>
                     <<<mg, BLOCK, 0, stream>>>(
                         ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
@@ -3874,7 +3884,7 @@ struct QwenModel {
                     <<<fg, BLOCK, smem16, stream>>>(
                         ab.attn_chunk_q_post, tq_k_slot, tq_v_slot,
                         ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
-                        num_q, num_kv, pos_base, N, ATTN_NB, active_end_max, scale);
+                        num_q, num_kv, pos_base, N, ATTN_NB, active_end_max, scale, vsink, vwin);
                 flash_attn_split_merge<HD, GQA, BLOCK, K_SPLITS>
                     <<<mg, BLOCK, 0, stream>>>(
                         ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,

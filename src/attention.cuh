@@ -1844,7 +1844,15 @@ __global__ void flash_attn_chunk_fused_split_tq3(
     float*            __restrict__ part_o,
     int num_q, int num_kv,
     int start_pos, int sub_n, int sub_n_max,
-    int active_end_max, float scale
+    int active_end_max, float scale,
+    // Optional sink+window sparsity (DFlash long-context verify). When both 0
+    // (default) the kernel is DENSE and byte-identical to before. When set, each
+    // query only attends to the first `sink_tok` tokens + the last `window_tok`
+    // tokens of its causal range — so per-iteration TQ decode becomes O(sink+
+    // window) instead of O(context), flattening the long-context gen curve. The
+    // DFlash drafter is itself windowed to ~4096, so a verify window >= that
+    // checks the drafter's predictions over the same span it conditioned on.
+    int sink_tok = 0, int window_tok = 0
 ) {
     static_assert(HD % TQ_BLOCK_SIZE == 0, "HD must be multiple of 128");
     constexpr int N_WARPS         = BLOCK / 32;
@@ -1897,9 +1905,20 @@ __global__ void flash_attn_chunk_fused_split_tq3(
 
     if (tile_lo < tile_hi) {
         const float wht_scale = rsqrtf((float)TQ_BLOCK_SIZE);
+        // sink+window sparsity (0/0 => dense, keep every tile). A tile is kept
+        // if it overlaps [0,sink_tok) (sink) OR [active_end_t-window_tok,
+        // active_end_t) (recent window). Skipped tiles cost nothing (no decode),
+        // so per-query decode is O(sink+window) not O(active_end_t).
+        const bool sparse_win = (sink_tok > 0 || window_tok > 0);
+        const int  win_lo = sparse_win ? (active_end_t - window_tok) : 0;
         for (int tile_start = tile_lo; tile_start < tile_hi; tile_start += BM) {
             int tile_end = min(tile_start + BM, tile_hi);
             int tile_len = tile_end - tile_start;
+            if (sparse_win) {
+                bool in_sink   = (tile_start < sink_tok);
+                bool in_window = (tile_end > win_lo);
+                if (!in_sink && !in_window) continue;   // skip middle tile
+            }
 
             unsigned long long t0_t=0, t1_t=0, t2_t=0, t3_t=0, t4_t=0;
             if (tid == 0) t0_t = clock64();
