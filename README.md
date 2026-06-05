@@ -11,6 +11,8 @@ A custom CUDA inference engine for **Qwen3.5 / Qwen3.6 hybrid (GDN + Attention) 
 
 📖 **한국어 README → [README.ko.md](README.ko.md)**
 
+> **A note on the writing:** I'm not a native English speaker — this README was written in Korean first and translated/polished with an LLM. All of the engineering, kernels, benchmarks, and decisions are my own.
+
 ---
 
 ## What it does
@@ -22,7 +24,7 @@ A custom CUDA inference engine for **Qwen3.5 / Qwen3.6 hybrid (GDN + Attention) 
 - **Embeddings + reranking** from the same binary (`--mode embed` / `--mode rerank`): Qwen3-Embedding-4B (last-token pool, L2-normalized) and Qwen3-Reranker-4B (cross-encoder via the `cls.output` classifier head, instruction-aware). The chat server reverse-proxies `/v1/embeddings` and `/v1/rerank` to these sidecars.
 - **Qwen3 thinking control**: `/no_think` (and `/think`) directives in user **or** system messages, plus vLLM-style `extra_body.chat_template_kwargs.enable_thinking` — all resolve to the same `force_think` switch in the chat template.
 - **Continuous batching** across N concurrent slots, with per-slot prefix caching.
-- **MTP draft speculative decoding (K=1)** — works. DFlash + DDTree code is in the repo but **not currently functional** (drafter mismatch — see Limitations).
+- **MTP draft speculative decoding (K=1)** — works. **DFlash block-diffusion speculative decoding** works too now (lossless drafting + chain tree-verify). With a distribution-matched drafter it runs in the **mid-30s to upper-40s t/s** on 27B Q8_0 / 3-GPU. A **pipelined-fold** path (default-on; `DFLASH_FOLD=0` to disable) folds the bonus token into the verify batch for **+15–22%** — quality-equivalent (verified: identical compiled-C++ coding pass-rate) but **not bit-identical** (see Limitations).
 - **3-bit KV cache (MTP_TQ)** — Walsh-Hadamard rotation + Lloyd-Max scalar quant. Same family of idea as llama.cpp [#21038](https://github.com/ggml-org/llama.cpp/pull/21038), but 3-bit Lloyd-Max instead of 4-bit RTN.
 - **Fused gate+up GEMM** (`MLP_GATEUP_FUSED_KERNEL=1`, default off): two Q8_0 weights share one Q8_1 input tile in SMEM, +5–10 % prefill on v2 models.
 - Multi-GPU layer-parallel split with pinned-host activation bridge (no P2P required).
@@ -103,7 +105,7 @@ Honest take: most of the surface-level features overlap. The list below is what 
 - **MTP_TQ uses 3-bit Lloyd-Max + WHT** — llama.cpp's [#21038](https://github.com/ggml-org/llama.cpp/pull/21038) already lands rotation + standard scalar quant types (q4_0 etc.). Ours is 3-bit (vs 4-bit), which gives a slightly higher compression ratio on KV. Whether this beats q4_0 RTN on perplexity is **not yet verified head-to-head**.
 - **Continuous batching with per-slot prefix snapshots** — not unique conceptually. The integration with our scheduler is tight; whether it actually beats llama.cpp's batched server is **not yet measured**.
 - **Qwen3-VL multimodal** — we have it. So does llama.cpp via `tools/mtmd/models/qwen3vl.cpp`. Not an advantage.
-- **DFlash + DDTree speculative decode (experimental, currently broken)** — z-lab pretrained drafter mismatches Qwopus3.6 distill distribution; produces degenerate output. Listed for transparency, not as a feature. Requires drafter fine-tune to be usable.
+- **DFlash block-diffusion speculative decoding** — functional and lossless on the engine side (block-diffusion drafter + chain tree-verify, with custom dp4a small-batch GEMV and an SMEM-resident GDN chain-scan for the verify). The catch is the **drafter**: a stock drafter trained on vanilla Qwen3.5 mismatches a distilled model's output distribution (low accept rate), so you need one trained/fine-tuned on **your** model's outputs. With a matched drafter, accept length ≈ 4.5–5 and the **pipelined-fold** path (default) adds another +15–22%.
 
 ## Hardware
 
@@ -342,7 +344,8 @@ Layer split (4-GPU 27B example): GPU 0 holds layers 0–15 + token embeddings; G
 ## Limitations & known issues
 
 - **MoE not supported.** Only dense Qwen3 hybrid (GDN + Attention) models — Qwen3-Moe and similar mixture-of-experts variants do not load.
-- **DFlash + DDTree spec decode is currently broken.** Pretrained drafter (`lucebox-hub/dflash`) is trained on stock Qwen3.5; output distribution doesn't match the Qwopus distill we use, so accept rate ≈ 0% and the chains degenerate. Code is in the repo for the eventual fine-tuned drafter, but as shipped this path is unusable.
+- **DFlash needs a distribution-matched drafter.** The engine-side DFlash path is functional and lossless, but a stock drafter trained on vanilla Qwen3.5 mismatches a distilled model's distribution, so accept rate is poor out of the box — train/fine-tune a drafter on your model's own outputs to get a usable accept length (~4.5–5).
+- **Pipelined-fold is quality-equivalent, not bit-identical.** The default fold path (`DFLASH_FOLD=0` to disable) forwards the committed bonus token through the *batched tree-verify* kernel instead of the *single-token* kernel, so near-tie argmax tokens can occasionally flip — different-but-valid wording on some responses. Verified to **not** change correctness (identical 8/8 compiled-C++ coding pass-rate and reasoning accuracy vs the non-fold path), but if you need byte-exact reproducibility set `DFLASH_FOLD=0` for the slower bit-exact path.
 - **No batched MTP / spec.** Speculative paths run only when `slots == 1`. With `slots > 1`, the batched gen loop is plain greedy.
 - **GGUF Q8_0 is the supported path.** Q5_K_M / Q6_K load but quality is degraded — use Q8_0.
 - **sm_70 specific tuning.** Should run on sm_75; sm_80+ has better engines anyway.
