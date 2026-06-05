@@ -2055,6 +2055,10 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
             if (mtp_loaded) mtp.reset_kv();
             mtp_pending_draft = -1;
             mtp_pending_draft_step = -1;
+            // Reset the DFlash incremental drafter K/V cache: it caches by
+            // absolute position within a single request, so a new request must
+            // start empty (cache_last_pos = -1 → first call refills the window).
+            if (dflash_enabled) dflash_state.draft.cache_last_pos = -1;
         }
 
         // ============ Phase 1: chunked prompt processing ============
@@ -2900,6 +2904,11 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
             // forwarded via the batched tree-verify kernel instead of the single-token
             // kernel, so near-tie argmax can differ. DFLASH_FOLD=0 = bit-exact (slower).
             static const bool dflash_fold_enabled = !getenv("DFLASH_FOLD") || atoi(getenv("DFLASH_FOLD")) != 0;
+            // Incremental drafter K/V cache (default ON). Caches pre-RoPE context
+            // K/V so the drafter projects only newly-accepted rows instead of the
+            // whole window every iteration — bit-identical, O(n_new) not O(ctx).
+            // DFLASH_DRAFT_CACHE=0 reverts to the full-recompute path (for A/B).
+            static const bool dflash_cache_on = !getenv("DFLASH_DRAFT_CACHE") || atoi(getenv("DFLASH_DRAFT_CACHE")) != 0;
             if (dflash_fold_enabled && slot == 0 && dflash_enabled
                 && sampler.grammar == nullptr && step >= (int)prompt_ids.size()) {
                 auto df0 = prof_now();
@@ -2923,8 +2932,12 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 int ctx_used = (ctx_len_draft < W_df) ? ctx_len_draft : W_df;
                 const half* C_view = model.dflash_window_view(step - 1, ctx_used);
                 dflash::prepare_positions(dflash_state, ctx_used);
-                dflash::draft_forward(dflash_state.draft, C_view, noise,
-                                      dflash_state.d_pos_q, dflash_state.d_pos_k, ctx_used, 0);
+                if (dflash_cache_on)
+                    dflash::draft_forward_cached(dflash_state.draft, C_view, noise,
+                                          dflash_state.d_pos_q, dflash_state.d_pos_k, ctx_used, /*last_pos=*/step - 1, 0);
+                else
+                    dflash::draft_forward(dflash_state.draft, C_view, noise,
+                                          dflash_state.d_pos_q, dflash_state.d_pos_k, ctx_used, 0);
 
                 // (4) draft lm_head -> draft_chain[d] = draft pred @ step+1+d (slots 1..15)
                 static half* host_pinned_draft_f = nullptr;
@@ -3262,13 +3275,19 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         dflash::prepare_positions(dflash_state, ctx_used);
 
                         // (3) draft forward → dflash_state.draft.h_buf [B, H] fp16
-                        dflash::draft_forward(
-                            dflash_state.draft,
-                            C_view,
-                            noise,
-                            dflash_state.d_pos_q,
-                            dflash_state.d_pos_k,
-                            ctx_used, 0);
+                        if (dflash_cache_on)
+                            dflash::draft_forward_cached(
+                                dflash_state.draft, C_view, noise,
+                                dflash_state.d_pos_q, dflash_state.d_pos_k,
+                                ctx_used, /*last_pos=*/step, 0);
+                        else
+                            dflash::draft_forward(
+                                dflash_state.draft,
+                                C_view,
+                                noise,
+                                dflash_state.d_pos_q,
+                                dflash_state.d_pos_k,
+                                ctx_used, 0);
 
                         // (4) lm_head: draft hidden (GPU 0) → last_gpu via host pinned bridge
                         static half* host_pinned_draft = nullptr;

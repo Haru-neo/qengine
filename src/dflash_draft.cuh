@@ -90,6 +90,21 @@ struct DraftModel {
     half* noise_embed       = nullptr;   // [block_size, hidden]
     half* h_buf             = nullptr;   // [block_size, hidden]  (per-layer in/out)
 
+    // ── Incremental context K/V cache (draft_forward_cached) ────────────────
+    // The drafter conditions on the 27B features C of the committed context. C
+    // for a given absolute position is fixed once committed (causal), so the
+    // PRE-RoPE / post-k_norm context K and the context V depend only on the
+    // absolute position and can be cached. (Post-RoPE K cannot — prepare_positions
+    // uses WINDOW-RELATIVE positions, which shift on every window slide; so RoPE
+    // is re-applied fresh each iteration.) Indexed by absolute_pos % cache_window,
+    // exactly like the C ring in model.cuh, so unwrapping mirrors dflash_window_view.
+    // This turns the per-iteration drafter cost from O(ctx_len) (full fc+wk/wv
+    // recompute, ~50% of gen time at 3.4K) into O(newly-accepted-tokens).
+    half* kctx_cache[DraftConfig::num_layers] = {nullptr};  // [W, kv_dim] pre-RoPE, post-k_norm
+    half* vctx_cache[DraftConfig::num_layers] = {nullptr};  // [W, kv_dim]
+    int   cache_window   = 0;    // == max_ctx_len passed to load_draft (the drafter window W)
+    int   cache_last_pos = -1;   // highest absolute position whose K/V is cached; -1 = empty (reset per request)
+
     // Per-layer scratch
     half* q_buf  = nullptr;              // [block_size, q_dim]
     half* k_buf  = nullptr;              // [ctx+block, kv_dim]
@@ -442,6 +457,14 @@ inline bool load_draft(DraftModel& m, const std::string& path, int gpu_id, int m
     if (!alloc(&m.attn_out_buf,      (size_t)C::block_size * C::q_dim)) return false;
     if (!alloc(&m.gate_buf,          (size_t)C::block_size * C::intermediate_size)) return false;
     if (!alloc(&m.up_buf,            (size_t)C::block_size * C::intermediate_size)) return false;
+
+    // Incremental context K/V cache rings (one per draft layer), sized to the window.
+    m.cache_window   = K;
+    m.cache_last_pos = -1;
+    for (int il = 0; il < C::num_layers; il++) {
+        if (!alloc(&m.kctx_cache[il], (size_t)K * C::kv_dim)) return false;
+        if (!alloc(&m.vctx_cache[il], (size_t)K * C::kv_dim)) return false;
+    }
 
     // Q8_1 input scratch — sized for the largest GEMM input we'll quantize:
     //   - target_hidden_cat → fc:  N=ctx_len, K=5*hidden,           blocks/row = 5*hidden/32 = 800
@@ -834,6 +857,157 @@ inline void draft_forward(
     rms_norm(m.h_buf, m.h_buf, m.out_norm, q_len, C::hidden_size, C::rms_eps, stream);
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Incremental draft forward — bit-identical to draft_forward but O(n_new)
+// instead of O(ctx_len). Caches PRE-RoPE/post-k_norm context K and context V
+// per layer (indexed by absolute_pos % cache_window). Only the newest `n_new`
+// context rows are projected each call; the rest are served from the cache.
+// RoPE is still applied fresh over the whole working buffer (window-relative
+// positions), so output matches the full-recompute path exactly.
+//
+//   target_hidden_cat : C_view [ctx_len, 5*hidden] contiguous, chronological
+//                       (oldest-in-window first), as returned by dflash_window_view.
+//   last_pos          : the REAL absolute position of the newest context row
+//                       (= step-1 in the fold path). n_new is derived from
+//                       (last_pos - cache_last_pos); on the first call of a
+//                       request cache_last_pos is -1 → full cache fill.
+//                       cache_last_pos must be reset to -1 per request.
+// ─────────────────────────────────────────────────────────────────────────
+inline void draft_forward_cached(
+    DraftModel& m,
+    const half* target_hidden_cat,
+    const half* noise_embed,
+    const int32_t* positions_q,
+    const int32_t* positions_k,
+    int ctx_len,
+    int last_pos,
+    cudaStream_t stream = 0
+) {
+    using C = DraftConfig;
+    int q_len   = C::block_size;
+    int total_k = ctx_len + q_len;
+    int W       = m.cache_window;
+    cudaSetDevice(m.device);
+
+    // n_new from the REAL absolute positions. First call (cache empty) or any
+    // non-monotonic jump (new request) → recompute the whole window.
+    int n_new = (m.cache_last_pos < 0) ? ctx_len : (last_pos - m.cache_last_pos);
+    if (n_new < 0 || n_new > ctx_len) n_new = ctx_len;
+    int oldest        = last_pos - ctx_len + 1;        // absolute pos of C_view row 0
+    int first_new_abs = last_pos - n_new + 1;          // absolute pos of first new row
+
+    // ── (A) project the new context rows' K/V into the ring ───────────────
+    if (n_new > 0) {
+        // target_feat for new rows = LAST n_new rows of C_view (newest = newly committed)
+        const half* C_new = target_hidden_cat
+                          + (size_t)(ctx_len - n_new) * C::n_target_layers * C::hidden_size;
+        half* feat_new = m.target_feat;   // reuse [<=W, hidden] scratch (n_new <= ctx_len <= W)
+        {
+            int N = n_new, K5 = C::n_target_layers * C::hidden_size, M = C::hidden_size;
+            q8gemm::launch_quantize_input_q8_1(C_new, m.xq_scratch, N, K5, stream);
+            q8gemm::launch_gemm_q8_0_q8_1(m.fc, m.xq_scratch, feat_new, M, N, K5, stream);
+            rms_norm(feat_new, feat_new, m.hidden_norm, N, M, C::rms_eps, stream);
+        }
+        // quantize feat_new ONCE — same input feeds wk/wv across all layers
+        q8gemm::launch_quantize_input_q8_1(feat_new, m.xq_scratch, n_new, C::hidden_size, stream);
+        int start = ((first_new_abs % W) + W) % W;
+        int seg1  = (start + n_new <= W) ? n_new : (W - start);
+        int seg2  = n_new - seg1;
+        for (int il = 0; il < C::num_layers; il++) {
+            const DraftLayer& L = m.layers[il];
+            half* kp = m.k_buf;   // transient scratch for the new rows
+            half* vp = m.v_buf;
+            q8gemm::launch_gemm_q8_0_q8_1(L.wk, m.xq_scratch, kp, C::kv_dim, n_new, C::hidden_size, stream);
+            q8gemm::launch_gemm_q8_0_q8_1(L.wv, m.xq_scratch, vp, C::kv_dim, n_new, C::hidden_size, stream);
+            launch_per_head_rms_norm(kp, L.k_norm, n_new, C::num_kv_heads, C::head_dim, C::rms_eps, stream);
+            // scatter to ring[start .. start+n_new) % W  (1 or 2 contiguous segments)
+            cudaMemcpyAsync(m.kctx_cache[il] + (size_t)start * C::kv_dim, kp,
+                            (size_t)seg1 * C::kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+            cudaMemcpyAsync(m.vctx_cache[il] + (size_t)start * C::kv_dim, vp,
+                            (size_t)seg1 * C::kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+            if (seg2 > 0) {
+                cudaMemcpyAsync(m.kctx_cache[il], kp + (size_t)seg1 * C::kv_dim,
+                                (size_t)seg2 * C::kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+                cudaMemcpyAsync(m.vctx_cache[il], vp + (size_t)seg1 * C::kv_dim,
+                                (size_t)seg2 * C::kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+            }
+        }
+    }
+    m.cache_last_pos = last_pos;
+
+    // ── (B) 5-layer forward of the 16 noise tokens over cached context ────
+    cudaMemcpyAsync(m.h_buf, noise_embed, (size_t)q_len * C::hidden_size * sizeof(half),
+                    cudaMemcpyDeviceToDevice, stream);
+    int ring_start = ((oldest % W) + W) % W;             // ring slot of C_view row 0
+    int u_seg1 = (ring_start + ctx_len <= W) ? ctx_len : (W - ring_start);
+    int u_seg2 = ctx_len - u_seg1;
+    for (int il = 0; il < C::num_layers; il++) {
+        const DraftLayer& L = m.layers[il];
+
+        half* hn = m.attn_out_buf;
+        rms_norm(hn, m.h_buf, L.attn_norm, q_len, C::hidden_size, C::rms_eps, stream);
+
+        // Q from noise
+        q8gemm::launch_quantize_input_q8_1(hn, m.xq_scratch, q_len, C::hidden_size, stream);
+        q8gemm::launch_gemm_q8_0_q8_1(L.wq, m.xq_scratch, m.q_buf, C::q_dim, q_len, C::hidden_size, stream);
+        launch_per_head_rms_norm(m.q_buf, L.q_norm, q_len, C::num_q_heads, C::head_dim, C::rms_eps, stream);
+
+        // unwrap cached context K/V (pre-RoPE) into k_buf[0..ctx_len), v_buf[0..ctx_len)
+        cudaMemcpyAsync(m.k_buf, m.kctx_cache[il] + (size_t)ring_start * C::kv_dim,
+                        (size_t)u_seg1 * C::kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(m.v_buf, m.vctx_cache[il] + (size_t)ring_start * C::kv_dim,
+                        (size_t)u_seg1 * C::kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+        if (u_seg2 > 0) {
+            cudaMemcpyAsync(m.k_buf + (size_t)u_seg1 * C::kv_dim, m.kctx_cache[il],
+                            (size_t)u_seg2 * C::kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+            cudaMemcpyAsync(m.v_buf + (size_t)u_seg1 * C::kv_dim, m.vctx_cache[il],
+                            (size_t)u_seg2 * C::kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+        }
+
+        // noise K/V appended at [ctx_len..total_k); k_norm the noise rows only
+        q8gemm::launch_quantize_input_q8_1(hn, m.xq_scratch, q_len, C::hidden_size, stream);
+        half* k_n = m.k_buf + (size_t)ctx_len * C::kv_dim;
+        half* v_n = m.v_buf + (size_t)ctx_len * C::kv_dim;
+        q8gemm::launch_gemm_q8_0_q8_1(L.wk, m.xq_scratch, k_n, C::kv_dim, q_len, C::hidden_size, stream);
+        q8gemm::launch_gemm_q8_0_q8_1(L.wv, m.xq_scratch, v_n, C::kv_dim, q_len, C::hidden_size, stream);
+        launch_per_head_rms_norm(k_n, L.k_norm, q_len, C::num_kv_heads, C::head_dim, C::rms_eps, stream);
+
+        // RoPE Q and the FULL K (context pre-RoPE + noise pre-RoPE) — window-relative positions
+        launch_rope_neox(m.q_buf, positions_q, q_len,   C::num_q_heads,  C::head_dim, C::head_dim, C::rope_theta, stream);
+        launch_rope_neox(m.k_buf, positions_k, total_k, C::num_kv_heads, C::head_dim, C::head_dim, C::rope_theta, stream);
+
+        // attention (non-causal full)
+        float scale = 1.0f / sqrtf((float)C::head_dim);
+        launch_attn_full(m.q_buf, m.k_buf, m.v_buf, m.attn_out_buf,
+                         q_len, total_k, C::num_q_heads, C::num_kv_heads, C::head_dim,
+                         scale, stream);
+
+        // output projection + residual
+        {
+            q8gemm::launch_quantize_input_q8_1(m.attn_out_buf, m.xq_scratch, q_len, C::q_dim, stream);
+            half* attn_proj = m.q_buf;
+            q8gemm::launch_gemm_q8_0_q8_1(L.wo, m.xq_scratch, attn_proj, C::hidden_size, q_len, C::q_dim, stream);
+            launch_residual_add(m.h_buf, attn_proj, (size_t)q_len * C::hidden_size, stream);
+        }
+
+        // FFN pre-norm + SwiGLU
+        half* hf = m.attn_out_buf;
+        rms_norm(hf, m.h_buf, L.post_attn_norm, q_len, C::hidden_size, C::rms_eps, stream);
+        {
+            q8gemm::launch_quantize_input_q8_1(hf, m.xq_scratch, q_len, C::hidden_size, stream);
+            q8gemm::launch_gemm_q8_0_q8_1(L.w_gate, m.xq_scratch, m.gate_buf, C::intermediate_size, q_len, C::hidden_size, stream);
+            q8gemm::launch_gemm_q8_0_q8_1(L.w_up,   m.xq_scratch, m.up_buf,   C::intermediate_size, q_len, C::hidden_size, stream);
+            launch_silu_mul(m.gate_buf, m.up_buf, (size_t)q_len * C::intermediate_size, stream);
+            q8gemm::launch_quantize_input_q8_1(m.gate_buf, m.xq_scratch, q_len, C::intermediate_size, stream);
+            half* ffn_out = m.q_buf;
+            q8gemm::launch_gemm_q8_0_q8_1(L.w_down, m.xq_scratch, ffn_out, C::hidden_size, q_len, C::intermediate_size, stream);
+            launch_residual_add(m.h_buf, ffn_out, (size_t)q_len * C::hidden_size, stream);
+        }
+    }
+
+    rms_norm(m.h_buf, m.h_buf, m.out_norm, q_len, C::hidden_size, C::rms_eps, stream);
+}
+
 inline void free_draft(DraftModel& m) {
     if (!m.loaded) return;
     cudaSetDevice(m.device);
@@ -851,6 +1025,7 @@ inline void free_draft(DraftModel& m) {
     F(m.noise_embed); F(m.h_buf);
     F(m.q_buf); F(m.k_buf); F(m.v_buf);
     F(m.attn_out_buf); F(m.gate_buf); F(m.up_buf);
+    for (int il = 0; il < DraftConfig::num_layers; il++) { F(m.kctx_cache[il]); F(m.vctx_cache[il]); }
     F1(m.xq_scratch);
     m.loaded = false;
 }
