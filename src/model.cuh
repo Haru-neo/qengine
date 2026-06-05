@@ -3635,7 +3635,15 @@ struct QwenModel {
         // (the batched scatter path); TQ/Q8 fall through to the per-token loop.
         static const bool batch_chain =
             !(getenv("DFLASH_ATTN_BATCH") && atoi(getenv("DFLASH_ATTN_BATCH")) == 0);
-        if (batch_chain && tree_is_chain && !use_turboquant && !use_q8_kv
+        // TQ KV chains can now batch too: forward_attn_step_batched runs ONE
+        // multi-query FA (flash_attn_chunk_fused_split_tq3, sub_n=N) over the TQ
+        // cache instead of N per-token forward_attn calls → KV read once, not N×.
+        // (DFLASH_VERIFY_BATCHED=0 reverts to the per-token path.) Q8 KV still
+        // routes per-token.
+        static const bool tq_verify_batched_tree =
+            !(getenv("DFLASH_VERIFY_BATCHED") && atoi(getenv("DFLASH_VERIFY_BATCHED")) == 0);
+        bool kv_ok_for_batch = (!use_turboquant || tq_verify_batched_tree) && !use_q8_kv;
+        if (batch_chain && tree_is_chain && kv_ok_for_batch
             && tree_chain_pos_ready && n_tokens > 1) {
             int g = gpu->layer_gpu[layer];
             int base_off = (int)kv_slot_offset(slot);
@@ -3802,53 +3810,107 @@ struct QwenModel {
                 slot_pos_dev, num_kv, hd, rope_dim, N);
         }
 
-        // 5. KV scatter — fp16 path. (TQ path: fall back to per-slot loop
-        //    since the per-block quantize/dequant kernel is not yet wired
-        //    for scattered destinations. TQ + batching can be added later.)
+        // 5/6. KV write + attention.
+        //
+        // TQ KV (the 256K config): write the N new (post-RoPE) K/V into the TQ
+        // cache at the chain's consecutive positions, then run ONE multi-query
+        // FlashAttention over the TQ cache. flash_attn_chunk_fused_split_tq3
+        // decodes the 3-bit cache cooperatively in shared memory (no fp16 scratch,
+        // no history re-dequant) and self-limits each chain query t_idx to
+        // [0..pos_base+t_idx] (active_end_t = abs_pos+1), so the KV cache is read
+        // ONCE for all N queries instead of N× (the old per-token forward_attn
+        // loop). Same kernel as the per-token FA path (sub_n=N vs sub_n=1) → the
+        // 27B verify is greedy-equivalent. DFLASH_VERIFY_BATCHED=0 reverts.
+        static const bool tq_verify_batched =
+            !(getenv("DFLASH_VERIFY_BATCHED") && atoi(getenv("DFLASH_VERIFY_BATCHED")) == 0);
         if (use_turboquant) {
-            // Per-slot fallback for TQ; correctness first.
-            for (int i = 0; i < N; i++) {
-                forward_attn(layer, hidden_batch + (size_t)i * H,
-                             slot_pos_host[i], stream,
-                             /*external_proj=*/false, /*slot_pos=*/-1,
-                             /*mask_start=*/-1, /*mask_len=*/0,
-                             /*mask_bits=*/0xffffffffu,
-                             /*slot=*/slot_ids_host[i]);
+            if (!tq_verify_batched) {
+                // Per-token fallback for TQ (legacy; reads KV N× per iteration).
+                for (int i = 0; i < N; i++) {
+                    forward_attn(layer, hidden_batch + (size_t)i * H,
+                                 slot_pos_host[i], stream,
+                                 /*external_proj=*/false, /*slot_pos=*/-1,
+                                 /*mask_start=*/-1, /*mask_len=*/0,
+                                 /*mask_bits=*/0xffffffffu,
+                                 /*slot=*/slot_ids_host[i]);
+                }
+                return;
             }
-            return;
-        }
+            int pos_base = slot_pos_host[0];          // chain → consecutive positions
+            int slot_s   = slot_ids_host[0];
+            auto& tq = tq_kv_caches[layer];
+            int bpt = tq.blocks_per_token;
+            int new_blocks = N * bpt;
+            size_t slot_blk_off = kv_slot_offset(slot_s) * (size_t)bpt;
+            block_tq3* tq_k_slot = tq.k + slot_blk_off;
+            block_tq3* tq_v_slot = tq.v + slot_blk_off;
+            // Quantize the N new post-RoPE K/V into the TQ cache (positions
+            // [pos_base..pos_base+N)); mirrors the chunked-prefill KV write.
+            tq3_quantize_kernel<<<(new_blocks + 31) / 32, 32, 0, stream>>>(
+                ab.attn_chunk_k, &tq_k_slot[(size_t)pos_base * bpt], new_blocks);
+            tq3_quantize_kernel<<<(new_blocks + 31) / 32, 32, 0, stream>>>(
+                ab.attn_chunk_v, &tq_v_slot[(size_t)pos_base * bpt], new_blocks);
 
-        auto& kv = kv_caches[layer];
-        {
-            dim3 sc_grid((kv_dim + 255) / 256, N);
-            scatter_kv_kernel<<<sc_grid, 256, 0, stream>>>(
-                ab.attn_chunk_k, ab.attn_chunk_v,
-                kv.k, kv.v, dst_kv_pos_dev, kv_dim, N);
-        }
+            constexpr int HD = 256, BM = 32, BLOCK = 256, K_SPLITS = 8;
+            int active_end_max = pos_base + N;
+            int smem24 = 6 * HD * sizeof(half) + 2 * BM * HD * sizeof(half) + 6 * BM * sizeof(float);
+            int smem16 = 4 * HD * sizeof(half) + 2 * BM * HD * sizeof(half) + 4 * BM * sizeof(float);
+            dim3 fg(num_kv, N, K_SPLITS);
+            dim3 mg(num_kv, N);
+            if (num_q == 24) {
+                constexpr int GQA = 6;
+                flash_attn_chunk_fused_split_tq3<HD, GQA, BM, BLOCK, K_SPLITS>
+                    <<<fg, BLOCK, smem24, stream>>>(
+                        ab.attn_chunk_q_post, tq_k_slot, tq_v_slot,
+                        ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
+                        num_q, num_kv, pos_base, N, ATTN_NB, active_end_max, scale);
+                flash_attn_split_merge<HD, GQA, BLOCK, K_SPLITS>
+                    <<<mg, BLOCK, 0, stream>>>(
+                        ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
+                        ab.attn_chunk_out, num_q, N, ATTN_NB);
+            } else {
+                constexpr int GQA = 4;
+                flash_attn_chunk_fused_split_tq3<HD, GQA, BM, BLOCK, K_SPLITS>
+                    <<<fg, BLOCK, smem16, stream>>>(
+                        ab.attn_chunk_q_post, tq_k_slot, tq_v_slot,
+                        ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
+                        num_q, num_kv, pos_base, N, ATTN_NB, active_end_max, scale);
+                flash_attn_split_merge<HD, GQA, BLOCK, K_SPLITS>
+                    <<<mg, BLOCK, 0, stream>>>(
+                        ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
+                        ab.attn_chunk_out, num_q, N, ATTN_NB);
+            }
+            // → attention output in ab.attn_chunk_out; fall through to gate/oproj.
+        } else {
+            // fp16 KV path: scatter K/V then per-slot attention into attn_chunk_out.
+            auto& kv = kv_caches[layer];
+            {
+                dim3 sc_grid((kv_dim + 255) / 256, N);
+                scatter_kv_kernel<<<sc_grid, 256, 0, stream>>>(
+                    ab.attn_chunk_k, ab.attn_chunk_v,
+                    kv.k, kv.v, dst_kv_pos_dev, kv_dim, N);
+            }
+            // Per-slot attention compute. Each slot's Q attends to KV[0..pos].
+            for (int i = 0; i < N; i++) {
+                int slot_i  = slot_ids_host[i];
+                int pos_i   = slot_pos_host[i];
+                int seq_len = pos_i + 1;
+                half*  q_buf_i = ab.attn_chunk_q_post + (size_t)i * total_qg;
+                float* scores_i = ab.attn_chunk_scores;  // single slot at a time, reuse base
+                half*  out_i   = ab.attn_chunk_out + (size_t)i * total_qg;
+                half*  k_slot  = kv.k + kv_slot_offset(slot_i) * kv_dim;
+                half*  v_slot  = kv.v + kv_slot_offset(slot_i) * kv_dim;
 
-        // 6. Per-slot attention compute. Each slot's Q attends to the slot's
-        //    KV[0..pos] range. Loops here; the GEMVs above are already
-        //    batched, which is where the bulk of the throughput win comes
-        //    from.
-        for (int i = 0; i < N; i++) {
-            int slot_i  = slot_ids_host[i];
-            int pos_i   = slot_pos_host[i];
-            int seq_len = pos_i + 1;
-            half*  q_buf_i = ab.attn_chunk_q_post + (size_t)i * total_qg;
-            float* scores_i = ab.attn_chunk_scores;  // single slot at a time, reuse base
-            half*  out_i   = ab.attn_chunk_out + (size_t)i * total_qg;
-            half*  k_slot  = kv.k + kv_slot_offset(slot_i) * kv_dim;
-            half*  v_slot  = kv.v + kv_slot_offset(slot_i) * kv_dim;
-
-            dim3 score_grid(num_q, seq_len);
-            attn_score_kernel_h<<<score_grid, std::min(hd, 256), 0, stream>>>(
-                q_buf_i, k_slot, scores_i,
-                num_q, num_kv, hd, seq_len, scale);
-            int st = 1; while (st < seq_len && st < 256) st <<= 1;
-            softmax_kernel<<<num_q, st, st * sizeof(float), stream>>>(
-                scores_i, num_q, seq_len);
-            attn_value_kernel_h<<<num_q, std::min(hd, 256), 0, stream>>>(
-                scores_i, v_slot, out_i, num_q, num_kv, hd, seq_len);
+                dim3 score_grid(num_q, seq_len);
+                attn_score_kernel_h<<<score_grid, std::min(hd, 256), 0, stream>>>(
+                    q_buf_i, k_slot, scores_i,
+                    num_q, num_kv, hd, seq_len, scale);
+                int st = 1; while (st < seq_len && st < 256) st <<= 1;
+                softmax_kernel<<<num_q, st, st * sizeof(float), stream>>>(
+                    scores_i, num_q, seq_len);
+                attn_value_kernel_h<<<num_q, std::min(hd, 256), 0, stream>>>(
+                    scores_i, v_slot, out_i, num_q, num_kv, hd, seq_len);
+            }
         }
 
         // 7. Batched output gate (sigmoid)

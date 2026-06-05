@@ -1723,7 +1723,11 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         // (ffn_gate_inp + *_exps + shared expert) in the MTP layer — qwen3_5_moe
         // makes the MTP layer itself MoE. load_from_gguf detects which and binds
         // the right tensors; num_experts_per_tok is passed through for top-k.
-        if (model.mtp_layer_idx >= 0) {
+        // DFlash uses its own drafter and force-disables all MTP paths below.
+        // Skip loading the MTP head entirely so its KV cache (1+ GB at 256K, on
+        // the last/tightest GPU) is never allocated — frees headroom at 256K.
+        const bool want_mtp = (getenv("DFLASH") == nullptr);
+        if (model.mtp_layer_idx >= 0 && want_mtp) {
             mtp_loaded = mtp.load_from_gguf(
                 gpu_model, model.mtp_layer_idx,
                 model.cfg.hidden_size, V,
@@ -1732,7 +1736,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 model.cfg.num_experts_per_tok);
         }
         // Fallback: external mtp_head_<hidden>.bin
-        if (!mtp_loaded) {
+        if (!mtp_loaded && want_mtp) {
             char mtp_path_buf[256];
             snprintf(mtp_path_buf, sizeof(mtp_path_buf),
                      "/home/paru/mtp_work/mtp_head_%d.bin", model.cfg.hidden_size);
