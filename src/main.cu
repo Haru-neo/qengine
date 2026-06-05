@@ -2918,10 +2918,13 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 fold_embed_row(noise, anchor_tok);
                 for (int i = 1; i < B; i++) fold_embed_row(noise + (size_t)i*H, dflash::DraftConfig::mask_token_id);
 
-                // (2) positions + (3) draft forward over C[0..step-1]
-                dflash::prepare_positions(dflash_state, ctx_len_draft);
-                dflash::draft_forward(dflash_state.draft, model.dflash_cap.gpu0_buf, noise,
-                                      dflash_state.d_pos_q, dflash_state.d_pos_k, ctx_len_draft, 0);
+                // (2) positions + (3) draft forward over windowed C[..step-1]
+                int W_df = model.dflash_cap.window;
+                int ctx_used = (ctx_len_draft < W_df) ? ctx_len_draft : W_df;
+                const half* C_view = model.dflash_window_view(step - 1, ctx_used);
+                dflash::prepare_positions(dflash_state, ctx_used);
+                dflash::draft_forward(dflash_state.draft, C_view, noise,
+                                      dflash_state.d_pos_q, dflash_state.d_pos_k, ctx_used, 0);
 
                 // (4) draft lm_head -> draft_chain[d] = draft pred @ step+1+d (slots 1..15)
                 static half* host_pinned_draft_f = nullptr;
@@ -3252,17 +3255,20 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         for (int i = 1; i < B; i++)
                             embed_row(noise + (size_t)i * H, dflash::DraftConfig::mask_token_id);
 
-                        // (2) positions
-                        dflash::prepare_positions(dflash_state, ctx_len_draft);
+                        // (2) positions + windowed C view (cap drafter ctx to the ring window)
+                        int W_df = model.dflash_cap.window;
+                        int ctx_used = (ctx_len_draft < W_df) ? ctx_len_draft : W_df;
+                        const half* C_view = model.dflash_window_view(step, ctx_used);
+                        dflash::prepare_positions(dflash_state, ctx_used);
 
                         // (3) draft forward → dflash_state.draft.h_buf [B, H] fp16
                         dflash::draft_forward(
                             dflash_state.draft,
-                            model.dflash_cap.gpu0_buf,
+                            C_view,
                             noise,
                             dflash_state.d_pos_q,
                             dflash_state.d_pos_k,
-                            ctx_len_draft, 0);
+                            ctx_used, 0);
 
                         // (4) lm_head: draft hidden (GPU 0) → last_gpu via host pinned bridge
                         static half* host_pinned_draft = nullptr;

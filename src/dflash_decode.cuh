@@ -63,15 +63,25 @@ inline bool dflash_init(
     s.vocab_size  = model.cfg.vocab_size;
     s.hidden_size = model.cfg.hidden_size;
 
-    if (!load_draft(s.draft, draft_path, s.draft_gpu, max_ctx)) {
+    // Drafter context window. The block-diffusion drafter was trained on short
+    // (~2K) sequences, and at large max_ctx the per-token C buffer (and the draft's
+    // own K/V buffers) would be enormous (256K -> ~13 GB fp16 on GPU 0). So cap the
+    // drafter's context to a recent-W window: bounds VRAM AND keeps the drafter in
+    // its trained range. Default 4096 when max_ctx is large; override with
+    // DFLASH_WINDOW; window == max_ctx for small contexts (exact, no ring).
+    int W = max_ctx;
+    if (const char* e = getenv("DFLASH_WINDOW")) { int w = atoi(e); if (w > 0 && w < max_ctx) W = w; }
+    else if (max_ctx > 16384) W = 4096;
+
+    if (!load_draft(s.draft, draft_path, s.draft_gpu, W)) {
         printf("[dflash] load_draft failed: %s\n", draft_path.c_str());
         return false;
     }
 
-    // Capture hook: 5 target layer ids, GPU0 ring buffer sized for max_ctx.
+    // Capture hook: 5 target layer ids, GPU0 ring buffer sized for the window W.
     int layer_ids[5];
     for (int i = 0; i < 5; i++) layer_ids[i] = kTargetLayerIds[i];
-    model.init_dflash_capture(max_ctx, layer_ids, 5);
+    model.init_dflash_capture(max_ctx, layer_ids, 5, W);
 
     int B = s.block_size;
     int V = s.vocab_size;

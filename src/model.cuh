@@ -390,10 +390,12 @@ struct QwenModel {
     // Cross-GPU transfer goes through host pinned memory (no P2P on CMP).
     // Disabled by default; init_dflash_capture() turns it on.
     struct DFlashCapture {
-        half* gpu0_buf       = nullptr;   // [max_ctx * n_slots * hidden] on GPU 0
+        half* gpu0_buf       = nullptr;   // [window * n_slots * hidden] ring on GPU 0
+        half* unwrap         = nullptr;   // [window * n_slots * hidden] contiguous scratch (only used when the window wraps)
         half* staging[4]     = {};        // per-GPU [hidden] fp16 staging
         half* host_pinned    = nullptr;   // [hidden] pinned host bridge
         int   max_ctx        = 0;
+        int   window         = 0;         // C ring size = drafter context window (== max_ctx when not windowed, e.g. extract)
         int   n_slots        = 0;
         int   layer_to_slot[256] = {};    // -1 if layer is not captured
         bool  enabled        = false;
@@ -409,9 +411,19 @@ struct QwenModel {
     };
     DFlashCapture dflash_cap;
 
-    void init_dflash_capture(int max_ctx_tokens, const int* layer_ids, int n_layers) {
+    // window<=0 -> no windowing (ring size == max_ctx; used by the offline
+    // extract path). window>0 and < max_ctx -> the C buffer is a ring of `window`
+    // tokens: the drafter only ever conditions on the most-recent `window` context
+    // features. This bounds the GPU-0 buffer (max_ctx=256K would be 13 GB fp16) AND
+    // keeps the drafter's RoPE positions / context length inside its trained range
+    // (the drafter was trained on ~2 K sequences). Lossless vs the 27B greedy — the
+    // verify is unchanged; only how much *draft context* the small model sees changes.
+    void init_dflash_capture(int max_ctx_tokens, const int* layer_ids, int n_layers,
+                             int window = -1) {
         int H = cfg.hidden_size;
+        int W = (window > 0 && window < max_ctx_tokens) ? window : max_ctx_tokens;
         dflash_cap.max_ctx = max_ctx_tokens;
+        dflash_cap.window  = W;
         dflash_cap.n_slots = n_layers;
         for (int i = 0; i < 256; i++) dflash_cap.layer_to_slot[i] = -1;
         for (int slot = 0; slot < n_layers; slot++) {
@@ -420,9 +432,12 @@ struct QwenModel {
                 dflash_cap.layer_to_slot[L] = slot;
         }
         cudaSetDevice(0);
-        size_t buf_bytes = (size_t)max_ctx_tokens * n_layers * H * sizeof(half);
+        size_t buf_bytes = (size_t)W * n_layers * H * sizeof(half);
         cudaMalloc(&dflash_cap.gpu0_buf, buf_bytes);
         cudaMemset(dflash_cap.gpu0_buf, 0, buf_bytes);
+        if (W < max_ctx_tokens) {   // windowed: need an unwrap scratch for wrapped reads
+            cudaMalloc(&dflash_cap.unwrap, buf_bytes);
+        }
         cudaMallocHost(&dflash_cap.host_pinned, H * sizeof(half));
         for (int g = 0; g < gpu->num_gpus; g++) {
             cudaSetDevice(g);
@@ -430,8 +445,33 @@ struct QwenModel {
         }
         cudaSetDevice(0);
         dflash_cap.enabled = true;
-        printf("[dflash-capture] enabled, max_ctx=%d slots=%d buf=%.1f MB\n",
-               max_ctx_tokens, n_layers, buf_bytes / 1024.0 / 1024.0);
+        printf("[dflash-capture] enabled, max_ctx=%d window=%d slots=%d buf=%.1f MB%s\n",
+               max_ctx_tokens, W, n_layers, buf_bytes / 1024.0 / 1024.0,
+               W < max_ctx_tokens ? " (windowed ring)" : "");
+    }
+
+    // Return a contiguous [ctx_used * n_slots * H] fp16 view of the C ring covering
+    // chronological positions [last_pos-ctx_used+1 .. last_pos]. No copy when the
+    // window is contiguous in the ring (the common case); 2 D2D copies on wrap.
+    const half* dflash_window_view(int last_pos, int ctx_used, cudaStream_t stream = 0) {
+        int W = dflash_cap.window, n = dflash_cap.n_slots, H = cfg.hidden_size;
+        if (W >= dflash_cap.max_ctx || last_pos < W) {
+            // not windowed, or the whole history still fits linearly before the first
+            // wrap (positions [0..last_pos] are at gpu0_buf[0..last_pos], chronological).
+            return dflash_cap.gpu0_buf;
+        }
+        int oldest = last_pos - ctx_used + 1;
+        int ring_start = ((oldest % W) + W) % W;
+        if (ring_start + ctx_used <= W) {
+            return dflash_cap.gpu0_buf + (size_t)ring_start * n * H;   // contiguous slice — no copy
+        }
+        cudaSetDevice(0);
+        int first = W - ring_start;
+        cudaMemcpyAsync(dflash_cap.unwrap, dflash_cap.gpu0_buf + (size_t)ring_start * n * H,
+                        (size_t)first * n * H * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(dflash_cap.unwrap + (size_t)first * n * H, dflash_cap.gpu0_buf,
+                        (size_t)(ctx_used - first) * n * H * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+        return dflash_cap.unwrap;
     }
 
     // Allocate tree-mode scratch for batched verify capture. Call once after
@@ -503,10 +543,9 @@ struct QwenModel {
             for (int i = 0; i < accept_len; i++) {
                 int tree_slot = host_slots[i];
                 if (tree_slot < 0 || tree_slot >= dflash_cap.tree_capacity) continue;
-                if (ctx_pos + i >= dflash_cap.max_ctx) break;
                 half* src = scratch_layer + (size_t)tree_slot * H;
                 half* dst = dflash_cap.gpu0_buf
-                          + ((size_t)(ctx_pos + i) * dflash_cap.n_slots + slot_idx) * H;
+                          + ((size_t)((ctx_pos + i) % dflash_cap.window) * dflash_cap.n_slots + slot_idx) * H;
                 cudaMemcpyAsync(dst, src, H * sizeof(half),
                                 cudaMemcpyDeviceToDevice, 0);
             }
@@ -544,7 +583,7 @@ struct QwenModel {
         float_to_half_kernel<<<(H+255)/256, 256, 0, stream>>>(h_fp32, stg, H);
 
         half* dst = dflash_cap.gpu0_buf
-                  + ((size_t)token_pos * dflash_cap.n_slots + slot) * H;
+                  + ((size_t)(token_pos % dflash_cap.window) * dflash_cap.n_slots + slot) * H;
         if (src_gpu == 0) {
             cudaMemcpyAsync(dst, stg, H * sizeof(half),
                             cudaMemcpyDeviceToDevice, stream);
