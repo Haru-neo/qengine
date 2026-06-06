@@ -2109,6 +2109,353 @@ __global__ void flash_attn_chunk_fused_split_tq3(
     }
 }
 
+// ============ Block-sparse Split-K FA + cooperative TQ3 decode ============
+// Identical body to flash_attn_chunk_fused_split_tq3, but instead of scanning
+// the contiguous causal range [0, active_end_t) the kernel iterates ONLY the
+// per-(kv_head, t_idx) top-k position-blocks listed in `block_index` (units of
+// `block_size_n` tokens, sorted ascending, -1 sentinel). This makes the
+// long-context verify O(top_k · block_size_n) TQ-decodes instead of O(context),
+// WITHOUT the far-middle recall loss of the fixed sink+window heuristic — the
+// blocks are chosen by content (MS: max(Q·mean, β·Q·maxabs), the same selector
+// the prefill path uses and which preserves single-token needles). The split
+// axis (blockIdx.z) now partitions the top_k blocks, not contiguous tiles; the
+// existing flash_attn_split_merge combines the partials unchanged.
+//
+// block_index row stride is sub_n_max (matches build_block_index_ms_kern's
+// write), so a chain of N<sub_n_max queries reads the right rows.
+template<int HD, int GQA, int BM, int BLOCK, int K_SPLITS>
+__global__ void flash_attn_chunk_block_sparse_split_tq3(
+    const half*       __restrict__ q_chunk,
+    const block_tq3*  __restrict__ k_tq,
+    const block_tq3*  __restrict__ v_tq,
+    const int*        __restrict__ block_index,
+    float*            __restrict__ part_m,
+    float*            __restrict__ part_l,
+    float*            __restrict__ part_o,
+    int num_q, int num_kv,
+    int start_pos, int sub_n, int sub_n_max,
+    float scale, int top_k, int block_size_n
+) {
+    static_assert(HD % TQ_BLOCK_SIZE == 0, "HD must be multiple of 128");
+    constexpr int N_WARPS         = BLOCK / 32;
+    constexpr int LANE_D          = HD / 32;
+    constexpr int BLOCKS_PER_KV   = HD / TQ_BLOCK_SIZE;     // 2 for HD=256
+    constexpr int K_DEC_BLOCKS    = BM * BLOCKS_PER_KV;     // 64 for BM=32
+    constexpr int TOTAL_DEC_BLOCKS = 2 * K_DEC_BLOCKS;       // K + V
+    int kv_head    = blockIdx.x;
+    int t_idx      = blockIdx.y;
+    int split_idx  = blockIdx.z;
+    if (t_idx >= sub_n) return;
+    int abs_pos       = start_pos + t_idx;
+    int active_end_t  = abs_pos + 1;
+    int tid  = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+
+    // Partition the top_k selected blocks across K_SPLITS (mirrors the fp16
+    // block-sparse kernel). Each split owns [tk_lo, tk_hi) of the block list.
+    int per_split = (top_k + K_SPLITS - 1) / K_SPLITS;
+    int tk_lo = split_idx * per_split;
+    int tk_hi = min((split_idx + 1) * per_split, top_k);
+    const int* bi_row = block_index + ((size_t)kv_head * sub_n_max + t_idx) * top_k;
+    int inner_per_block = block_size_n / BM;   // tiles per selected block
+
+    extern __shared__ unsigned char smem_fa_bsp_tq[];
+    half*  q_s    = (half*)smem_fa_bsp_tq;
+    half*  k_tile = q_s    + GQA * HD;
+    half*  v_tile = k_tile + BM  * HD;
+    float* s_smem = (float*)(v_tile + BM * HD);
+
+    // Load Q (same as base).
+    #pragma unroll
+    for (int i = tid; i < GQA * HD; i += BLOCK) {
+        int g = i / HD;
+        int c = i - g * HD;
+        int q_head = kv_head * GQA + g;
+        q_s[g * HD + c] = q_chunk[(size_t)t_idx * num_q * HD
+                                  + (size_t)q_head * HD + c];
+    }
+    __syncthreads();
+
+    float acc_o[LANE_D];
+    #pragma unroll
+    for (int i = 0; i < LANE_D; i++) acc_o[i] = 0.0f;
+    float m_w = -INFINITY;
+    float l_w = 0.0f;
+    unsigned long long ph0=0, ph1=0, ph2=0, ph3=0, tile_cnt=0;
+
+    if (tk_lo < tk_hi) {
+        const float wht_scale = rsqrtf((float)TQ_BLOCK_SIZE);
+        for (int tk = tk_lo; tk < tk_hi; tk++) {
+            int blk = bi_row[tk];
+            if (blk < 0) break;                  // sentinel — no more blocks
+            int outer_start = blk * block_size_n;
+            for (int inner = 0; inner < inner_per_block; inner++) {
+                int tile_start = outer_start + inner * BM;
+                if (tile_start > abs_pos) break;       // past causal cap
+                int tile_end = min(tile_start + BM, active_end_t);
+                int tile_len = tile_end - tile_start;
+                if (tile_len <= 0) continue;
+
+                unsigned long long t0_t=0, t1_t=0, t2_t=0, t3_t=0, t4_t=0;
+                if (tid == 0) t0_t = clock64();
+
+                // ===== Cooperative TQ3 decode of K + V tile (identical body) =====
+                for (int blk_iter = warp; blk_iter < TOTAL_DEC_BLOCKS; blk_iter += N_WARPS) {
+                    bool is_v = (blk_iter >= K_DEC_BLOCKS);
+                    int b      = is_v ? (blk_iter - K_DEC_BLOCKS) : blk_iter;
+                    int row    = b / BLOCKS_PER_KV;
+                    int col_block = b - row * BLOCKS_PER_KV;
+                    int abs_row = tile_start + row;
+                    half* tile_dst = (is_v ? v_tile : k_tile)
+                                   + row * HD + col_block * TQ_BLOCK_SIZE;
+                    if (abs_row >= tile_end) {
+                        #pragma unroll
+                        for (int i = 0; i < 4; i++)
+                            tile_dst[lane * 4 + i] = __float2half(0.0f);
+                        continue;
+                    }
+                    size_t blk_idx = ((size_t)abs_row * num_kv + kv_head) * BLOCKS_PER_KV
+                                   + col_block;
+                    const block_tq3* blk_p = (is_v ? v_tq : k_tq) + blk_idx;
+
+                    int base_elem = lane * 4;
+                    float v[4];
+                    #pragma unroll
+                    for (int i = 0; i < 4; i++) {
+                        int elem        = base_elem + i;
+                        int bit_off     = elem * 3;
+                        int byte_off    = bit_off >> 3;
+                        int bit_in_byte = bit_off & 7;
+                        uint16_t two = (uint16_t)blk_p->qs[byte_off]
+                                     | ((uint16_t)blk_p->qs[byte_off + 1] << 8);
+                        uint8_t idx = (two >> bit_in_byte) & 0x7;
+                        v[i] = d_tq3_centroids[idx];
+                    }
+                    { float a=v[0], bb=v[1]; v[0]=a+bb; v[1]=a-bb; }
+                    { float a=v[2], bb=v[3]; v[2]=a+bb; v[3]=a-bb; }
+                    { float a=v[0], bb=v[2]; v[0]=a+bb; v[2]=a-bb; }
+                    { float a=v[1], bb=v[3]; v[1]=a+bb; v[3]=a-bb; }
+                    #pragma unroll
+                    for (int step = 4; step <= 64; step <<= 1) {
+                        int xor_off = step >> 2;
+                        int upper   = (lane & xor_off) ? 1 : 0;
+                        #pragma unroll
+                        for (int i = 0; i < 4; i++) {
+                            float other = __shfl_xor_sync(0xffffffff, v[i], xor_off);
+                            v[i] = upper ? (other - v[i]) : (v[i] + other);
+                        }
+                    }
+                    #pragma unroll
+                    for (int i = 0; i < 4; i++) v[i] *= wht_scale;
+                    #pragma unroll
+                    for (int i = 0; i < 4; i++)
+                        v[i] *= d_tq3_signs[base_elem + i];
+                    float norm = blk_p->norm;
+                    #pragma unroll
+                    for (int i = 0; i < 4; i++) v[i] *= norm;
+                    #pragma unroll
+                    for (int i = 0; i < 4; i++)
+                        tile_dst[base_elem + i] = __float2half(v[i]);
+                }
+                __syncthreads();
+                if (tid == 0) { t1_t = clock64(); ph0 += t1_t - t0_t; }
+
+                // ===== Score compute (identical) =====
+                constexpr int NITERS = (GQA * BM + N_WARPS - 1) / N_WARPS;
+                #pragma unroll
+                for (int k_it = 0; k_it < NITERS; k_it++) {
+                    int flat = warp + k_it * N_WARPS;
+                    if (flat >= GQA * BM) break;
+                    int g = flat / BM;
+                    int r = flat - g * BM;
+                    float partial = 0.0f;
+                    const half2* qs2 = reinterpret_cast<const half2*>(q_s    + g * HD);
+                    const half2* kt2 = reinterpret_cast<const half2*>(k_tile + r * HD);
+                    #pragma unroll
+                    for (int i = 0; i < LANE_D / 2; i++) {
+                        half2 qv = qs2[lane * (LANE_D / 2) + i];
+                        half2 kv = kt2[lane * (LANE_D / 2) + i];
+                        float2 qf = __half22float2(qv);
+                        float2 kf = __half22float2(kv);
+                        partial += qf.x * kf.x + qf.y * kf.y;
+                    }
+                    #pragma unroll
+                    for (int off = 16; off > 0; off >>= 1)
+                        partial += __shfl_xor_sync(0xffffffff, partial, off);
+                    if (lane == 0) {
+                        float val = (r < tile_len) ? partial * scale : -INFINITY;
+                        s_smem[g * BM + r] = val;
+                    }
+                }
+                __syncthreads();
+                if (tid == 0) { t2_t = clock64(); ph1 += t2_t - t1_t; }
+
+                // ===== Softmax + O accumulation (identical) =====
+                if (warp < GQA) {
+                    int g = warp;
+                    float s_val = s_smem[g * BM + lane];
+                    float m_row = s_val;
+                    #pragma unroll
+                    for (int off = 16; off > 0; off >>= 1)
+                        m_row = fmaxf(m_row, __shfl_xor_sync(0xffffffff, m_row, off));
+                    float m_new = fmaxf(m_w, m_row);
+                    float correction = expf(m_w - m_new);
+                    float p_lane    = expf(s_val - m_new);
+                    float sum_p = p_lane;
+                    #pragma unroll
+                    for (int off = 16; off > 0; off >>= 1)
+                        sum_p += __shfl_xor_sync(0xffffffff, sum_p, off);
+                    #pragma unroll
+                    for (int i = 0; i < LANE_D; i++) acc_o[i] *= correction;
+                    l_w = l_w * correction + sum_p;
+                    if (tid == 0) { t3_t = clock64(); ph2 += t3_t - t2_t; }
+                    #pragma unroll
+                    for (int r = 0; r < BM; r++) {
+                        float p_r = __shfl_sync(0xffffffff, p_lane, r);
+                        const half2* vt = reinterpret_cast<const half2*>(
+                            v_tile + r * HD + lane * LANE_D);
+                        #pragma unroll
+                        for (int i = 0; i < LANE_D / 2; i++) {
+                            half2 vv = vt[i];
+                            float2 vf = __half22float2(vv);
+                            acc_o[i * 2]     += p_r * vf.x;
+                            acc_o[i * 2 + 1] += p_r * vf.y;
+                        }
+                    }
+                    m_w = m_new;
+                }
+                __syncthreads();
+                if (tid == 0) { t4_t = clock64(); ph3 += t4_t - t3_t; tile_cnt++; }
+            }
+        }
+    }
+    if (tid == 0) {
+        atomicAdd(&g_fa_phase_cyc[0], ph0);
+        atomicAdd(&g_fa_phase_cyc[1], ph1);
+        atomicAdd(&g_fa_phase_cyc[2], ph2);
+        atomicAdd(&g_fa_phase_cyc[3], ph3);
+        atomicAdd(&g_fa_phase_cyc[4], tile_cnt);
+    }
+
+    // Write partial outputs (identical to base split kernel).
+    if (warp < GQA) {
+        int g = warp;
+        int q_head = kv_head * GQA + g;
+        size_t ml_idx = ((size_t)q_head * sub_n_max + t_idx) * K_SPLITS + split_idx;
+        if (lane == 0) {
+            part_m[ml_idx] = m_w;
+            part_l[ml_idx] = l_w;
+        }
+        size_t o_base = (((size_t)q_head * sub_n_max + t_idx) * K_SPLITS + split_idx) * HD;
+        #pragma unroll
+        for (int i = 0; i < LANE_D; i++) {
+            int c = lane * LANE_D + i;
+            part_o[o_base + c] = acc_o[i];
+        }
+    }
+}
+
+// ============ Incremental MS K-pool builder for the TQ3 verify ============
+// Decodes a range of position-blocks [blk_lo, blk_hi) of the TQ3 K cache and
+// writes per-block mean and signed-max-abs signatures into persistent fp16
+// pools (layout [num_kv, n_blocks_stride, HD], matching build_k_pool_kern /
+// build_k_pool_max_kern). One thread block per (kv_head, n_block); decode the
+// ≤block_size_n positions cooperatively into shared memory, then reduce over
+// positions. Called incrementally at decode (only the newest 1-2 blocks change
+// per step), with a one-time full build covering the prefilled context.
+//
+// block_size_n must be <= 64 (smem K buffer is sized block_size_n × HD halves).
+template<int HD, int BLOCK>
+__global__ void tq3_kpool_ms_update_kern(
+    const block_tq3* __restrict__ k_tq,     // slot-base TQ3 K cache
+    half*            __restrict__ k_pool,     // [num_kv, n_blocks_stride, HD] mean
+    half*            __restrict__ k_pool_max, // [num_kv, n_blocks_stride, HD] maxabs
+    int num_kv, int total_kv,
+    int blk_lo, int n_blocks_stride, int block_size_n)
+{
+    constexpr int BLOCKS_PER_KV = HD / TQ_BLOCK_SIZE;     // 2 for HD=256
+    int kv_head = blockIdx.x;
+    int n_block = blk_lo + blockIdx.y;
+    int tid  = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    constexpr int N_WARPS = BLOCK / 32;
+
+    int t_lo = n_block * block_size_n;
+    int t_hi = min(t_lo + block_size_n, total_kv);
+    size_t out_base = ((size_t)kv_head * n_blocks_stride + n_block) * HD;
+    if (t_lo >= t_hi) {
+        for (int c = tid; c < HD; c += BLOCK) {
+            k_pool[out_base + c]     = __float2half(0.0f);
+            k_pool_max[out_base + c] = __float2half(0.0f);
+        }
+        return;
+    }
+    int n_pos = t_hi - t_lo;
+
+    // Decode all n_pos positions' K into shared memory: kbuf[pos_local][HD].
+    extern __shared__ half kbuf[];   // block_size_n * HD halves
+    const float wht_scale = rsqrtf((float)TQ_BLOCK_SIZE);
+    int total_blocks = n_pos * BLOCKS_PER_KV;   // (pos, col_block) decode units
+    for (int u = warp; u < total_blocks; u += N_WARPS) {
+        int pos_local = u / BLOCKS_PER_KV;
+        int col_block = u - pos_local * BLOCKS_PER_KV;
+        int abs_row   = t_lo + pos_local;
+        size_t blk_idx = ((size_t)abs_row * num_kv + kv_head) * BLOCKS_PER_KV + col_block;
+        const block_tq3* blk_p = k_tq + blk_idx;
+        int base_elem = lane * 4;
+        float v[4];
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int elem = base_elem + i;
+            int bit_off = elem * 3;
+            int byte_off = bit_off >> 3;
+            int bit_in_byte = bit_off & 7;
+            uint16_t two = (uint16_t)blk_p->qs[byte_off]
+                         | ((uint16_t)blk_p->qs[byte_off + 1] << 8);
+            uint8_t idx = (two >> bit_in_byte) & 0x7;
+            v[i] = d_tq3_centroids[idx];
+        }
+        { float a=v[0], bb=v[1]; v[0]=a+bb; v[1]=a-bb; }
+        { float a=v[2], bb=v[3]; v[2]=a+bb; v[3]=a-bb; }
+        { float a=v[0], bb=v[2]; v[0]=a+bb; v[2]=a-bb; }
+        { float a=v[1], bb=v[3]; v[1]=a+bb; v[3]=a-bb; }
+        #pragma unroll
+        for (int step = 4; step <= 64; step <<= 1) {
+            int xor_off = step >> 2;
+            int upper   = (lane & xor_off) ? 1 : 0;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                float other = __shfl_xor_sync(0xffffffff, v[i], xor_off);
+                v[i] = upper ? (other - v[i]) : (v[i] + other);
+            }
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; i++) v[i] *= wht_scale;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) v[i] *= d_tq3_signs[base_elem + i];
+        float norm = blk_p->norm;
+        half* dst = kbuf + pos_local * HD + col_block * TQ_BLOCK_SIZE;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) dst[base_elem + i] = __float2half(v[i] * norm);
+    }
+    __syncthreads();
+
+    // Reduce over positions: per dim c, mean and signed-max-abs.
+    for (int c = tid; c < HD; c += BLOCK) {
+        float sum = 0.0f, best_mag = 0.0f, best_val = 0.0f;
+        for (int p = 0; p < n_pos; p++) {
+            float x = __half2float(kbuf[p * HD + c]);
+            sum += x;
+            float m = fabsf(x);
+            if (m > best_mag) { best_mag = m; best_val = x; }
+        }
+        k_pool[out_base + c]     = __float2half(sum / (float)n_pos);
+        k_pool_max[out_base + c] = __float2half(best_val);
+    }
+}
+
 // ===========================================================
 // Q8_0 KV cache quantize / decode helpers
 // ===========================================================

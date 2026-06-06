@@ -1569,6 +1569,22 @@ struct QwenModel {
     struct FP16DecCache { half* k = nullptr; half* v = nullptr; };
     std::unordered_map<int, FP16DecCache> fp16_dec_caches;
     bool fp16_dec_cache_on = false;
+    // ===== MS-block-sparse verify K-pool (DFLASH_VERIFY_BLOCKSPARSE=1) =====
+    // Per-attn-layer persistent mean + signed-max-abs K signatures over 64-token
+    // position-blocks. Lets the DFlash TQ verify attend only the content-selected
+    // top-k blocks (MS selector, same as prefill) → O(top_k·64) TQ-decodes per
+    // verify instead of O(context), losslessly (keeps single-token needles that
+    // sink+window drops). Pools live on the layer's GPU; fixed stride n_blocks_max
+    // so incremental growth never moves existing signatures. pooled_pos = leading
+    // positions already folded into FROZEN (complete) blocks; the current partial
+    // block is rebuilt every step. Reset to 0 on any KV reset.
+    struct VerifyKPool {
+        half* k_pool     = nullptr;   // [num_kv, n_blocks_max, HD] mean
+        half* k_pool_max = nullptr;   // [num_kv, n_blocks_max, HD] signed max-abs
+        int   n_blocks_max = 0;
+        int   pooled_pos   = 0;
+    };
+    std::unordered_map<int, VerifyKPool> verify_kpool;
     // ============ Q8_0 KV cache (Q8KV=1) ============
     // Alternative to the TurboQuant path for hardware that can't run the
     // cooperative TQ3 decode (Walsh-Hadamard + cross-warp shuffle) at
@@ -1748,6 +1764,7 @@ struct QwenModel {
     }
 
     void reset_kv_cache() {
+        for (auto& kv : verify_kpool) kv.second.pooled_pos = 0;  // invalidate MS verify pool
         int num_kv = cfg.num_kv_heads;
         int hd = cfg.head_dim;
         int kv_dim = num_kv * hd;
@@ -1794,6 +1811,7 @@ struct QwenModel {
     // Reset only slot s's KV range. Cheaper than full reset when num_slots > 1.
     void reset_kv_slot(int slot) {
         if (slot < 0 || slot >= num_slots) return;
+        for (auto& kv : verify_kpool) kv.second.pooled_pos = 0;  // invalidate MS verify pool
         int num_kv = cfg.num_kv_heads, hd = cfg.head_dim;
         int kv_dim = num_kv * hd;
         if (use_q8_kv) {
@@ -3867,7 +3885,79 @@ struct QwenModel {
                 if (!e || atoi(e)==0) return 0; const char* s=getenv("DFLASH_VERIFY_SINK"); return s?atoi(s):256; }();
             static const int vwin  = []{ const char* e=getenv("DFLASH_VERIFY_SPARSE");
                 if (!e || atoi(e)==0) return 0; const char* w=getenv("DFLASH_VERIFY_WINDOW"); return w?atoi(w):4096; }();
-            if (num_q == 24) {
+            // ===== MS-block-sparse verify (DFLASH_VERIFY_BLOCKSPARSE=1) =====
+            // Content-selected top-k 64-token blocks (same MS selector the prefill
+            // path uses) → O(top_k·64) TQ-decodes per verify instead of O(context),
+            // keeping the needle blocks sink+window would drop. Per-layer MS K-pool
+            // (verify_kpool) is grown incrementally: rebuild [first-unfrozen-block ..
+            // newest], then freeze all complete blocks.
+            static const bool  vbs_on   = []{ const char* e=getenv("DFLASH_VERIFY_BLOCKSPARSE"); return e && atoi(e)!=0; }();
+            static const float vbs_bud  = []{ const char* e=getenv("DFLASH_VERIFY_BUDGET"); return e?(float)atof(e):0.10f; }();
+            static const int   vbs_tk   = []{ const char* e=getenv("DFLASH_VERIFY_TOPK"); return e?atoi(e):0; }();
+            static const float vbs_beta = []{ const char* e=getenv("MINF_MS_BETA"); return e?(float)atof(e):0.5f; }();
+            if (vbs_on) {
+                constexpr int BLOCK_N = 64;
+                int total_kv   = pos_base + N;                     // causal end
+                int cur_blocks = (total_kv + BLOCK_N - 1) / BLOCK_N;
+                auto& vp = verify_kpool[layer];
+                if (vp.k_pool == nullptr) {
+                    vp.n_blocks_max = (slot_capacity(slot_s) + BLOCK_N - 1) / BLOCK_N;
+                    size_t pe = (size_t)num_kv * vp.n_blocks_max * HD;
+                    cudaMalloc(&vp.k_pool,     pe * sizeof(half));
+                    cudaMalloc(&vp.k_pool_max, pe * sizeof(half));
+                    vp.pooled_pos = 0;
+                }
+                if (!ab.sparse_block_index) {
+                    cudaMalloc(&ab.sparse_block_index,
+                               (size_t)num_kv * ATTN_NB * 64 * sizeof(int));
+                }
+                // (re)build pool from first not-yet-frozen block to the newest.
+                int blk_lo = vp.pooled_pos / BLOCK_N;
+                if (cur_blocks > blk_lo) {
+                    dim3 pg(num_kv, cur_blocks - blk_lo);
+                    int pool_smem = BLOCK_N * HD * sizeof(half);
+                    tq3_kpool_ms_update_kern<HD, 256><<<pg, 256, pool_smem, stream>>>(
+                        tq_k_slot, vp.k_pool, vp.k_pool_max, num_kv, total_kv,
+                        blk_lo, vp.n_blocks_max, BLOCK_N);
+                }
+                vp.pooled_pos = (cur_blocks > 0 ? cur_blocks - 1 : 0) * BLOCK_N;
+                // top-k blocks (budget-scaled, capped at the 64-block buffer).
+                int top_k = vbs_tk > 0 ? vbs_tk : (int)(cur_blocks * vbs_bud);
+                if (top_k < 1) top_k = 1;
+                if (top_k > 64) top_k = 64;
+                if (top_k > cur_blocks) top_k = cur_blocks;
+                dim3 bi_grid(num_kv, N);
+                size_t bi_smem = HD * sizeof(half) + (size_t)cur_blocks * sizeof(float);
+                if (num_q == 24) {
+                    constexpr int GQA = 6;
+                    build_block_index_ms_kern<HD, GQA, BLOCK><<<bi_grid, BLOCK, bi_smem, stream>>>(
+                        ab.attn_chunk_q_post, vp.k_pool, vp.k_pool_max, ab.sparse_block_index,
+                        num_q, num_kv, N, ATTN_NB, pos_base, top_k, BLOCK_N, cur_blocks,
+                        vp.n_blocks_max, vbs_beta);
+                    flash_attn_chunk_block_sparse_split_tq3<HD, GQA, BM, BLOCK, K_SPLITS>
+                        <<<fg, BLOCK, smem24, stream>>>(
+                            ab.attn_chunk_q_post, tq_k_slot, tq_v_slot, ab.sparse_block_index,
+                            ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
+                            num_q, num_kv, pos_base, N, ATTN_NB, scale, top_k, BLOCK_N);
+                    flash_attn_split_merge<HD, GQA, BLOCK, K_SPLITS><<<mg, BLOCK, 0, stream>>>(
+                        ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
+                        ab.attn_chunk_out, num_q, N, ATTN_NB);
+                } else {
+                    constexpr int GQA = 4;
+                    build_block_index_ms_kern<HD, GQA, BLOCK><<<bi_grid, BLOCK, bi_smem, stream>>>(
+                        ab.attn_chunk_q_post, vp.k_pool, vp.k_pool_max, ab.sparse_block_index,
+                        num_q, num_kv, N, ATTN_NB, pos_base, top_k, BLOCK_N, cur_blocks,
+                        vp.n_blocks_max, vbs_beta);
+                    flash_attn_chunk_block_sparse_split_tq3<HD, GQA, BM, BLOCK, K_SPLITS>
+                        <<<fg, BLOCK, smem16, stream>>>(
+                            ab.attn_chunk_q_post, tq_k_slot, tq_v_slot, ab.sparse_block_index,
+                            ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
+                            num_q, num_kv, pos_base, N, ATTN_NB, scale, top_k, BLOCK_N);
+                    flash_attn_split_merge<HD, GQA, BLOCK, K_SPLITS><<<mg, BLOCK, 0, stream>>>(
+                        ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
+                        ab.attn_chunk_out, num_q, N, ATTN_NB);
+                }
+            } else if (num_q == 24) {
                 constexpr int GQA = 6;
                 flash_attn_chunk_fused_split_tq3<HD, GQA, BM, BLOCK, K_SPLITS>
                     <<<fg, BLOCK, smem24, stream>>>(
@@ -4618,14 +4708,14 @@ struct QwenModel {
                                             q_post_sub, ab.sparse_k_pool, ab.sparse_k_pool_max,
                                             ab.sparse_block_index,
                                             num_q, num_kv, sub_n, ATTN_NB, sub_start_pos,
-                                            top_k, BLOCK_N, n_blocks, ms_beta);
+                                            top_k, BLOCK_N, n_blocks, n_blocks, ms_beta);
                                 } else {
                                     build_block_index_ms_kern<HD, 4, BLOCK_THR>
                                         <<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
                                             q_post_sub, ab.sparse_k_pool, ab.sparse_k_pool_max,
                                             ab.sparse_block_index,
                                             num_q, num_kv, sub_n, ATTN_NB, sub_start_pos,
-                                            top_k, BLOCK_N, n_blocks, ms_beta);
+                                            top_k, BLOCK_N, n_blocks, n_blocks, ms_beta);
                                 }
                                 check_launch("build_block_index_ms");
                             } else if (num_q == 24) {

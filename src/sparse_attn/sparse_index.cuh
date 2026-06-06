@@ -221,6 +221,7 @@ __global__ void build_block_index_ms_kern(
     int  sub_n, int sub_n_max,
     int  start_pos, int top_k,
     int  block_size_n, int n_blocks,
+    int  n_blocks_stride,   // pool alloc stride (>= n_blocks); == n_blocks for prefill
     float beta_max)
 {
     int kv_head = blockIdx.x;
@@ -250,8 +251,8 @@ __global__ void build_block_index_ms_kern(
 
     // 2. Score every n_block: max(Q·mean, β·Q·max_abs).
     for (int n = tid; n < n_blocks; n += BLOCK) {
-        const half* kp_mean = k_pool      + ((size_t)kv_head * n_blocks + n) * HD;
-        const half* kp_maxa = k_pool_max  + ((size_t)kv_head * n_blocks + n) * HD;
+        const half* kp_mean = k_pool      + ((size_t)kv_head * n_blocks_stride + n) * HD;
+        const half* kp_maxa = k_pool_max  + ((size_t)kv_head * n_blocks_stride + n) * HD;
         float s_mean = 0.0f;
         float s_maxa = 0.0f;
         const half2* qa2 = reinterpret_cast<const half2*>(q_avg);
