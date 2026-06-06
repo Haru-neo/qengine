@@ -762,7 +762,7 @@ struct MTPHead {
 
         // 5g. attention: Q @ K^T → softmax → @ V
         float scale = rsqrtf((float)head_dim);
-        dim3 score_grid(num_q, seq_len);
+        dim3 score_grid = score_pos_grid(num_q, seq_len);
         attn_score_kernel_h<<<score_grid, min(head_dim, 256), 0, stream>>>(
             q_tmp, kv_k, attn_scores, num_q, num_kv, head_dim, seq_len, scale);
         { int st = 1; while (st < seq_len && st < 256) st <<= 1;

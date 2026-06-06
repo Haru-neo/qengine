@@ -2288,7 +2288,7 @@ struct QwenModel {
             }
             attn_dump_h("fa_out", q_buf);
         } else {
-            dim3 score_grid(num_q, seq_len);
+            dim3 score_grid = score_pos_grid(num_q, seq_len);
             static const bool tq_fused = getenv("TQ_FUSED") != nullptr;
             // Q8 path: bulk-dequant K/V into the per-GPU fp16 scratch and
             // run the standard attn_score_kernel_h / attn_value_kernel_h.
@@ -2322,7 +2322,7 @@ struct QwenModel {
                 size_t slot_off_blocks_int = kv_slot_offset(slot) * (size_t)tq.blocks_per_token;
                 block_tq3* tq_k_slot = tq.k + slot_off_blocks_int;
                 if (tq_fused) {
-                    dim3 tq_score_grid(num_kv, seq_len);
+                    dim3 tq_score_grid = score_pos_grid(num_kv, seq_len);
                     int smem_bytes = hd * sizeof(float);
                     attn_score_kernel_tq3<<<tq_score_grid, hd, smem_bytes, stream>>>(
                         q_buf, tq_k_slot, ab.attn_scores,
@@ -3911,7 +3911,7 @@ struct QwenModel {
                 half*  k_slot  = kv.k + kv_slot_offset(slot_i) * kv_dim;
                 half*  v_slot  = kv.v + kv_slot_offset(slot_i) * kv_dim;
 
-                dim3 score_grid(num_q, seq_len);
+                dim3 score_grid = score_pos_grid(num_q, seq_len);
                 attn_score_kernel_h<<<score_grid, std::min(hd, 256), 0, stream>>>(
                     q_buf_i, k_slot, scores_i,
                     num_q, num_kv, hd, seq_len, scale);
@@ -4488,7 +4488,13 @@ struct QwenModel {
                     // K_pool + top-k. A_SHAPE → deterministic sink+window
                     // index. Both index builders feed the same
                     // flash_attn_chunk_block_sparse_split kernel.
-                    SparsePattern layer_pattern = SPARSE_BLOCK;  // default when no profile
+                    // Research knob: in uniform mode (no profile), force the
+                    // multi-signature (mean + max-abs) selector so a spiky
+                    // single-token needle survives mean-pool dilution. Default
+                    // off → SPARSE_BLOCK (mean-only), unchanged behavior.
+                    static const bool uniform_ms =
+                        getenv("MINF_UNIFORM_MS") && atoi(getenv("MINF_UNIFORM_MS")) != 0;
+                    SparsePattern layer_pattern = uniform_ms ? SPARSE_BLOCK_MS : SPARSE_BLOCK;
                     uint32_t a_sink   = 64;
                     uint32_t a_window = 1024;
                     if (sparse_rt.enabled && !sparse_rt.profile.empty()
@@ -4512,7 +4518,16 @@ struct QwenModel {
                         constexpr int BLOCK_THR  = 256;
                         int n_blocks = (sub_seq_total + BLOCK_N - 1) / BLOCK_N;
                         int top_k = max(1, (int)(n_blocks * sparse_rt.flops_budget));
-                        if (top_k > 64) top_k = 64;
+                        // Research knob: lift the top-k block cap (default 64).
+                        // At long ctx the needle block must rank in the top-k of
+                        // many distractors; more room helps recall. Buffer below
+                        // is sized to this same cap.
+                        static const int topk_cap = []{
+                            const char* e = getenv("MINF_TOPK_CAP");
+                            int v = e ? atoi(e) : 64;
+                            return v > 0 ? v : 64;
+                        }();
+                        if (top_k > topk_cap) top_k = topk_cap;
                         // Lazy alloc K_pool (per-layer, max-sized) + block_index
                         // (per-call, sub_n_max × top_k_max).
                         int n_blocks_max = (slot_max_seq + BLOCK_N - 1) / BLOCK_N;
@@ -4522,7 +4537,7 @@ struct QwenModel {
                         }
                         if (!ab.sparse_block_index) {
                             cudaMalloc(&ab.sparse_block_index,
-                                       (size_t)num_kv * ATTN_NB * 64 * sizeof(int));
+                                       (size_t)num_kv * ATTN_NB * topk_cap * sizeof(int));
                         }
                         // Launch-error tripwire. After every sparse kernel we
                         // peek at the last error so a fault that surfaces on
@@ -4977,7 +4992,7 @@ struct QwenModel {
             auto ts0 = pa_now();
             if (chunk_attn_fast) {
                 int smem_bytes = (hd + 8) * sizeof(float);
-                dim3 sg(num_kv, sub_seq_total);
+                dim3 sg = score_pos_grid(num_kv, sub_seq_total);
                 attn_score_kernel_h_chunk<<<sg, hd, smem_bytes, stream>>>(
                     q_post_sub, k_cache_ptr, scores_sub,
                     num_q, num_kv, hd, sub_seq_total, sub_start_pos, sub_n, scale,
@@ -5547,7 +5562,7 @@ struct QwenModel {
                 cudaMemcpyAsync(v_cache_pos, ab.v_proj, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
             }
             int seq_len = pos + 1;
-            dim3 score_grid(num_q, seq_len);
+            dim3 score_grid = score_pos_grid(num_q, seq_len);
             static const bool tq_fused = getenv("TQ_FUSED") != nullptr;
             // Pick fp16 source: legacy fp16 KV, fp16 mirror, or Q8 bulk-dequant
             // into the per-GPU scratch (re-used from the TQ chunked path).
@@ -5580,7 +5595,7 @@ struct QwenModel {
                 size_t slot_off_blocks_int = kv_slot_offset(slot) * (size_t)tq.blocks_per_token;
                 block_tq3* tq_k_slot = tq.k + slot_off_blocks_int;
                 if (tq_fused) {
-                    dim3 tq_score_grid(num_kv, seq_len);
+                    dim3 tq_score_grid = score_pos_grid(num_kv, seq_len);
                     int smem_bytes = hd * sizeof(float);
                     attn_score_kernel_tq3<<<tq_score_grid, hd, smem_bytes, stream>>>(
                         q_buf, tq_k_slot, ab.attn_scores,
@@ -5873,7 +5888,7 @@ struct QwenModel {
                 cudaMemcpyAsync(v_cache_pos, ab.v_proj, kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
             }
             int seq_len = pos + 1;
-            dim3 score_grid(num_q, seq_len);
+            dim3 score_grid = score_pos_grid(num_q, seq_len);
             static const bool tq_fused = getenv("TQ_FUSED") != nullptr;
             half* k_src_fp16 = nullptr;
             half* v_src_fp16 = nullptr;
@@ -5904,7 +5919,7 @@ struct QwenModel {
                 size_t slot_off_blocks_int = kv_slot_offset(slot) * (size_t)tq.blocks_per_token;
                 block_tq3* tq_k_slot = tq.k + slot_off_blocks_int;
                 if (tq_fused) {
-                    dim3 tq_score_grid(num_kv, seq_len);
+                    dim3 tq_score_grid = score_pos_grid(num_kv, seq_len);
                     int smem_bytes = hd * sizeof(float);
                     attn_score_kernel_tq3<<<tq_score_grid, hd, smem_bytes, stream>>>(
                         q_buf, tq_k_slot, ab.attn_scores,

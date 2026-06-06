@@ -258,6 +258,21 @@ __global__ void attn_score_kernel(
     }
 }
 
+// CUDA caps grid.y and grid.z at 65535. The per-token decode score kernels
+// below put the KV position on grid.y, so for context > 65535 the launch is
+// rejected (cudaErrorInvalidValue, "invalid argument") and the kernel silently
+// never runs — leaving stale scores → garbage at long context (the ~64K
+// long-context corruption bug). We tile the position over grid.y (tile size
+// kScoreYTile) and grid.z and reconstruct pos = blockIdx.y + blockIdx.z*tile
+// inside the kernel. Backward compatible: a 2-D launch (grid.z defaults to 1)
+// yields pos = blockIdx.y exactly as before, so untiled callers are unchanged.
+static constexpr int kScoreYTile = 32768;  // power-of-two, <= 65535
+static inline dim3 score_pos_grid(int xdim, int seq_len) {
+    int yt = seq_len < kScoreYTile ? seq_len : kScoreYTile;
+    int zt = (seq_len + kScoreYTile - 1) / kScoreYTile;
+    return dim3(xdim, yt, zt);
+}
+
 // FP16 K-cache variant (Gemma uses fp16 KV cache)
 __global__ void attn_score_kernel_h(
     const half* __restrict__ q,         // [num_q_heads * head_dim]
@@ -270,13 +285,13 @@ __global__ void attn_score_kernel_h(
     float scale
 ) {
     int q_head = blockIdx.x;
-    int pos = blockIdx.y;
+    int pos = blockIdx.y + blockIdx.z * kScoreYTile;
     if (q_head >= num_q_heads || pos >= seq_len) return;
 
     int kv_head = q_head / (num_q_heads / num_kv_heads);
 
     const half* qh = q + q_head * head_dim;
-    const half* kh = k_cache + pos * num_kv_heads * head_dim + kv_head * head_dim;
+    const half* kh = k_cache + (size_t)pos * num_kv_heads * head_dim + kv_head * head_dim;
 
     float sum = 0.0f;
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
@@ -320,7 +335,7 @@ __global__ void attn_score_kernel_h_tree_masked(
     uint32_t mask_bits
 ) {
     int q_head = blockIdx.x;
-    int pos = blockIdx.y;
+    int pos = blockIdx.y + blockIdx.z * kScoreYTile;
     if (q_head >= num_q_heads || pos >= seq_len) return;
 
     bool in_tree = (pos >= mask_start) && (pos < mask_start + mask_len);
@@ -328,7 +343,7 @@ __global__ void attn_score_kernel_h_tree_masked(
 
     int kv_head = q_head / (num_q_heads / num_kv_heads);
     const half* qh = q + q_head * head_dim;
-    const half* kh = k_cache + pos * num_kv_heads * head_dim + kv_head * head_dim;
+    const half* kh = k_cache + (size_t)pos * num_kv_heads * head_dim + kv_head * head_dim;
 
     float sum = 0.0f;
     if (!masked) {
@@ -373,7 +388,7 @@ __global__ void attn_score_kernel_tq3(
     int num_q_heads, int num_kv_heads, int head_dim, int seq_len, float scale
 ) {
     int kv_head = blockIdx.x;
-    int pos     = blockIdx.y;
+    int pos     = blockIdx.y + blockIdx.z * kScoreYTile;
     if (kv_head >= num_kv_heads || pos >= seq_len) return;
 
     int gqa                = num_q_heads / num_kv_heads;
@@ -672,7 +687,7 @@ __global__ void attn_score_kernel_h_chunk(
     // each score is owned by exactly one warp. Expected 5-8× speedup on the
     // score phase at 2071 tok.
     int kv_head = blockIdx.x;
-    int pos     = blockIdx.y;
+    int pos     = blockIdx.y + blockIdx.z * kScoreYTile;
     if (kv_head >= num_kv_heads || pos >= seq_len) return;
 
     int gqa = num_q_heads / num_kv_heads;
