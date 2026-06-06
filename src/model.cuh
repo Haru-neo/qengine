@@ -643,7 +643,7 @@ struct QwenModel {
         if (src_gpu == 0) {
             for (int i = 0; i < n_tokens; i++) {
                 half* dst = dflash_cap.gpu0_buf
-                          + ((size_t)(cb+i) * dflash_cap.n_slots + slot) * H;
+                          + ((size_t)((cb+i) % dflash_cap.window) * dflash_cap.n_slots + slot) * H;
                 cudaMemcpyAsync(dst, chunk_half + (size_t)i * H, H * sizeof(half),
                                 cudaMemcpyDeviceToDevice, stream);
             }
@@ -656,7 +656,7 @@ struct QwenModel {
             cudaSetDevice(0);
             for (int i = 0; i < n_tokens; i++) {
                 half* dst = dflash_cap.gpu0_buf
-                          + ((size_t)(cb+i) * dflash_cap.n_slots + slot) * H;
+                          + ((size_t)((cb+i) % dflash_cap.window) * dflash_cap.n_slots + slot) * H;
                 cudaMemcpy(dst, host_buf + (size_t)i * H, H * sizeof(half),
                            cudaMemcpyHostToDevice);
             }
