@@ -5088,6 +5088,111 @@ struct EmbedForwardCtx {
 // RERANK_PROF accumulators (per-forward; reset after the print).
 static double g_rr_attn = 0.0, g_rr_mlp = 0.0;
 
+// Chunked prefill of prompt_ids[tok_lo, tok_hi) at ABSOLUTE positions
+// [tok_lo, tok_hi). Reuses whatever KV already exists for [0, tok_lo) — the
+// caller is responsible for resetting state and prefilling the shared prefix
+// exactly once before calling this with tok_lo > 0 (rerank prefix-sharing).
+// Bit-identical to prefilling the whole [0, tok_hi) prompt in one shot,
+// because attention is causal: tokens at [tok_lo, tok_hi) attend over the full
+// [0, abs_pos] range (forward_attn_chunk's sub_seq_total = start_pos + sub_n),
+// and the prefix KV written by the earlier call is still resident (no memset
+// between calls). When out_hidden != nullptr it receives the post-output_norm
+// hidden of the LAST token (position tok_hi-1, fp32 on host).
+static bool run_embed_forward_range(EmbedForwardCtx& C,
+                                    const std::vector<int>& prompt_ids,
+                                    int tok_lo, int tok_hi,
+                                    std::vector<float>* out_hidden) {
+    QwenModel& model = *C.model;
+    GPUModel& gpu_model = *C.gpu_model;
+    int H = C.H;
+    int last_gpu = C.last_gpu;
+    if (tok_lo < 0 || tok_hi <= tok_lo || tok_hi > (int)prompt_ids.size()) return false;
+
+    constexpr int CHUNK = QwenModel::CHUNK_SIZE;
+    int chunk_pos = tok_lo;
+    float* last_h = nullptr;   // chunk buffer holding the final chunk (on last_gpu)
+    int    last_n = 0;
+    while (chunk_pos < tok_hi) {
+        int chunk_n = std::min(CHUNK, tok_hi - chunk_pos);
+        cudaSetDevice(0);
+        for (int t = 0; t < chunk_n; t++) {
+            int tok = prompt_ids[chunk_pos + t];
+            if (C.embd_t->type == GGML_TYPE_Q8_0)
+                dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(C.embd_t->data, C.gpu_hidden_half[0], tok, H);
+            else if (C.embd_t->type == GGML_TYPE_Q5_K)
+                dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(C.embd_t->data, C.gpu_hidden_half[0], tok, H);
+            else if (C.embd_t->type == GGML_TYPE_Q6_K)
+                dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(C.embd_t->data, C.gpu_hidden_half[0], tok, H);
+            else { fprintf(stderr, "[embed] unsupported embd type %d\n", C.embd_t->type); return false; }
+            half_to_float_kernel<<<(H+255)/256, 256>>>(
+                C.gpu_hidden_half[0], C.gpu_hidden_chunk[0] + (size_t)t * H, H);
+        }
+
+        float* h_chunk = C.gpu_hidden_chunk[0];
+        for (int layer = 0; layer < model.cfg.num_layers; layer++) {
+            int g = gpu_model.layer_gpu[layer];
+            int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
+            if (g != prev_g) {
+                cudaSetDevice(prev_g); cudaDeviceSynchronize();
+                cudaMemcpy(C.host_chunk_transfer, h_chunk,
+                           (size_t)chunk_n * H * sizeof(float), cudaMemcpyDeviceToHost);
+                cudaSetDevice(g);
+                cudaMemcpy(C.gpu_hidden_chunk[g], C.host_chunk_transfer,
+                           (size_t)chunk_n * H * sizeof(float), cudaMemcpyHostToDevice);
+                h_chunk = C.gpu_hidden_chunk[g];
+            }
+            cudaSetDevice(g);
+            static const bool prof = getenv("RERANK_PROF") != nullptr;
+            auto p0 = std::chrono::high_resolution_clock::now();
+            if (model.is_attn_layer(layer))
+                model.forward_attn_chunk(layer, h_chunk, chunk_pos, chunk_n, /*stream=*/0);
+            else
+                model.forward_gdn_chunk(layer, h_chunk, chunk_n, /*stream=*/0);
+            if (prof) { cudaSetDevice(g); cudaDeviceSynchronize(); }
+            auto p1 = std::chrono::high_resolution_clock::now();
+            model.forward_mlp_chunk(layer, h_chunk, chunk_n, /*stream=*/0);
+            if (prof) {
+                cudaSetDevice(g); cudaDeviceSynchronize();
+                auto p2 = std::chrono::high_resolution_clock::now();
+                g_rr_attn += std::chrono::duration<double,std::milli>(p1-p0).count();
+                g_rr_mlp  += std::chrono::duration<double,std::milli>(p2-p1).count();
+            }
+        }
+        cudaSetDevice(last_gpu); cudaDeviceSynchronize();
+        last_h = h_chunk;
+        last_n = chunk_n;
+        chunk_pos += chunk_n;
+    }
+    {
+        static const bool prof = getenv("RERANK_PROF") != nullptr;
+        if (prof) {
+            fprintf(stderr, "[rr-prof] tokens=%d attn=%.1fms mlp=%.1fms\n",
+                    tok_hi - tok_lo, g_rr_attn, g_rr_mlp);
+            g_rr_attn = 0; g_rr_mlp = 0;
+        }
+    }
+
+    if (!out_hidden) return true;  // prefix-only prefill: KV written, no pooling
+
+    // Last token's hidden is the final row of the final chunk. Convert fp32 →
+    // fp16, apply output_norm, copy back to host.
+    cudaSetDevice(last_gpu); cudaDeviceSynchronize();
+    float_to_half_kernel<<<(H+255)/256, 256>>>(
+        last_h + (size_t)(last_n - 1) * H, C.gpu_hidden_half[last_gpu], H);
+    if (C.out_norm_t->type == GGML_TYPE_F32)
+        rms_norm_f32w(C.norm_buf, C.gpu_hidden_half[last_gpu],
+                      (float*)C.out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
+    else
+        rms_norm(C.norm_buf, C.gpu_hidden_half[last_gpu],
+                 (half*)C.out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
+    cudaDeviceSynchronize();
+    std::vector<half> host_h(H);
+    cudaMemcpy(host_h.data(), C.norm_buf, H * sizeof(half), cudaMemcpyDeviceToHost);
+    out_hidden->resize(H);
+    for (int i = 0; i < H; i++) (*out_hidden)[i] = __half2float(host_h[i]);
+    return true;
+}
+
 // Run a single-pass prefill and return the post-output_norm hidden for the
 // last token (length H, fp32 on host).
 static bool run_embed_forward(EmbedForwardCtx& C,
@@ -5152,95 +5257,12 @@ static bool run_embed_forward(EmbedForwardCtx& C,
         return true;
     }
 
-    // Fresh KV per request — single slot, no continuous batching for sidecars.
-    // Chunked prefill (CHUNK_SIZE tokens per pass through the layer stack)
-    // instead of one-token-at-a-time: amortises the per-layer cross-GPU host
-    // bridge and uses the batched chunk kernels, the same path the chat server
-    // uses for prompt processing. For an N-token rerank/embed prompt this turns
-    // N sequential single-token forwards into ceil(N/256) batched ones.
-    constexpr int CHUNK = QwenModel::CHUNK_SIZE;
+    // Fresh KV per request: reset once, then prefill [0, N) via the chunked
+    // range helper (which reuses no prior KV here). The same helper powers
+    // rerank prefix-sharing, where the shared system/instruct/query prefix is
+    // prefilled once and each doc only forwards its own tail at start_pos=P.
     embed_reset();   // STAGE 0: skip the full KV memset on the fp16 dense path
-    int plen = (int)prompt_ids.size();
-    int chunk_pos = 0;
-    float* last_h = nullptr;   // chunk buffer holding the final chunk (on last_gpu)
-    int    last_n = 0;
-    while (chunk_pos < plen) {
-        int chunk_n = std::min(CHUNK, plen - chunk_pos);
-        cudaSetDevice(0);
-        for (int t = 0; t < chunk_n; t++) {
-            int tok = prompt_ids[chunk_pos + t];
-            if (C.embd_t->type == GGML_TYPE_Q8_0)
-                dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(C.embd_t->data, C.gpu_hidden_half[0], tok, H);
-            else if (C.embd_t->type == GGML_TYPE_Q5_K)
-                dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(C.embd_t->data, C.gpu_hidden_half[0], tok, H);
-            else if (C.embd_t->type == GGML_TYPE_Q6_K)
-                dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(C.embd_t->data, C.gpu_hidden_half[0], tok, H);
-            else { fprintf(stderr, "[embed] unsupported embd type %d\n", C.embd_t->type); return false; }
-            half_to_float_kernel<<<(H+255)/256, 256>>>(
-                C.gpu_hidden_half[0], C.gpu_hidden_chunk[0] + (size_t)t * H, H);
-        }
-
-        float* h_chunk = C.gpu_hidden_chunk[0];
-        for (int layer = 0; layer < model.cfg.num_layers; layer++) {
-            int g = gpu_model.layer_gpu[layer];
-            int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
-            if (g != prev_g) {
-                cudaSetDevice(prev_g); cudaDeviceSynchronize();
-                cudaMemcpy(C.host_chunk_transfer, h_chunk,
-                           (size_t)chunk_n * H * sizeof(float), cudaMemcpyDeviceToHost);
-                cudaSetDevice(g);
-                cudaMemcpy(C.gpu_hidden_chunk[g], C.host_chunk_transfer,
-                           (size_t)chunk_n * H * sizeof(float), cudaMemcpyHostToDevice);
-                h_chunk = C.gpu_hidden_chunk[g];
-            }
-            cudaSetDevice(g);
-            static const bool prof = getenv("RERANK_PROF") != nullptr;
-            auto p0 = std::chrono::high_resolution_clock::now();
-            if (model.is_attn_layer(layer))
-                model.forward_attn_chunk(layer, h_chunk, chunk_pos, chunk_n, /*stream=*/0);
-            else
-                model.forward_gdn_chunk(layer, h_chunk, chunk_n, /*stream=*/0);
-            if (prof) { cudaSetDevice(g); cudaDeviceSynchronize(); }
-            auto p1 = std::chrono::high_resolution_clock::now();
-            model.forward_mlp_chunk(layer, h_chunk, chunk_n, /*stream=*/0);
-            if (prof) {
-                cudaSetDevice(g); cudaDeviceSynchronize();
-                auto p2 = std::chrono::high_resolution_clock::now();
-                g_rr_attn += std::chrono::duration<double,std::milli>(p1-p0).count();
-                g_rr_mlp  += std::chrono::duration<double,std::milli>(p2-p1).count();
-            }
-        }
-        cudaSetDevice(last_gpu); cudaDeviceSynchronize();
-        last_h = h_chunk;
-        last_n = chunk_n;
-        chunk_pos += chunk_n;
-    }
-    {
-        static const bool prof = getenv("RERANK_PROF") != nullptr;
-        if (prof) {
-            fprintf(stderr, "[rr-prof] tokens=%d attn=%.1fms mlp=%.1fms\n",
-                    plen, g_rr_attn, g_rr_mlp);
-            g_rr_attn = 0; g_rr_mlp = 0;
-        }
-    }
-
-    // Last token's hidden is the final row of the final chunk. Convert fp32 →
-    // fp16, apply output_norm, copy back to host.
-    cudaSetDevice(last_gpu); cudaDeviceSynchronize();
-    float_to_half_kernel<<<(H+255)/256, 256>>>(
-        last_h + (size_t)(last_n - 1) * H, C.gpu_hidden_half[last_gpu], H);
-    if (C.out_norm_t->type == GGML_TYPE_F32)
-        rms_norm_f32w(C.norm_buf, C.gpu_hidden_half[last_gpu],
-                      (float*)C.out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
-    else
-        rms_norm(C.norm_buf, C.gpu_hidden_half[last_gpu],
-                 (half*)C.out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
-    cudaDeviceSynchronize();
-    std::vector<half> host_h(H);
-    cudaMemcpy(host_h.data(), C.norm_buf, H * sizeof(half), cudaMemcpyDeviceToHost);
-    out_hidden.resize(H);
-    for (int i = 0; i < H; i++) out_hidden[i] = __half2float(host_h[i]);
-    return true;
+    return run_embed_forward_range(C, prompt_ids, 0, (int)prompt_ids.size(), &out_hidden);
 }
 
 static void l2_normalize(std::vector<float>& v) {
@@ -5296,12 +5318,25 @@ int serve_embed(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port,
     init_embed_ctx(C, model, gpu_model, n_gpus);
 
     std::mutex fwd_mu;  // single-flight forward (sidecar = low QPS)
+    // Qwen3-Embedding (qwen3.pooling_type=3=LAST) was trained to APPEND
+    // <|endoftext|> (eos_id=151643) and pool ITS hidden — the EOS position
+    // carries the whole-sequence summary. The GGUF flags this with
+    // tokenizer.ggml.add_eos_token=True, but the plain BPE encode() never
+    // appends it, so the engine was pooling the last CONTENT token (usually a
+    // brace/paren/newline shared across nearly all code) → near-zero
+    // related-vs-unrelated discrimination (~0.027 measured). Appending the EOS
+    // makes LAST-pooling land on the trained summary token and restores normal
+    // discrimination (~0.37). EMBED_APPEND_EOS=0 opts out (A/B).
+    static const bool append_eos = []{ const char* e=getenv("EMBED_APPEND_EOS"); return !e || e[0]!='0'; }();
+    printf("[embed] append_eos=%d (eos_id=%d) — LAST-token pooling on <|endoftext|>\n",
+           (int)append_eos, tok.eos_id);
     auto embed_fn = [&](const std::vector<std::string>& inputs) -> std::vector<std::vector<float>> {
         std::lock_guard<std::mutex> lk(fwd_mu);
         std::vector<std::vector<float>> out;
         out.reserve(inputs.size());
         for (const auto& s : inputs) {
             auto ids = tok.encode(s);
+            if (append_eos && tok.eos_id >= 0) ids.push_back(tok.eos_id);
             std::vector<float> h;
             if (!run_embed_forward(C, ids, h)) { out.push_back({}); continue; }
             l2_normalize(h);
@@ -5454,24 +5489,11 @@ int serve_rerank(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port,
         std::lock_guard<std::mutex> lk(fwd_mu);
         std::vector<float> scores;
         scores.reserve(docs.size());
-        for (const auto& d : docs) {
-            auto ids = tok.encode(build_prompt(instruction, query, d));
-            static const bool dbg_tok = getenv("RERANK_DEBUG") != nullptr;
-            if (dbg_tok) {
-                fprintf(stderr, "[rerank-tok] n=%zu head:", ids.size());
-                for (size_t i = 0; i < ids.size() && i < 12; i++) fprintf(stderr, " %d", ids[i]);
-                fprintf(stderr, " tail:");
-                for (size_t i = (ids.size()>6?ids.size()-6:0); i < ids.size(); i++) fprintf(stderr, " %d", ids[i]);
-                fprintf(stderr, "\n"); fflush(stderr);
-            }
-            std::vector<float> h;
-            if (!run_embed_forward(C, ids, h)) { scores.push_back(0.0f); continue; }
 
-            // Prefer the classifier head when present (the converted Qwen3
-            // reranker GGUFs include it). The projection is [cls_dim, H] @ h
-            // computed on host — cls_dim is 2, so this is two dot products,
-            // and it sidesteps an intermittent CUDA fault we saw running the
-            // F16 gemv for this tiny shape. No device round-trip needed.
+        // Map a last-token hidden → yes/no relevance score. Classifier head
+        // when present (host 2-class dot product, sidesteps the F16-gemv CUDA
+        // fault for this tiny shape); else lm_head yes/no token logits.
+        auto score_hidden = [&](const std::vector<float>& h, const std::string& d) -> float {
             if (cls_w && !cls_w_host_f16.empty()) {
                 std::vector<float> cls_logits(cls_dim, 0.0f);
                 for (int c = 0; c < cls_dim; c++) {
@@ -5483,8 +5505,7 @@ int serve_rerank(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port,
                 }
                 // Row 0 = "yes"/true, row 1 = "no"/false (convert_hf_to_gguf.py
                 // `_get_cls_out_tensor` stacks [true_row, false_row]).
-                // RERANK_CLS_YES overrides which row is yes for GGUFs built
-                // with the opposite stack order.
+                // RERANK_CLS_YES overrides which row is yes.
                 static const int yes_row = []{ const char* e = getenv("RERANK_CLS_YES"); return e ? atoi(e) : 0; }();
                 float lyes = cls_logits[yes_row == 0 ? 0 : (cls_dim > 1 ? 1 : 0)];
                 float lno  = cls_logits[yes_row == 0 ? (cls_dim > 1 ? 1 : 0) : 0];
@@ -5496,12 +5517,9 @@ int serve_rerank(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port,
                 float m = std::max(lyes, lno);
                 float pyes = std::exp(lyes - m);
                 float pno  = std::exp(lno  - m);
-                scores.push_back(pyes / (pyes + pno));
-                continue;
+                return pyes / (pyes + pno);
             }
-
-            // Fallback: lm_head + yes/no token logits. Needs the hidden on
-            // device + quantized for the big vocab GEMV.
+            // Fallback: lm_head + yes/no token logits.
             cudaSetDevice(C.last_gpu);
             std::vector<half> h16(C.H);
             for (int i = 0; i < C.H; i++) h16[i] = __float2half(h[i]);
@@ -5510,15 +5528,11 @@ int serve_rerank(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port,
             auto* lmh = C.out_w ? C.out_w : C.embd_t;  // tied embeddings fallback
             quant_gemv(lmh->data, lmh->type, C.norm_buf, C.logits_buf, C.H, C.V, &C.qi_logits, 0);
             cudaDeviceSynchronize();
-            // Read just the two logits we care about.
             half lyes_h, lno_h;
             cudaMemcpy(&lyes_h, C.logits_buf + yes_id, sizeof(half), cudaMemcpyDeviceToHost);
             cudaMemcpy(&lno_h,  C.logits_buf + no_id,  sizeof(half), cudaMemcpyDeviceToHost);
             float lyes = __half2float(lyes_h);
             float lno  = __half2float(lno_h);
-            // Optional: RERANK_DEBUG=1 dumps yes/no + argmax to stderr for
-            // diagnosing model/quant mismatches (a healthy reranker has yes
-            // or no as the argmax with a much larger logit than other tokens).
             static const bool dbg = getenv("RERANK_DEBUG") != nullptr;
             if (dbg) {
                 int* d_arg = nullptr; cudaMalloc(&d_arg, sizeof(int));
@@ -5536,7 +5550,67 @@ int serve_rerank(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port,
             float m = std::max(lyes, lno);
             float pyes = std::exp(lyes - m);
             float pno  = std::exp(lno  - m);
-            scores.push_back(pyes / (pyes + pno));
+            return pyes / (pyes + pno);
+        };
+
+        // Tokenize every doc's full prompt up front.
+        std::vector<std::vector<int>> all_ids;
+        all_ids.reserve(docs.size());
+        for (const auto& d : docs)
+            all_ids.push_back(tok.encode(build_prompt(instruction, query, d)));
+
+        static const bool dbg_tok = getenv("RERANK_DEBUG") != nullptr;
+        if (dbg_tok) {
+            for (const auto& ids : all_ids) {
+                fprintf(stderr, "[rerank-tok] n=%zu head:", ids.size());
+                for (size_t i = 0; i < ids.size() && i < 12; i++) fprintf(stderr, " %d", ids[i]);
+                fprintf(stderr, " tail:");
+                for (size_t i = (ids.size()>6?ids.size()-6:0); i < ids.size(); i++) fprintf(stderr, " %d", ids[i]);
+                fprintf(stderr, "\n");
+            }
+            fflush(stderr);
+        }
+
+        // Prefix-KV sharing: system + <Instruct> + <Query> + "<Document>: " is
+        // identical across all docs in one rerank call, so the longest common
+        // token prefix is prefilled ONCE and each doc only forwards its own
+        // tail at start_pos=P. Bit-identical to per-doc processing (causal
+        // attention; the prefix KV stays resident, doc tails overwrite [P..]).
+        // RERANK_PREFIX_SHARE=0 opts out.
+        static const bool prefix_share = []{ const char* e=getenv("RERANK_PREFIX_SHARE"); return !e || e[0]!='0'; }();
+        static const bool rr_skip_kv_reset = []{ const char* e=getenv("EMBED_SKIP_KV_RESET"); return !e || e[0]!='0'; }();
+        auto rr_reset = [&]{ if (rr_skip_kv_reset) model.reset_states_no_kv_memset(); else model.reset_all_states(); };
+
+        if (prefix_share && all_ids.size() >= 2) {
+            int P = (int)all_ids[0].size();
+            int min_len = P;
+            for (size_t i = 1; i < all_ids.size(); i++) {
+                int lcp = 0, m = std::min(P, (int)all_ids[i].size());
+                while (lcp < m && all_ids[0][lcp] == all_ids[i][lcp]) lcp++;
+                P = lcp;
+                if ((int)all_ids[i].size() < min_len) min_len = (int)all_ids[i].size();
+            }
+            // Leave each doc at least one tail token to pool from.
+            if (P > min_len - 1) P = min_len - 1;
+            if (P < 0) P = 0;
+
+            rr_reset();
+            if (P > 0) run_embed_forward_range(C, all_ids[0], 0, P, nullptr);  // shared prefix, once
+            for (size_t i = 0; i < all_ids.size(); i++) {
+                std::vector<float> h;
+                if (!run_embed_forward_range(C, all_ids[i], P, (int)all_ids[i].size(), &h)) {
+                    scores.push_back(0.0f); continue;
+                }
+                scores.push_back(score_hidden(h, docs[i]));
+            }
+            return scores;
+        }
+
+        // Fallback: independent per-doc forward (single doc, or opted out).
+        for (size_t i = 0; i < all_ids.size(); i++) {
+            std::vector<float> h;
+            if (!run_embed_forward(C, all_ids[i], h)) { scores.push_back(0.0f); continue; }
+            scores.push_back(score_hidden(h, docs[i]));
         }
         return scores;
     };

@@ -30,6 +30,16 @@ sleep 2
 # Drop page cache before loading the 28 GB chat GGUF.
 echo 9717 | sudo -S sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || true
 
+# Lock all 4 GPUs to the 1380 MHz BIOS-max clock + persistence mode.
+# The CMP 100-210 defaults to its 1147 MHz application clock and does NOT
+# auto-boost under load, leaving ~15-20% on the table for clock-bound paths
+# (Q8_0 DP4A / HFMA2 GEMM — exactly what inference uses). Locking to 1380 is a
+# free, consistent gain (verified 2026-06-06: FFMA 7.3->8.4, HFMA2 15.5->17.7,
+# steady). The tensor/FP64 throttle is fixed-cycle and unaffected, but we don't
+# use those paths. Reversible with: sudo nvidia-smi -rgc
+echo 9717 | sudo -S nvidia-smi -pm 1 >/dev/null 2>&1 || true
+echo 9717 | sudo -S nvidia-smi -lgc 1380,1380 >/dev/null 2>&1 || true
+
 cd "$ROOT"
 
 # Chat server (GPUs 0,1,2)
