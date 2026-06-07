@@ -1018,8 +1018,19 @@ struct HttpServer {
             }
         }
 
-        // Apply per-request sampling params from OpenAI API
+        // Apply per-request sampling params from OpenAI API.
+        // Each request starts from the server-launch BASELINE (CLI/default
+        // values, captured once below) and then applies its own overrides.
+        // Previously the overrides mutated the shared params cumulatively, so
+        // a request that omitted `temperature` silently inherited whatever the
+        // PREVIOUS request set — one temperature:0 client flipped the whole
+        // server to greedy until someone sent a different value (observed
+        // 2026-06-07: a greedy-inherited UE codegen request hit Qwen's
+        // documented greedy-repetition failure mode and looped for 10K
+        // tokens). Omitted field now always means "server default".
         if (sampling_params) {
+            static const SamplingParams baseline = *sampling_params;
+            *sampling_params = baseline;
             float temp = json_get_float(body, "temperature", -1.0f);
             if (temp >= 0.0f) sampling_params->temperature = temp;
             float top_p = json_get_float(body, "top_p", -1.0f);
