@@ -5185,6 +5185,176 @@ struct QwenModel {
         }
     }
 
+    // ===== Varlen-packed attention layer (DENSE embed/rerank sidecar only) =====
+    // Stage-2 embed batch packing: multiple independent texts are packed into
+    // one token stream so the per-token GEMMs (norm/QKV/o_proj/MLP) sweep the
+    // Q8_0 weights once per CHUNK instead of once per text — on the dp4a
+    // weight-traffic-bound sidecar this is the entire win (~N× for N short
+    // texts). hidden_chunk holds n_tokens packed rows at PACKED positions
+    // [start_pos, start_pos+n_tokens); K/V are appended at those packed
+    // positions. Attention must NOT cross segment boundaries, so instead of
+    // one fused call we launch the existing dense flash kernel once per
+    // segment piece with the K/V base pointer offset to the segment start and
+    // start_pos remapped to the segment-LOCAL query position — the kernel
+    // only ever reads keys [base, base + local_pos], which is exactly the
+    // segment's causal range in the packed cache. No new attention kernel.
+    //
+    // pos_arr_dev[t] = segment-local position of packed row t (device int
+    // array, length n_tokens) — drives RoPE. pieces = the segment spans
+    // intersecting this chunk: queries [q_lo, q_lo+q_n) of the segment that
+    // starts at packed position seg_start.
+    //
+    // Returns false BEFORE any state mutation when this layer can't take the
+    // packed path (GDN layer, gated/hybrid Q, non-Q8_0 weights, non-fp16 KV,
+    // non-dense attention shape, FA off) — the caller then falls back to the
+    // per-text path. The 27B chat path always fails these gates, so this
+    // function is unreachable for the hybrid model.
+    struct VarlenPiece { int seg_start; int q_lo; int q_n; };
+    bool forward_attn_chunk_varlen(int layer, float* hidden_chunk, int start_pos,
+                                   int n_tokens, const int* pos_arr_dev,
+                                   const std::vector<VarlenPiece>& pieces,
+                                   cudaStream_t stream) {
+        if (!is_attn_layer(layer)) return false;        // GDN is recurrent: can't pack
+        if (use_q8_kv || use_turboquant) return false;  // fp16 KV path only
+        if (!g_use_flash_attn) return false;
+        int g = gpu->layer_gpu[layer];
+        auto& ab = attn_bufs[g];
+        auto& buf = bufs[g];
+        int H = cfg.hidden_size;
+        int num_q  = cfg.num_q_heads;
+        int num_kv = cfg.num_kv_heads;
+        int hd     = cfg.head_dim;
+        int kv_dim = num_kv * hd;
+        int total_qg = num_q * hd;
+        float eps = cfg.rms_norm_eps;
+        float scale = 1.0f / sqrtf((float)hd);
+        if (!(hd == 128 && num_kv == 8 && num_q == 32)) return false;  // dense shape
+
+        auto* norm_w   = t(blk(layer, "attn_norm.weight"));
+        auto* q_w      = t(blk(layer, "attn_q.weight"));
+        auto* k_w      = t(blk(layer, "attn_k.weight"));
+        auto* v_w      = t(blk(layer, "attn_v.weight"));
+        auto* q_norm_w = t(blk(layer, "attn_q_norm.weight"));
+        auto* k_norm_w = t(blk(layer, "attn_k_norm.weight"));
+        auto* o_w      = t(blk(layer, "attn_output.weight"));
+        if (!norm_w || !q_w || !k_w || !v_w || !q_norm_w || !k_norm_w || !o_w)
+            return false;
+        int q_out_dim = q_w->dims[1];
+        if (q_out_dim != total_qg) return false;        // ungated dense only
+        if (q_w->type != GGML_TYPE_Q8_0 || k_w->type != GGML_TYPE_Q8_0 ||
+            v_w->type != GGML_TYPE_Q8_0 || o_w->type != GGML_TYPE_Q8_0)
+            return false;
+
+        // Lazy alloc — identical shapes to forward_attn_chunk (shared buffers,
+        // either function may run first).
+        if (!ab.attn_chunk_q) {
+            cudaMalloc(&ab.attn_chunk_q,        (size_t)CHUNK_SIZE * q_out_dim * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_k,        (size_t)CHUNK_SIZE * kv_dim    * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_v,        (size_t)CHUNK_SIZE * kv_dim    * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_q_post,   (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_gate,     (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_scores,   (size_t)ATTN_NB * num_q * kv_max_seq * sizeof(float));
+            cudaMalloc(&ab.attn_chunk_out,      (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_oproj,    (size_t)CHUNK_SIZE * H         * sizeof(half));
+            constexpr int K_SPLITS_MAX = 16;
+            cudaMalloc(&ab.attn_split_m, (size_t)num_q * ATTN_NB * K_SPLITS_MAX * sizeof(float));
+            cudaMalloc(&ab.attn_split_l, (size_t)num_q * ATTN_NB * K_SPLITS_MAX * sizeof(float));
+            cudaMalloc(&ab.attn_split_o, (size_t)num_q * ATTN_NB * K_SPLITS_MAX * hd * sizeof(float));
+        }
+
+        // 1. Batched RMSNorm over the whole packed chunk (segment-agnostic).
+        if (norm_w->type == GGML_TYPE_F32) {
+            rms_norm_f32in_f32w(buf.mlp_chunk_norm, hidden_chunk, (float*)norm_w->data,
+                                n_tokens, H, eps, stream);
+        } else {
+            rms_norm_f32in(buf.mlp_chunk_norm, hidden_chunk, (half*)norm_w->data,
+                           n_tokens, H, eps, stream);
+        }
+
+        // 2.+3. Quantize once, batched Q/K/V projections (segment-agnostic).
+        gpu_qi[g].quantize_chunk(buf.mlp_chunk_norm, H, n_tokens, stream);
+        quant_gemv_chunk(q_w->data, q_w->type, gpu_qi[g].q8_buf, ab.attn_chunk_q,
+                         H, q_out_dim, n_tokens, stream);
+        quant_gemv_chunk(k_w->data, k_w->type, gpu_qi[g].q8_buf, ab.attn_chunk_k,
+                         H, kv_dim, n_tokens, stream);
+        quant_gemv_chunk(v_w->data, v_w->type, gpu_qi[g].q8_buf, ab.attn_chunk_v,
+                         H, kv_dim, n_tokens, stream);
+
+        // 4. Head-RMS + varlen RoPE. Ungated: attn_chunk_q IS q_post (skip the
+        //    deinterleave/copy the gated path needs).
+        half* q_post = ab.attn_chunk_q;
+        int rope_dim = rope.rope_dim;
+        int half_rope = rope_dim / 2;
+        int tn = min(hd, 128);
+        static const bool skip_qk_norm_v = getenv("SKIP_QK_NORM") != nullptr;
+        if (!skip_qk_norm_v) {
+            dim3 q_rms_grid(num_q, n_tokens);
+            head_rms_norm_kernel_chunk<<<q_rms_grid, tn, tn * sizeof(float), stream>>>(
+                q_post, (float*)q_norm_w->data, num_q, hd, eps, n_tokens);
+            dim3 k_rms_grid(num_kv, n_tokens);
+            head_rms_norm_kernel_chunk<<<k_rms_grid, tn, tn * sizeof(float), stream>>>(
+                ab.attn_chunk_k, (float*)k_norm_w->data, num_kv, hd, eps, n_tokens);
+        }
+        {
+            dim3 rope_q_grid((num_q  * half_rope + 255) / 256, n_tokens);
+            dim3 rope_k_grid((num_kv * half_rope + 255) / 256, n_tokens);
+            apply_rope_kernel_chunk_varlen<<<rope_q_grid, 256, 0, stream>>>(
+                q_post, rope.sin_table(g), rope.cos_table(g),
+                pos_arr_dev, num_q,  hd, rope_dim, n_tokens);
+            apply_rope_kernel_chunk_varlen<<<rope_k_grid, 256, 0, stream>>>(
+                ab.attn_chunk_k, rope.sin_table(g), rope.cos_table(g),
+                pos_arr_dev, num_kv, hd, rope_dim, n_tokens);
+        }
+
+        // 5. fp16 K/V append at the PACKED positions.
+        auto& kv = kv_caches[layer];
+        {
+            size_t new_bytes = (size_t)n_tokens * kv_dim * sizeof(half);
+            cudaMemcpyAsync(kv.k + (size_t)start_pos * kv_dim, ab.attn_chunk_k,
+                            new_bytes, cudaMemcpyDeviceToDevice, stream);
+            cudaMemcpyAsync(kv.v + (size_t)start_pos * kv_dim, ab.attn_chunk_v,
+                            new_bytes, cudaMemcpyDeviceToDevice, stream);
+        }
+
+        // 6. Per-piece flash attention. Base pointer offset to the segment
+        //    start + segment-local start_pos = causal range [seg_start,
+        //    seg_start+local_pos] in the packed cache. ATTN_NB sub-chunking
+        //    mirrors the dense dispatch in forward_attn_chunk.
+        for (const auto& pc : pieces) {
+            int done = 0;
+            while (done < pc.q_n) {
+                int sub_n = std::min(ATTN_NB, pc.q_n - done);
+                int row0 = pc.q_lo - start_pos + done;        // chunk-row offset
+                int local_start = pc.q_lo - pc.seg_start + done;
+                constexpr int HD128 = 128, GQA = 4, BM = 32, BLOCK = 256;
+                int smem_bytes = GQA * HD128 * sizeof(half)
+                               + 2 * BM * HD128 * sizeof(half)
+                               + GQA * BM * sizeof(float);
+                dim3 fg(num_kv, sub_n);
+                flash_attn_chunk_fused<HD128, GQA, BM, BLOCK>
+                    <<<fg, BLOCK, smem_bytes, stream>>>(
+                        q_post + (size_t)row0 * total_qg,
+                        kv.k + (size_t)pc.seg_start * kv_dim,
+                        kv.v + (size_t)pc.seg_start * kv_dim,
+                        ab.attn_chunk_out + (size_t)row0 * total_qg,
+                        num_q, num_kv, local_start, sub_n, scale);
+                done += sub_n;
+            }
+        }
+
+        // 7. Batched o_proj + residual over the whole packed chunk.
+        gpu_qi_inter[g].quantize_chunk(ab.attn_chunk_out, total_qg, n_tokens, stream);
+        quant_gemv_chunk(o_w->data, o_w->type,
+                         gpu_qi_inter[g].q8_buf, ab.attn_chunk_oproj,
+                         total_qg, H, n_tokens, stream);
+        {
+            int n_elem = n_tokens * H;
+            add_kernel_f32<<<(n_elem + 255) / 256, 256, 0, stream>>>(
+                hidden_chunk, ab.attn_chunk_oproj, n_elem);
+        }
+        return true;
+    }
+
     // ============ Chunked MLP forward (batched, prefill fast path) ============
     // Processes n_tokens hidden states through one MLP layer with shared
     // weight loads. Each weight word in ffn_gate/ffn_up/ffn_down is read

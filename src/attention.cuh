@@ -1232,6 +1232,40 @@ __global__ void apply_rope_kernel_chunk(
     xh[i + half_rope] = __float2half(x0 * s + x1 * c);
 }
 
+// Varlen-packed RoPE: identical math to apply_rope_kernel_chunk but each
+// token's position comes from a device array instead of start_pos + tt.
+// Used by the dense-sidecar packed prefill (forward_attn_chunk_varlen) where
+// chunk rows belong to different segments and need segment-LOCAL positions.
+__global__ void apply_rope_kernel_chunk_varlen(
+    half* __restrict__ x,
+    const float* __restrict__ sin_table,  // [max_seq, rope_dim/2]
+    const float* __restrict__ cos_table,
+    const int* __restrict__ pos_arr,      // [n_tokens] segment-local positions
+    int num_heads, int head_dim, int rope_dim,
+    int n_tokens
+) {
+    int tt = blockIdx.y;
+    if (tt >= n_tokens) return;
+    int pos = pos_arr[tt];
+    int half_rope = rope_dim / 2;
+    const float* sin_t = sin_table + (size_t)pos * half_rope;
+    const float* cos_t = cos_table + (size_t)pos * half_rope;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_heads * half_rope;
+    if (idx >= total) return;
+
+    int head = idx / half_rope;
+    int i    = idx - head * half_rope;
+    half* xh = x + (size_t)tt * num_heads * head_dim + head * head_dim;
+
+    float x0 = __half2float(xh[i]);
+    float x1 = __half2float(xh[i + half_rope]);
+    float c = cos_t[i], s = sin_t[i];
+    xh[i]             = __float2half(x0 * c - x1 * s);
+    xh[i + half_rope] = __float2half(x0 * s + x1 * c);
+}
+
 __global__ void apply_gate_sigmoid_chunk(
     half* __restrict__ output,  // [n_tokens, size]
     const half* __restrict__ gate,

@@ -5075,6 +5075,7 @@ struct EmbedForwardCtx {
     half*            gpu_hidden_half[4] = {};
     float*           gpu_hidden_fp32[4] = {};
     float*           gpu_hidden_chunk[4] = {};   // [CHUNK_SIZE * H] per GPU (chunked prefill)
+    int*             gpu_pos_varlen[4] = {};     // [kv_max_seq] seg-local positions (Stage-2 packing)
     float*           host_chunk_transfer = nullptr; // [CHUNK_SIZE * H] pinned cross-GPU bridge
     half*            host_transfer = nullptr;
     half*            norm_buf = nullptr;
@@ -5265,6 +5266,129 @@ static bool run_embed_forward(EmbedForwardCtx& C,
     return run_embed_forward_range(C, prompt_ids, 0, (int)prompt_ids.size(), &out_hidden);
 }
 
+// Stage-2 packed batch embedding: forward N texts as ONE packed token stream
+// so the per-token GEMMs (norm/QKV/o_proj/MLP) amortize the Q8_0 weight sweep
+// across every text in a 256-token chunk instead of sweeping ~3.9 GB once per
+// text — the dominant cost for short texts on the dp4a sidecar. Attention
+// stays strictly per-segment via forward_attn_chunk_varlen (base-pointer
+// offset into the packed KV cache + segment-local RoPE positions), so no
+// cross-text leakage is possible. Total packed length must fit kv_max_seq;
+// the caller bins texts accordingly. out_hiddens[i] receives text i's
+// post-output_norm LAST-token hidden (same pooling as the unpacked path).
+// Returns false if any layer rejects the varlen path — caller falls back to
+// the per-text path, which does its own state reset.
+static bool run_embed_forward_packed(EmbedForwardCtx& C,
+                                     const std::vector<std::vector<int>>& seg_ids,
+                                     std::vector<std::vector<float>>& out_hiddens) {
+    QwenModel& model = *C.model;
+    GPUModel& gpu_model = *C.gpu_model;
+    int H = C.H;
+    int last_gpu = C.last_gpu;
+    int n_segs = (int)seg_ids.size();
+    if (n_segs == 0) return false;
+
+    // Segment table + packed stream + segment-local positions.
+    std::vector<int> seg_start(n_segs + 1, 0);
+    for (int i = 0; i < n_segs; i++) {
+        if (seg_ids[i].empty()) return false;
+        seg_start[i + 1] = seg_start[i] + (int)seg_ids[i].size();
+    }
+    int T = seg_start[n_segs];
+    if (T > model.kv_max_seq) return false;
+    std::vector<int> packed(T), local_pos(T);
+    for (int i = 0; i < n_segs; i++)
+        for (int t = 0; t < (int)seg_ids[i].size(); t++) {
+            packed[seg_start[i] + t]    = seg_ids[i][t];
+            local_pos[seg_start[i] + t] = t;
+        }
+    for (int g = 0; g < C.n_gpus; g++) {
+        cudaSetDevice(g);
+        cudaMemcpy(C.gpu_pos_varlen[g], local_pos.data(), (size_t)T * sizeof(int),
+                   cudaMemcpyHostToDevice);
+    }
+
+    // Same reset policy as the unpacked path (EMBED_SKIP_KV_RESET): packed
+    // queries only ever read KV [seg_start, pos] — all written this batch —
+    // so stale KV beyond T is never touched.
+    static const bool skip_kv_reset = []{ const char* e=getenv("EMBED_SKIP_KV_RESET"); return !e || e[0]!='0'; }();
+    if (skip_kv_reset) model.reset_states_no_kv_memset(); else model.reset_all_states();
+
+    out_hiddens.assign(n_segs, {});
+    constexpr int CHUNK = QwenModel::CHUNK_SIZE;
+    int chunk_pos = 0;
+    while (chunk_pos < T) {
+        int chunk_n = std::min(CHUNK, T - chunk_pos);
+        int chunk_end = chunk_pos + chunk_n;
+        // Segment pieces intersecting this chunk.
+        std::vector<QwenModel::VarlenPiece> pieces;
+        for (int i = 0; i < n_segs; i++) {
+            int q_lo = std::max(seg_start[i], chunk_pos);
+            int q_hi = std::min(seg_start[i + 1], chunk_end);
+            if (q_lo < q_hi) pieces.push_back({seg_start[i], q_lo, q_hi - q_lo});
+        }
+
+        cudaSetDevice(0);
+        for (int t = 0; t < chunk_n; t++) {
+            int tok = packed[chunk_pos + t];
+            if (C.embd_t->type == GGML_TYPE_Q8_0)
+                dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(C.embd_t->data, C.gpu_hidden_half[0], tok, H);
+            else if (C.embd_t->type == GGML_TYPE_Q5_K)
+                dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(C.embd_t->data, C.gpu_hidden_half[0], tok, H);
+            else if (C.embd_t->type == GGML_TYPE_Q6_K)
+                dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(C.embd_t->data, C.gpu_hidden_half[0], tok, H);
+            else { fprintf(stderr, "[embed] unsupported embd type %d\n", C.embd_t->type); return false; }
+            half_to_float_kernel<<<(H+255)/256, 256>>>(
+                C.gpu_hidden_half[0], C.gpu_hidden_chunk[0] + (size_t)t * H, H);
+        }
+
+        float* h_chunk = C.gpu_hidden_chunk[0];
+        for (int layer = 0; layer < model.cfg.num_layers; layer++) {
+            int g = gpu_model.layer_gpu[layer];
+            int prev_g = (layer == 0) ? 0 : gpu_model.layer_gpu[layer - 1];
+            if (g != prev_g) {
+                cudaSetDevice(prev_g); cudaDeviceSynchronize();
+                cudaMemcpy(C.host_chunk_transfer, h_chunk,
+                           (size_t)chunk_n * H * sizeof(float), cudaMemcpyDeviceToHost);
+                cudaSetDevice(g);
+                cudaMemcpy(C.gpu_hidden_chunk[g], C.host_chunk_transfer,
+                           (size_t)chunk_n * H * sizeof(float), cudaMemcpyHostToDevice);
+                h_chunk = C.gpu_hidden_chunk[g];
+            }
+            cudaSetDevice(g);
+            if (!model.forward_attn_chunk_varlen(layer, h_chunk, chunk_pos, chunk_n,
+                                                 C.gpu_pos_varlen[g] + chunk_pos,
+                                                 pieces, /*stream=*/0))
+                return false;  // unsupported layer → fallback (which resets state)
+            model.forward_mlp_chunk(layer, h_chunk, chunk_n, /*stream=*/0);
+        }
+        cudaSetDevice(last_gpu); cudaDeviceSynchronize();
+
+        // Pool every segment that ENDS inside this chunk: post-output_norm
+        // hidden of its last token (the appended <|endoftext|>).
+        for (int i = 0; i < n_segs; i++) {
+            int last_abs = seg_start[i + 1] - 1;
+            if (last_abs < chunk_pos || last_abs >= chunk_end) continue;
+            int row = last_abs - chunk_pos;
+            float_to_half_kernel<<<(H+255)/256, 256>>>(
+                h_chunk + (size_t)row * H, C.gpu_hidden_half[last_gpu], H);
+            if (C.out_norm_t->type == GGML_TYPE_F32)
+                rms_norm_f32w(C.norm_buf, C.gpu_hidden_half[last_gpu],
+                              (float*)C.out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
+            else
+                rms_norm(C.norm_buf, C.gpu_hidden_half[last_gpu],
+                         (half*)C.out_norm_t->data, 1, H, model.cfg.rms_norm_eps);
+            cudaDeviceSynchronize();
+            std::vector<half> host_h(H);
+            cudaMemcpy(host_h.data(), C.norm_buf, H * sizeof(half), cudaMemcpyDeviceToHost);
+            auto& oh = out_hiddens[i];
+            oh.resize(H);
+            for (int j = 0; j < H; j++) oh[j] = __half2float(host_h[j]);
+        }
+        chunk_pos = chunk_end;
+    }
+    return true;
+}
+
 static void l2_normalize(std::vector<float>& v) {
     double ss = 0.0;
     for (float x : v) ss += (double)x * (double)x;
@@ -5289,6 +5413,8 @@ static void init_embed_ctx(EmbedForwardCtx& C, QwenModel& model, GPUModel& gpu_m
         cudaMalloc(&C.gpu_hidden_half[g], C.H * sizeof(half));
         cudaMalloc(&C.gpu_hidden_fp32[g], C.H * sizeof(float));
         cudaMalloc(&C.gpu_hidden_chunk[g], (size_t)QwenModel::CHUNK_SIZE * C.H * sizeof(float));
+        if (model.kv_max_seq > 0)
+            cudaMalloc(&C.gpu_pos_varlen[g], (size_t)model.kv_max_seq * sizeof(int));
     }
     cudaSetDevice(C.last_gpu);
     cudaMalloc(&C.norm_buf, C.H * sizeof(half));
@@ -5330,17 +5456,61 @@ int serve_embed(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port,
     static const bool append_eos = []{ const char* e=getenv("EMBED_APPEND_EOS"); return !e || e[0]!='0'; }();
     printf("[embed] append_eos=%d (eos_id=%d) — LAST-token pooling on <|endoftext|>\n",
            (int)append_eos, tok.eos_id);
+    // Stage-2 varlen batch packing: multi-text requests are packed into one
+    // token stream (segment-isolated attention) so the Q8_0 weight sweep is
+    // shared across all texts in a chunk — ~N× for N short texts (RAG
+    // indexing). EMBED_PACK=0 opts back into the per-text path.
+    static const bool embed_pack = []{ const char* e=getenv("EMBED_PACK"); return !e || e[0]!='0'; }();
+    printf("[embed] varlen_pack=%d (EMBED_PACK=0 to disable)\n", (int)embed_pack);
     auto embed_fn = [&](const std::vector<std::string>& inputs) -> std::vector<std::vector<float>> {
         std::lock_guard<std::mutex> lk(fwd_mu);
-        std::vector<std::vector<float>> out;
-        out.reserve(inputs.size());
-        for (const auto& s : inputs) {
-            auto ids = tok.encode(s);
-            if (append_eos && tok.eos_id >= 0) ids.push_back(tok.eos_id);
+        std::vector<std::vector<float>> out(inputs.size());
+        std::vector<std::vector<int>> all_ids(inputs.size());
+        for (size_t i = 0; i < inputs.size(); i++) {
+            all_ids[i] = tok.encode(inputs[i]);
+            if (append_eos && tok.eos_id >= 0) all_ids[i].push_back(tok.eos_id);
+        }
+        auto run_single = [&](size_t i) {
             std::vector<float> h;
-            if (!run_embed_forward(C, ids, h)) { out.push_back({}); continue; }
-            l2_normalize(h);
-            out.push_back(std::move(h));
+            if (run_embed_forward(C, all_ids[i], h)) {
+                l2_normalize(h);
+                out[i] = std::move(h);
+            }
+        };
+        if (embed_pack && inputs.size() >= 2) {
+            // Greedy bins under the KV budget; oversize singletons take the
+            // per-text path (same limits as before).
+            int budget = C.model->kv_max_seq;
+            size_t i = 0;
+            while (i < inputs.size()) {
+                std::vector<size_t> idxs;
+                int used = 0;
+                while (i < inputs.size()
+                       && (idxs.empty() || used + (int)all_ids[i].size() <= budget)) {
+                    idxs.push_back(i);
+                    used += (int)all_ids[i].size();
+                    i++;
+                    if (used > budget) break;  // oversize singleton: bin of 1
+                }
+                if (idxs.size() < 2 || used > budget) {
+                    for (size_t j : idxs) run_single(j);
+                    continue;
+                }
+                std::vector<std::vector<int>> batch;
+                batch.reserve(idxs.size());
+                for (size_t j : idxs) batch.push_back(all_ids[j]);
+                std::vector<std::vector<float>> hiddens;
+                if (run_embed_forward_packed(C, batch, hiddens)) {
+                    for (size_t b = 0; b < idxs.size(); b++) {
+                        l2_normalize(hiddens[b]);
+                        out[idxs[b]] = std::move(hiddens[b]);
+                    }
+                } else {
+                    for (size_t j : idxs) run_single(j);  // safe fallback
+                }
+            }
+        } else {
+            for (size_t i = 0; i < inputs.size(); i++) run_single(i);
         }
         return out;
     };
