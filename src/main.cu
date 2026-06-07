@@ -1491,6 +1491,68 @@ int run_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, const SamplingPara
 
 // ============ Qwen serve mode: OpenAI-compatible HTTP API ============
 
+// Degenerate-repetition cutter. Detects when the generated tail has become an
+// EXACT token-level cycle (e.g. ids ...1550 25095 3581 1550 25095 3581... for
+// hundreds of tokens — observed 2026-06-07: a 10,378-token runaway burning a
+// slot for 634 s) and signals the gen loop to stop, independent of max_tokens.
+//
+// Trigger rule: the last `span` tokens are exactly periodic with some period
+// p <= REP_LOOP_MAX_PERIOD (64), where span = max(REP_LOOP_MIN_SPAN (1024),
+// REP_LOOP_MIN_CYCLES (8) * p). Legit repetitive code (similar lines, arrays)
+// varies in names/indices so it never sustains a bit-exact short cycle for
+// 1024 tokens; sampling-level penalties were rejected because they would
+// distort correct code output. REP_LOOP_BREAK=0 disables.
+//
+// Defaults reviewed 2026-06-07 (adversarial tokenizer sweep): all measured
+// legit-output near-misses (flat 0x00 LUTs, "repeat N times" asks, identical
+// JSON fixtures) fire at exactly 512 tokens, so MIN_SPAN=1024 doubles the
+// legit headroom (~170 LUT elements) while a runaway still dies at ~1K
+// instead of 10K+ tokens. MIN_CYCLES has a hard floor of 2: at 1 the inner
+// loop could run zero iterations (span == p) and flag ANY tail as periodic.
+// Returns the detected period (>0) or 0.
+static std::atomic<long> g_rep_loop_cuts{0};     // /stats: lifetime cut count
+static std::atomic<long> g_rep_loop_resumes{0};  // /stats: lifetime auto-resumes
+// Auto-resume budget per request: when a generation is rep-loop cut, the HTTP
+// layer collapses the looped tail to 2 cycles and re-submits the request as a
+// token-level continuation (REP_LOOP_RESUME times, default 2). Rewinding
+// alone can NEVER fix a greedy loop — same context, same trajectory — so the
+// collapse IS the perturbation that breaks the cycle. 0 disables (cut-only).
+static int rep_loop_resume_max() {
+    static const int v = []{ const char* e = getenv("REP_LOOP_RESUME"); int x = e ? atoi(e) : 2; return x >= 0 ? x : 2; }();
+    return v;
+}
+// Collapse the maximal p-periodic suffix of ids down to two cycles. The
+// detector guarantees >= span tokens of tail periodicity, but the loop may
+// have started earlier — extend backwards while ids[i] == ids[i+p].
+static std::vector<int> rep_collapse_tail(const std::vector<int>& ids, int p) {
+    int n = (int)ids.size();
+    if (p <= 0 || n < 2 * p) return ids;
+    int s = n - p;
+    while (s - 1 >= 0 && ids[s - 1] == ids[s - 1 + p]) s--;
+    int keep = std::min(n, s + 2 * p);
+    return std::vector<int>(ids.begin(), ids.begin() + keep);
+}
+static int detect_rep_loop(const std::vector<int>& ids) {
+    static const bool enabled = []{ const char* e = getenv("REP_LOOP_BREAK"); return !e || e[0] != '0'; }();
+    if (!enabled) return 0;
+    static const int max_period = []{ const char* e = getenv("REP_LOOP_MAX_PERIOD"); int v = e ? atoi(e) : 64;   return v > 0 ? v : 64; }();
+    static const int min_span   = []{ const char* e = getenv("REP_LOOP_MIN_SPAN");   int v = e ? atoi(e) : 1024; return v > 0 ? v : 1024; }();
+    static const int min_cycles = []{ const char* e = getenv("REP_LOOP_MIN_CYCLES"); int v = e ? atoi(e) : 8;    return v >= 2 ? v : 2; }();
+    int n = (int)ids.size();
+    if (n < min_span) return 0;
+    const int* d = ids.data();
+    for (int p = 1; p <= max_period; p++) {
+        int span = std::max(min_span, min_cycles * p);
+        if (n < span) break;  // longer periods need even longer evidence
+        bool periodic = true;
+        for (int i = n - span + p; i < n; i++) {
+            if (d[i] != d[i - p]) { periodic = false; break; }
+        }
+        if (periodic) return p;
+    }
+    return 0;
+}
+
 int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const Tokenizer& tok, const std::string& model_name, const std::string& api_key = "", int max_seq = 262144, int num_slots = 1, const std::vector<int>& slot_caps = {}, const std::string& proxy_embed_url = "", const std::string& proxy_rerank_url = "") {
     QwenModel model;
     model.gpu = &gpu_model;
@@ -1973,6 +2035,11 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                              int* batched_handoff_first_tok = nullptr,
                              int* batched_handoff_slot_pos = nullptr,
                              std::atomic<bool>* cancelled = nullptr,
+                             // Out-flag: set to the detected cycle period
+                             // when the rep-loop cutter ends the generation
+                             // (HTTP layer auto-resumes or maps to
+                             // finish_reason "length").
+                             std::atomic<int>* rep_cut = nullptr,
                              // Dynamic slot-router yield (RANK 1). When
                              // dyn_yield_tok is non-null AND router_yield_signal
                              // fires mid-generation, the MTP loop breaks at a
@@ -2854,6 +2921,13 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
             if (tok == 248068) in_think = true;
             if (tok == 248069) in_think = false;
             if (!in_think) output_tokens++;
+            if (int p = detect_rep_loop(generated)) {
+                fprintf(stderr, "[REP-LOOP] cut slot0 gen: period=%d at %zu tokens\n",
+                        p, generated.size());
+                g_rep_loop_cuts.fetch_add(1, std::memory_order_relaxed);
+                if (rep_cut) rep_cut->store(p, std::memory_order_relaxed);
+                return true;
+            }
             return output_tokens >= max_gen;
         };
         int step_cap = std::min((int)prompt_ids.size() + max_gen + 4096, max_seq);
@@ -3244,6 +3318,13 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     if (generated.size() >= 4) {
                         std::string tail = tok.decode(std::vector<int>(generated.end()-4, generated.end()));
                         if (tail.find("</tool_call>") != std::string::npos) break;
+                    }
+                    if (int p = detect_rep_loop(generated)) {
+                        fprintf(stderr, "[REP-LOOP] cut slot0 nonspec: period=%d at %zu tokens\n",
+                                p, generated.size());
+                        g_rep_loop_cuts.fetch_add(1, std::memory_order_relaxed);
+                        if (rep_cut) rep_cut->store(p, std::memory_order_relaxed);
+                        break;
                     }
 
                     // ===================== DFlash speculative decode =====================
@@ -4420,6 +4501,9 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         // so a queued-up burst of disconnected requests doesn't burn GPU
         // generating tokens nobody will see.
         std::atomic<bool>*        cancelled = nullptr;
+        // Pointer to the owning Sequence's rep_cut atomic — set to the
+        // detected cycle period when the rep-loop cutter stops this slot.
+        std::atomic<int>*         rep_cut = nullptr;
         // Completion signaling (the run_fn waits on this after handing the
         // sequence off to the gen loop).
         std::mutex                done_mu;
@@ -4495,7 +4579,8 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     final_text = generate_impl(seq.prompt_ids, seq.max_tokens,
                                                seq.cached_prompt_tokens,
                                                &completion_tokens, on_tok, slot,
-                                               nullptr, nullptr, &seq.cancelled);
+                                               nullptr, nullptr, &seq.cancelled,
+                                           &seq.rep_cut);
                 } catch (...) { sampler.grammar = nullptr; throw; }
                 sampler.grammar = nullptr;
                 if (seq.on_done) seq.on_done(std::move(final_text), completion_tokens);
@@ -4508,7 +4593,8 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 final_text = generate_impl(seq.prompt_ids, seq.max_tokens,
                                            seq.cached_prompt_tokens,
                                            &completion_tokens, on_tok, slot,
-                                           nullptr, nullptr, &seq.cancelled);
+                                           nullptr, nullptr, &seq.cancelled,
+                                           &seq.rep_cut);
                 if (seq.on_done) seq.on_done(std::move(final_text), completion_tokens);
                 return;
             }
@@ -4557,6 +4643,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                                                    seq.cached_prompt_tokens,
                                                    &completion_tokens, on_tok, slot,
                                                    nullptr, nullptr, &seq.cancelled,
+                                                   &seq.rep_cut,
                                                    &dyn_yield_tok, &dyn_yield_pos,
                                                    &dyn_yield_gen,
                                                    &dyn_yield_output_tokens,
@@ -4585,7 +4672,8 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 generate_impl(seq.prompt_ids, seq.max_tokens,
                               seq.cached_prompt_tokens,
                               &completion_tokens, on_tok, slot,
-                              &first_tok, &slot_pos_after, &seq.cancelled);
+                              &first_tok, &slot_pos_after, &seq.cancelled,
+                              &seq.rep_cut);
             } else {
                 first_tok      = dyn_yield_tok;
                 slot_pos_after = dyn_yield_pos;
@@ -4598,6 +4686,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 st.done = false;
                 st.on_token = on_tok;
                 st.cancelled = &seq.cancelled;
+                st.rep_cut = &seq.rep_cut;
                 int prompt_len = (int)seq.prompt_ids.size();
                 st.max_gen = seq.max_tokens > 0
                              ? seq.max_tokens
@@ -4721,6 +4810,15 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                                 std::string ts = tok.decode(tail);
                                 if (ts.find("</tool_call>") != std::string::npos) stop = true;
                             }
+                            if (!stop) {
+                                if (int p = detect_rep_loop(st.generated)) {
+                                    fprintf(stderr, "[REP-LOOP] cut slot%d batched: period=%d at %zu tokens\n",
+                                            s, p, st.generated.size());
+                                    g_rep_loop_cuts.fetch_add(1, std::memory_order_relaxed);
+                                    if (st.rep_cut) st.rep_cut->store(p, std::memory_order_relaxed);
+                                    stop = true;
+                                }
+                            }
                             if (!stop && st.slot_pos >= model.slot_capacity(s) - 1) stop = true;
                         }
                         if (stop) {
@@ -4762,6 +4860,8 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
            << ",\"active\":" << active
            << ",\"queued\":" << sched.queued_count()
            << ",\"queue_cap\":" << max_queue
+           << ",\"rep_loop_cuts\":" << g_rep_loop_cuts.load(std::memory_order_relaxed)
+           << ",\"rep_loop_resumes\":" << g_rep_loop_resumes.load(std::memory_order_relaxed)
            << "}";
         return os.str();
     };
@@ -4776,48 +4876,89 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                              const ResponseFormat& rf,
                              int client_fd,
                              int requested_slot,
-                             int* out_completion_tokens) -> std::string {
-        auto seq = std::make_shared<qwen_engine::Sequence>();
-        seq->prompt_ids           = prompt_ids;
-        seq->max_tokens           = max_tokens;
-        seq->cached_prompt_tokens = cached_prompt_tokens;
-        seq->requested_slot       = requested_slot;
-        if (rf.json_mode) seq->grammar = std::make_shared<qwen_engine::JsonGrammar>();
+                             int* out_completion_tokens,
+                             std::atomic<bool>* out_truncated) -> std::string {
+        // Rep-loop auto-resume loop. Each attempt is a fresh Sequence; on a
+        // rep-loop cut we collapse this attempt's looped tail to 2 cycles,
+        // append it to the prompt and resubmit pinned to the same slot (the
+        // prefix cache makes the re-prefill a delta). Non-streaming clients
+        // get the CLEAN text (collapsed ids decoded once at the end), so a
+        // recovered response never shows the runaway stretch. JSON-grammar
+        // requests never resume (the grammar state machine can't be re-seeded
+        // mid-document) — they keep cut-only behavior.
+        std::vector<int> cur_prompt = prompt_ids;
+        std::vector<int> out_ids;                 // kept (collapsed) output ids
+        int pinned_slot = requested_slot;
+        int cached_toks = cached_prompt_tokens;
+        int resumes = 0;
+        for (;;) {
+            auto seq = std::make_shared<qwen_engine::Sequence>();
+            seq->prompt_ids           = cur_prompt;
+            seq->max_tokens           = max_tokens;
+            seq->cached_prompt_tokens = cached_toks;
+            seq->requested_slot       = pinned_slot;
+            if (rf.json_mode) seq->grammar = std::make_shared<qwen_engine::JsonGrammar>();
+            auto attempt_ids = std::make_shared<std::vector<int>>();
+            seq->on_token = [attempt_ids](int t) { attempt_ids->push_back(t); };
 
-        std::mutex done_mu;
-        std::condition_variable done_cv;
-        bool done = false;
-        std::string final_text;
-        int comp = 0;
-        seq->on_done = [&](std::string text, int n) {
-            {
-                std::lock_guard<std::mutex> lk(done_mu);
-                final_text = std::move(text);
-                comp = n;
-                done = true;
+            std::mutex done_mu;
+            std::condition_variable done_cv;
+            bool done = false;
+            seq->on_done = [&](std::string /*text*/, int /*n*/) {
+                {
+                    std::lock_guard<std::mutex> lk(done_mu);
+                    done = true;
+                }
+                done_cv.notify_all();
+            };
+            if (!sched.submit(seq)) {
+                if (out_completion_tokens) *out_completion_tokens = 0;
+                return std::string("[server overloaded — queue full]");
             }
-            done_cv.notify_all();
-        };
-        if (!sched.submit(seq)) {
-            if (out_completion_tokens) *out_completion_tokens = 0;
-            return std::string("[server overloaded — queue full]");
-        }
-        {
-            std::unique_lock<std::mutex> lk(done_mu);
-            while (!done) {
-                done_cv.wait_for(lk, std::chrono::milliseconds(100), [&]() { return done; });
-                if (done) break;
-                if (client_fd >= 0 && !seq->cancelled.load(std::memory_order_acquire)) {
-                    struct pollfd pfd { client_fd, POLLRDHUP | POLLHUP | POLLERR, 0 };
-                    if (poll(&pfd, 1, 0) > 0 &&
-                        (pfd.revents & (POLLRDHUP | POLLHUP | POLLERR))) {
-                        seq->cancelled.store(true, std::memory_order_release);
+            {
+                std::unique_lock<std::mutex> lk(done_mu);
+                while (!done) {
+                    done_cv.wait_for(lk, std::chrono::milliseconds(100), [&]() { return done; });
+                    if (done) break;
+                    if (client_fd >= 0 && !seq->cancelled.load(std::memory_order_acquire)) {
+                        struct pollfd pfd { client_fd, POLLRDHUP | POLLHUP | POLLERR, 0 };
+                        if (poll(&pfd, 1, 0) > 0 &&
+                            (pfd.revents & (POLLRDHUP | POLLHUP | POLLERR))) {
+                            seq->cancelled.store(true, std::memory_order_release);
+                        }
                     }
                 }
             }
+            int p = seq->rep_cut.load(std::memory_order_relaxed);
+            bool can_resume = p > 0 && !rf.json_mode
+                           && resumes < rep_loop_resume_max()
+                           && !seq->cancelled.load(std::memory_order_acquire);
+            if (can_resume) {
+                resumes++;
+                g_rep_loop_resumes.fetch_add(1, std::memory_order_relaxed);
+                std::vector<int> kept = rep_collapse_tail(*attempt_ids, p);
+                fprintf(stderr, "[REP-LOOP] resume %d/%d: collapsed %zu -> %zu tokens (period %d)\n",
+                        resumes, rep_loop_resume_max(), attempt_ids->size(), kept.size(), p);
+                out_ids.insert(out_ids.end(), kept.begin(), kept.end());
+                cur_prompt.insert(cur_prompt.end(), kept.begin(), kept.end());
+                pinned_slot = seq->slot_id;   // stay on the slot: prefix cache
+                cached_toks = 0;              // auto prefix cache handles reuse
+                continue;
+            }
+            // Final attempt: if it was still cut (resumes exhausted), collapse
+            // the junk tail in the clean text too — the client gets 2 cycles,
+            // not 1024 tokens of loop — and mark the response truncated.
+            if (p > 0) {
+                std::vector<int> kept = rep_collapse_tail(*attempt_ids, p);
+                out_ids.insert(out_ids.end(), kept.begin(), kept.end());
+                if (out_truncated) out_truncated->store(true, std::memory_order_relaxed);
+            } else {
+                out_ids.insert(out_ids.end(), attempt_ids->begin(), attempt_ids->end());
+            }
+            break;
         }
-        if (out_completion_tokens) *out_completion_tokens = comp;
-        return final_text;
+        if (out_completion_tokens) *out_completion_tokens = (int)out_ids.size();
+        return tok.decode(out_ids);
     };
     // Match llama.cpp: no <think> prefill. 모델이 자율적으로 필요 시
     // `<think>` 열고 닫음. 웹 UI splitThink 는 `<think>` 로 시작하는
@@ -4834,67 +4975,88 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                                     int cached_prompt_tokens,
                                     const ResponseFormat& rf,
                                     int requested_slot,
-                                    StreamCallback cb) {
-        auto seq = std::make_shared<qwen_engine::Sequence>();
-        seq->prompt_ids           = prompt_ids;
-        seq->max_tokens           = max_tokens;
-        seq->cached_prompt_tokens = cached_prompt_tokens;
-        seq->requested_slot       = requested_slot;
-        if (rf.json_mode) seq->grammar = std::make_shared<qwen_engine::JsonGrammar>();
-
-        // utf8_buf is owned by the lambda captures — the worker thread runs
-        // on_token, then on_done; both fire before the request handler
-        // returns thanks to the cv wait below.
+                                    StreamCallback cb,
+                                    std::atomic<bool>* out_truncated) {
+        // Rep-loop auto-resume (streaming flavor). Tokens already delivered
+        // to the client can't be unsent, so the stream shows the (bounded)
+        // repetition stretch and then simply keeps going after the server
+        // resumes with the collapsed-context continuation. The final done
+        // callback fires exactly once, after the last attempt.
+        std::vector<int> cur_prompt = prompt_ids;
+        int pinned_slot = requested_slot;
+        int cached_toks = cached_prompt_tokens;
+        int resumes = 0;
+        // utf8_buf carries a partial multi-byte char across attempts too.
         auto utf8_buf = std::make_shared<std::string>();
-        // Capture seq raw pointer for the on_token closure so it can mark
-        // the Sequence as cancelled when SSE delivery fails. We hold a
-        // shared_ptr above so the raw pointer stays valid for the duration
-        // of generate_impl + gen_loop activity (both finish before this
-        // function returns, thanks to the cv wait below).
-        auto* seq_raw = seq.get();
-        seq->on_token = [seq_raw, utf8_buf, cb](int tok_id) {
-            // Tokenization happens elsewhere — but the closure needs `tok`
-            // for decode. We can't capture `tok` by reference here because
-            // this lambda outlives the enclosing serve_qwen frame... wait,
-            // it doesn't: serve_qwen runs the HTTP loop in start(port) and
-            // owns `tok`. So tok& by capture is fine via the [&] above.
-            // Re-add the [&] capture for tok and friends:
-        };
-        // Replace with the proper capture (need [&] for tok decode + cb).
-        seq->on_token = [&, utf8_buf, seq_raw](int tok_id) {
-            if (seq_raw->cancelled.load(std::memory_order_acquire)) return;
-            *utf8_buf += tok.decode_token(tok_id);
-            std::string complete = Tokenizer::extract_complete_utf8(*utf8_buf);
-            if (!complete.empty()) {
-                if (!cb(complete, false)) {
-                    seq_raw->cancelled.store(true, std::memory_order_release);
-                }
-            }
-        };
+        bool client_gone = false;
+        for (;;) {
+            auto seq = std::make_shared<qwen_engine::Sequence>();
+            seq->prompt_ids           = cur_prompt;
+            seq->max_tokens           = max_tokens;
+            seq->cached_prompt_tokens = cached_toks;
+            seq->requested_slot       = pinned_slot;
+            if (rf.json_mode) seq->grammar = std::make_shared<qwen_engine::JsonGrammar>();
+            auto attempt_ids = std::make_shared<std::vector<int>>();
 
-        std::mutex done_mu;
-        std::condition_variable done_cv;
-        bool done = false;
-        seq->on_done = [&, utf8_buf, seq_raw](std::string /*final_text*/, int /*n*/) {
-            if (!seq_raw->cancelled.load(std::memory_order_acquire)) {
-                if (!utf8_buf->empty()) { cb(*utf8_buf, false); utf8_buf->clear(); }
+            // Capture seq raw pointer for the on_token closure so it can mark
+            // the Sequence as cancelled when SSE delivery fails. The shared_ptr
+            // above outlives the worker activity (cv wait below).
+            auto* seq_raw = seq.get();
+            seq->on_token = [&, utf8_buf, seq_raw, attempt_ids](int tok_id) {
+                attempt_ids->push_back(tok_id);
+                if (seq_raw->cancelled.load(std::memory_order_acquire)) return;
+                *utf8_buf += tok.decode_token(tok_id);
+                std::string complete = Tokenizer::extract_complete_utf8(*utf8_buf);
+                if (!complete.empty()) {
+                    if (!cb(complete, false)) {
+                        seq_raw->cancelled.store(true, std::memory_order_release);
+                    }
+                }
+            };
+
+            std::mutex done_mu;
+            std::condition_variable done_cv;
+            bool done = false;
+            seq->on_done = [&](std::string /*final_text*/, int /*n*/) {
+                {
+                    std::lock_guard<std::mutex> lk(done_mu);
+                    done = true;
+                }
+                done_cv.notify_all();
+            };
+
+            if (!sched.submit(seq)) {
+                // Queue at cap. Tell the client and bail.
                 cb("", true);
+                return;
             }
             {
-                std::lock_guard<std::mutex> lk(done_mu);
-                done = true;
+                std::unique_lock<std::mutex> lk(done_mu);
+                done_cv.wait(lk, [&]() { return done; });
             }
-            done_cv.notify_all();
-        };
-
-        if (!sched.submit(seq)) {
-            // Queue at cap. Tell the client and bail.
-            cb("", true);
-            return;
+            client_gone = seq->cancelled.load(std::memory_order_acquire);
+            int p = seq->rep_cut.load(std::memory_order_relaxed);
+            bool can_resume = p > 0 && !rf.json_mode
+                           && resumes < rep_loop_resume_max()
+                           && !client_gone;
+            if (can_resume) {
+                resumes++;
+                g_rep_loop_resumes.fetch_add(1, std::memory_order_relaxed);
+                std::vector<int> kept = rep_collapse_tail(*attempt_ids, p);
+                fprintf(stderr, "[REP-LOOP] resume %d/%d (stream): collapsed %zu -> %zu tokens (period %d)\n",
+                        resumes, rep_loop_resume_max(), attempt_ids->size(), kept.size(), p);
+                cur_prompt.insert(cur_prompt.end(), kept.begin(), kept.end());
+                pinned_slot = seq->slot_id;
+                cached_toks = 0;
+                continue;
+            }
+            if (p > 0 && out_truncated)
+                out_truncated->store(true, std::memory_order_relaxed);
+            break;
         }
-        {
-            std::unique_lock<std::mutex> lk(done_mu);
-            done_cv.wait(lk, [&]() { return done; });
+        if (!client_gone) {
+            if (!utf8_buf->empty()) { cb(*utf8_buf, false); utf8_buf->clear(); }
+            cb("", true);
         }
     };
 
@@ -5833,7 +5995,8 @@ int serve_gemma(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
                         const ResponseFormat& /*rf*/,
                         int /*client_fd*/,
                         int /*requested_slot*/,
-                        int* out_completion_tokens) -> std::string {
+                        int* out_completion_tokens,
+                        std::atomic<bool>* /*out_truncated*/) -> std::string {
         model.reset_all();
         std::vector<int> generated;
         auto t0 = std::chrono::high_resolution_clock::now();

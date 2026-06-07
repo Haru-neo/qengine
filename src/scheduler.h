@@ -82,6 +82,14 @@ struct Sequence {
     // per-token loops and break early so we don't waste GPU cycles
     // generating tokens nobody will receive.
     std::atomic<bool> cancelled{false};
+    // Repetition-loop cut signal: 0 = none, >0 = the detected cycle period.
+    // Set by the rep-loop detector when it stops this generation. The HTTP
+    // layer uses it to (a) auto-resume the request with the looped tail
+    // collapsed to 2 cycles (REP_LOOP_RESUME, breaks the deterministic
+    // greedy loop by changing the context), and (b) mark the response
+    // finish_reason "length" when resumes are exhausted — agent clients must
+    // be able to tell a truncated answer from a complete one.
+    std::atomic<int> rep_cut{0};
 };
 
 class SlotManager {

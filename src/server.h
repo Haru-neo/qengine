@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -572,12 +573,15 @@ struct ResponseFormat {
 // POLLRDHUP and abort the in-flight gen — without it, a closed non-streaming
 // client keeps the slot busy until natural completion since there's no
 // per-token send to fail.
-using GenerateFunc = std::function<std::string(const std::vector<int>& prompt_ids, int max_tokens, int cached_prompt_tokens, const ResponseFormat& rf, int client_fd, int requested_slot, int* out_completion_tokens)>;
+// `out_truncated` (nullable): the producer sets it when the generation was cut
+// short server-side (repetition-loop cutter with resumes exhausted) so the
+// response can carry finish_reason "length" instead of a misleading "stop".
+using GenerateFunc = std::function<std::string(const std::vector<int>& prompt_ids, int max_tokens, int cached_prompt_tokens, const ResponseFormat& rf, int client_fd, int requested_slot, int* out_completion_tokens, std::atomic<bool>* out_truncated)>;
 // StreamCallback returns true while the client is still receiving and false
 // once delivery has failed (EPIPE / closed connection). Producers should
 // stop generating as soon as it returns false.
 using StreamCallback = std::function<bool(const std::string& token_text, bool is_done)>;
-using StreamGenerateFunc = std::function<void(const std::vector<int>& prompt_ids, int max_tokens, int cached_prompt_tokens, const ResponseFormat& rf, int requested_slot, StreamCallback cb)>;
+using StreamGenerateFunc = std::function<void(const std::vector<int>& prompt_ids, int max_tokens, int cached_prompt_tokens, const ResponseFormat& rf, int requested_slot, StreamCallback cb, std::atomic<bool>* out_truncated)>;
 
 struct HttpServer {
     int port;
@@ -1264,6 +1268,7 @@ struct HttpServer {
                     + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<think>\\n\"},\"finish_reason\":null}]}");
             }
             bool client_alive = true;
+            std::atomic<bool> gen_truncated{false};
             stream_generate_fn(prompt_ids, max_tokens, cached_prompt_tokens, rf, requested_slot, [&](const std::string& token, bool done) -> bool {
                 if (!client_alive) return false;  // already dead, stop calling
                 if (done) {
@@ -1280,8 +1285,12 @@ struct HttpServer {
                         client_alive &= send_sse(client_fd, "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\""
                             + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}");
                     } else {
+                        // "length" = server cut the gen (rep-loop, resumes
+                        // exhausted) — distinguishable from a clean stop.
+                        const char* fr = gen_truncated.load(std::memory_order_relaxed)
+                                         ? "length" : "stop";
                         client_alive &= send_sse(client_fd, "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\""
-                            + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}");
+                            + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"" + std::string(fr) + "\"}]}");
                     }
                     client_alive &= send_sse(client_fd, "[DONE]");
                 } else {
@@ -1291,11 +1300,12 @@ struct HttpServer {
                         + json_escape(token) + "\"},\"finish_reason\":null}]}");
                 }
                 return client_alive;
-            });
+            }, &gen_truncated);
         } else {
             // Non-streaming response
             int completion_tokens = 0;
-            std::string generated_text = generate_fn(prompt_ids, max_tokens, cached_prompt_tokens, rf, client_fd, requested_slot, &completion_tokens);
+            std::atomic<bool> gen_truncated{false};
+            std::string generated_text = generate_fn(prompt_ids, max_tokens, cached_prompt_tokens, rf, client_fd, requested_slot, &completion_tokens, &gen_truncated);
 
             // The chat encoder may prefill "<think>\n" into the prompt, in
             // which case the generated text starts mid-think with no opening
@@ -1305,7 +1315,9 @@ struct HttpServer {
 
             // Parse tool calls from XML output
             auto parsed_calls = parse_tool_calls(full_text);
-            std::string finish_reason = parsed_calls.empty() ? "stop" : "tool_calls";
+            // Priority: tool_calls > length (server-side rep-loop cut) > stop.
+            std::string finish_reason = !parsed_calls.empty() ? "tool_calls"
+                : (gen_truncated.load(std::memory_order_relaxed) ? "length" : "stop");
 
             // Clean content: strip <think> and <tool_call> blocks
             std::string clean_content = strip_think_block(full_text);
