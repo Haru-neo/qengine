@@ -3001,6 +3001,26 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
             // whole window every iteration — bit-identical, O(n_new) not O(ctx).
             // DFLASH_DRAFT_CACHE=0 reverts to the full-recompute path (for A/B).
             static const bool dflash_cache_on = !getenv("DFLASH_DRAFT_CACHE") || atoi(getenv("DFLASH_DRAFT_CACHE")) != 0;
+            // DFLASH_TREE=1: branching-tree verify (top-2 leaf alternates +
+            // dup-children). See tree assembly in (5) below.
+            static const bool dflash_tree_on = getenv("DFLASH_TREE") && atoi(getenv("DFLASH_TREE")) != 0;
+            static const std::vector<int> tree_alt_depths = []{
+                std::vector<int> v;
+                const char* e = getenv("DFLASH_TREE_ALTS");
+                std::string s = e ? e : "1,2";
+                size_t p = 0;
+                while (p < s.size()) {
+                    size_t c = s.find(',', p);
+                    if (c == std::string::npos) c = s.size();
+                    if (c > p) v.push_back(atoi(s.substr(p, c - p).c_str()));
+                    p = c + 1;
+                }
+                return v;
+            }();
+            static const int tree_dup = getenv("DFLASH_TREE_DUP") ? atoi(getenv("DFLASH_TREE_DUP")) : 1;
+            const int tree_chain_M = dflash_tree_on
+                ? std::max(2, tree_budget - (int)tree_alt_depths.size() * (1 + tree_dup))
+                : tree_budget;
             if (dflash_fold_enabled && slot == 0 && dflash_enabled
                 && sampler.grammar == nullptr && step >= (int)prompt_ids.size()) {
                 auto df0 = prof_now();
@@ -3048,7 +3068,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 // posterior, unused; rows >= tree_budget never verified) -> GEMM
                 // exactly those rows. Row-independent quantize+GEMV = identical
                 // logits for the consumed rows, ~B/(budget-1) x less lm_head work.
-                int n_dr = tree_budget - 1;                    // draft rows consumed
+                int n_dr = tree_chain_M - 1;                   // draft rows consumed (chain M-1 rows; alts reuse their top-2)
                 static half* host_pinned_draft_f = nullptr;
                 if (!host_pinned_draft_f) cudaMallocHost(&host_pinned_draft_f, (size_t)B*H*sizeof(half));
                 auto drb0 = prof_now();
@@ -3067,7 +3087,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 static const bool fold_pos_accept = getenv("DFLASH_POS_ACCEPT") != nullptr;
                 int fold_top2[16];
                 int fold_chain[16];
-                if (fold_pos_accept) {
+                if (fold_pos_accept || dflash_tree_on) {
                     argmax_top2_half_rows_kernel<<<n_dr,1024>>>(tree_logits_buf, V, tree_d_argmax2);
                     cudaMemcpy(tree_h_argmax2, tree_d_argmax2, (size_t)2*n_dr*sizeof(int), cudaMemcpyDeviceToHost);
                     for (int d = 0; d < n_dr; d++) { fold_chain[d] = tree_h_argmax2[2*d]; fold_top2[d] = tree_h_argmax2[2*d+1]; }
@@ -3080,27 +3100,58 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 if (do_gen_prof) g_mtp += prof_sync_ms(df0, last_gpu);
 
                 // (5) verify: tokens=[anchor_tok, fold_chain[0..14]] @ pos_base=step
+                //
+                // DFLASH_TREE=1: branching tree instead of a pure chain.
+                //   slots 0..M-1            = main chain (depth == slot)
+                //   for each d in DFLASH_TREE_ALTS (default "1,2"):
+                //     1 leaf  = drafter top-2 at depth d (parent = chain d-1)
+                //     DFLASH_TREE_DUP dup-children re-using fold_chain[d..]
+                //     (the diffusion drafts are position-marginal, so the
+                //      chain continuation is a valid draft after the alt too)
+                // Routing: upload_parent_ids sets tree_is_chain=false ->
+                // attn falls to the per-token masked path (correct, slower);
+                // GDN takes the general parent_ids scan. Accept = root-to-leaf
+                // walk matching posterior; commits go through the path APIs.
                 std::vector<int> tokens_h(tree_budget), host_parents(tree_budget);
+                int n_ver = tree_budget;     // nodes actually verified
                 tokens_h[0] = anchor_tok; host_parents[0] = -1;
-                for (int t = 1; t < tree_budget; t++) { tokens_h[t] = fold_chain[t-1]; host_parents[t] = t-1; }
+                if (dflash_tree_on) {
+                    int M = tree_chain_M;    // main-chain slots (incl. root)
+                    for (int t = 1; t < M; t++) { tokens_h[t] = fold_chain[t-1]; host_parents[t] = t-1; }
+                    int s = M;
+                    for (int d : tree_alt_depths) {
+                        if (d < 1 || d >= M || s >= tree_budget) continue;
+                        tokens_h[s] = fold_top2[d-1]; host_parents[s] = d - 1;
+                        int prev = s; s++;
+                        for (int j = 0; j < tree_dup && s < tree_budget && d + j < M - 1; j++) {
+                            tokens_h[s] = fold_chain[d + j]; host_parents[s] = prev;
+                            prev = s; s++;
+                        }
+                    }
+                    n_ver = s;
+                    // fill tail (not verified, but upload reads tree_budget ints)
+                    for (int t = s; t < tree_budget; t++) { tokens_h[t] = fold_chain[0]; host_parents[t] = 0; }
+                } else {
+                    for (int t = 1; t < tree_budget; t++) { tokens_h[t] = fold_chain[t-1]; host_parents[t] = t-1; }
+                }
                 cudaSetDevice(0);
                 auto se0 = prof_now();
                 if (embd_t->type == GGML_TYPE_Q8_0) {
                     // Batched: budget dequant launches -> 1 (ids slot [16..31] of
                     // the staging buffer; slot [0..15] may still be in flight for
                     // the draft noise H2D on this stream).
-                    for (int b = 0; b < tree_budget; b++) tree_h_embed_ids[16+b] = tokens_h[b];
-                    cudaMemcpyAsync(tree_d_embed_ids+16, tree_h_embed_ids+16, (size_t)tree_budget*sizeof(int), cudaMemcpyHostToDevice, 0);
-                    dim3 eg((H+255)/256, tree_budget);
+                    for (int b = 0; b < n_ver; b++) tree_h_embed_ids[16+b] = tokens_h[b];
+                    cudaMemcpyAsync(tree_d_embed_ids+16, tree_h_embed_ids+16, (size_t)n_ver*sizeof(int), cudaMemcpyHostToDevice, 0);
+                    dim3 eg((H+255)/256, n_ver);
                     dequant_embd_q8_0_rows<<<eg,256>>>(embd_t->data, tree_hidden_half[0], tree_d_embed_ids+16, H);
                 } else {
-                    for (int b = 0; b < tree_budget; b++) {
+                    for (int b = 0; b < n_ver; b++) {
                         half* dst = tree_hidden_half[0] + (size_t)b*H;
                         if (embd_t->type == GGML_TYPE_Q5_K)      dequant_embd_q5k_row_v2<<<(H+255)/256,256>>>(embd_t->data, dst, tokens_h[b], H);
                         else if (embd_t->type == GGML_TYPE_Q6_K) dequant_embd_q6k_row_v2<<<(H+255)/256,256>>>(embd_t->data, dst, tokens_h[b], H);
                     }
                 }
-                half_to_float_kernel<<<(tree_budget*H+255)/256,256>>>(tree_hidden_half[0], tree_hidden[0], tree_budget*H);
+                half_to_float_kernel<<<(n_ver*H+255)/256,256>>>(tree_hidden_half[0], tree_hidden[0], n_ver*H);
                 if (do_gen_prof) g_embed += prof_sync_ms(se0, 0);
                 model.upload_parent_ids(host_parents.data(), 0);
 
@@ -3111,41 +3162,57 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     if (g_l != prev_g) {
                         auto tvx = prof_now();
                         cudaSetDevice(prev_g);
-                        cudaMemcpy(tree_host_transfer, h_tree, (size_t)tree_budget*H*sizeof(float), cudaMemcpyDeviceToHost);
+                        cudaMemcpy(tree_host_transfer, h_tree, (size_t)n_ver*H*sizeof(float), cudaMemcpyDeviceToHost);
                         cudaSetDevice(g_l);
-                        cudaMemcpy(tree_hidden[g_l], tree_host_transfer, (size_t)tree_budget*H*sizeof(float), cudaMemcpyHostToDevice);
+                        cudaMemcpy(tree_hidden[g_l], tree_host_transfer, (size_t)n_ver*H*sizeof(float), cudaMemcpyHostToDevice);
                         h_tree = tree_hidden[g_l];
                         if (do_gen_prof) g_tv_xfer += prof_sync_ms(tvx, g_l);
                     } else cudaSetDevice(g_l);
                     bool is_attn_t = model.is_attn_layer(layer);
                     auto tvl = prof_now();
-                    if (is_attn_t) { model.forward_attn_tree(layer, h_tree, step, tree_budget, model.tree_parent_ids_d[g_l], 0); if (do_gen_prof) g_tv_attn += prof_sync_ms(tvl, g_l); }
-                    else           { model.forward_gdn_tree(layer, h_tree, tree_budget, model.tree_parent_ids_d[g_l], 0);        if (do_gen_prof) g_tv_gdn  += prof_sync_ms(tvl, g_l); }
+                    if (is_attn_t) { model.forward_attn_tree(layer, h_tree, step, n_ver, model.tree_parent_ids_d[g_l], 0); if (do_gen_prof) g_tv_attn += prof_sync_ms(tvl, g_l); }
+                    else           { model.forward_gdn_tree(layer, h_tree, n_ver, model.tree_parent_ids_d[g_l], 0);        if (do_gen_prof) g_tv_gdn  += prof_sync_ms(tvl, g_l); }
                     auto tvm = prof_now();
-                    model.forward_mlp_tree(layer, h_tree, tree_budget, model.tree_parent_ids_d[g_l], 0);
+                    model.forward_mlp_tree(layer, h_tree, n_ver, model.tree_parent_ids_d[g_l], 0);
                     if (do_gen_prof) g_tv_mlp += prof_sync_ms(tvm, g_l);
                     auto tvc = prof_now();
-                    model.dflash_capture_tree_layer(layer, h_tree, tree_budget, g_l, 0);
+                    model.dflash_capture_tree_layer(layer, h_tree, n_ver, g_l, 0);
                     if (do_gen_prof) g_tv_cap += prof_sync_ms(tvc, g_l);
                 }
                 cudaSetDevice(last_gpu); cudaDeviceSynchronize();
                 auto sl0 = prof_now();
                 if (out_norm_t->type == GGML_TYPE_F32)
-                    rms_norm_f32in_f32w(tree_norm_buf, h_tree, (float*)out_norm_t->data, tree_budget, H, model.cfg.rms_norm_eps, 0);
+                    rms_norm_f32in_f32w(tree_norm_buf, h_tree, (float*)out_norm_t->data, n_ver, H, model.cfg.rms_norm_eps, 0);
                 else
-                    rms_norm_f32in(tree_norm_buf, h_tree, (half*)out_norm_t->data, tree_budget, H, model.cfg.rms_norm_eps, 0);
-                qi_logits_tree.quantize_chunk(tree_norm_buf, H, tree_budget, 0);
-                quant_gemv_chunk(out_w->data, out_w->type, qi_logits_tree.q8_buf, tree_logits_buf, H, V, tree_budget, 0);
-                argmax_half_rows_kernel<<<tree_budget,1024>>>(tree_logits_buf, V, tree_d_argmax);
-                cudaMemcpy(tree_h_argmax, tree_d_argmax, (size_t)tree_budget*sizeof(int), cudaMemcpyDeviceToHost);
+                    rms_norm_f32in(tree_norm_buf, h_tree, (half*)out_norm_t->data, n_ver, H, model.cfg.rms_norm_eps, 0);
+                qi_logits_tree.quantize_chunk(tree_norm_buf, H, n_ver, 0);
+                quant_gemv_chunk(out_w->data, out_w->type, qi_logits_tree.q8_buf, tree_logits_buf, H, V, n_ver, 0);
+                argmax_half_rows_kernel<<<n_ver,1024>>>(tree_logits_buf, V, tree_d_argmax);
+                cudaMemcpy(tree_h_argmax, tree_d_argmax, (size_t)n_ver*sizeof(int), cudaMemcpyDeviceToHost);
                 if (do_gen_prof) { g_logits += prof_sync_ms(sl0, last_gpu); g_spec_iters++; g_steps++; }
 
                 // (6) accept: posterior[i]=tree_h_argmax[i]=27B greedy @ step+1+i.
                 //     accept_drafts = largest m s.t. fold_chain[i]==posterior[i] for i<m.
                 int accept_drafts = 0;
-                for (int i = 0; i < tree_budget - 1; i++) {
-                    if (tree_h_argmax[i] == fold_chain[i]) accept_drafts++;
-                    else break;
+                std::vector<int> accept_path;        // tree mode: accepted node ids (root first)
+                if (dflash_tree_on) {
+                    // Root-to-leaf walk: descend into the child whose token
+                    // matches the parent's posterior (27B greedy).
+                    accept_path.reserve(n_ver); accept_path.push_back(0);
+                    int cur = 0;
+                    for (;;) {
+                        int want = tree_h_argmax[cur], next = -1;
+                        for (int s2 = cur + 1; s2 < n_ver; s2++)
+                            if (host_parents[s2] == cur && tokens_h[s2] == want) { next = s2; break; }
+                        if (next < 0) break;
+                        accept_path.push_back(next); cur = next;
+                    }
+                    accept_drafts = (int)accept_path.size() - 1;
+                } else {
+                    for (int i = 0; i < tree_budget - 1; i++) {
+                        if (tree_h_argmax[i] == fold_chain[i]) accept_drafts++;
+                        else break;
+                    }
                 }
                 // DFLASH_POS_ACCEPT stats: per-position conditional accept curve
                 // p_k = matched[k]/reached[k], plus top-2 recovery rate at the
@@ -3174,11 +3241,22 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         printf("\n"); fflush(stdout);
                     }
                 }
-                int accept_len_slots = accept_drafts + 1;     // slots 0..accept_drafts (positions step..step+accept_drafts)
-                model.commit_tree_gdn_chain(accept_len_slots);
-                std::vector<int> commit_slots(accept_len_slots);
-                for (int i = 0; i < accept_len_slots; i++) commit_slots[i] = i;
-                model.dflash_commit_tree_capture(commit_slots.data(), accept_len_slots, step);  // C[step..step+accept]
+                int accept_len_slots = accept_drafts + 1;     // path length incl. root
+                if (dflash_tree_on) {
+                    model.commit_tree_gdn_path(accept_path.data(), accept_len_slots);
+                    model.dflash_commit_tree_capture(accept_path.data(), accept_len_slots, step);  // C[step..step+accept]
+                    // Off-diagonal accepted nodes: move their K/V from the tree
+                    // slot position to the final chain position. (RoPE already
+                    // at depth position; pure storage move.)
+                    for (int i = 1; i < accept_len_slots; i++)
+                        if (accept_path[i] != i)
+                            model.kv_move_token(step + accept_path[i], step + i, 0);
+                } else {
+                    model.commit_tree_gdn_chain(accept_len_slots);
+                    std::vector<int> commit_slots(accept_len_slots);
+                    for (int i = 0; i < accept_len_slots; i++) commit_slots[i] = i;
+                    model.dflash_commit_tree_capture(commit_slots.data(), accept_len_slots, step);  // C[step..step+accept]
+                }
 
                 if (accept_drafts == tree_budget - 1) tree_accept_full_count++;
                 else if (accept_drafts > 0)            tree_accept_partial_count++;
@@ -3189,7 +3267,8 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 if (!got_first_tok) { t_first = std::chrono::high_resolution_clock::now(); got_first_tok = true; }
                 bool stopped_fold = false;
                 for (int i = 0; i <= accept_drafts && !stopped_fold; i++) {
-                    if (emit_tok(tree_h_argmax[i])) stopped_fold = true;
+                    int node = dflash_tree_on ? accept_path[i] : i;
+                    if (emit_tok(tree_h_argmax[node])) stopped_fold = true;
                 }
                 // (8) step advance. New slot0 = posterior[accept_drafts] @ step+1+accept_drafts.
                 //     step += accept_drafts; outer ++ -> next step = step+accept_drafts+1 = step+1+accept_drafts.

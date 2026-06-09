@@ -2369,6 +2369,13 @@ struct QwenModel {
             }
             attn_dump_f("score", ab.attn_scores, seq_len);
 
+            // Branching-tree verify on TQ/Q8 KV: the score kernels above have
+            // no masked variants, so stamp sibling-branch slots to -INF here
+            // (fp16 path already scored masked via the _tree_masked kernel).
+            if (mask_start >= 0 && (use_turboquant || use_q8_kv) && mask_len > 0)
+                apply_tree_mask_kernel<<<num_q, ((mask_len + 31) / 32) * 32, 0, stream>>>(
+                    ab.attn_scores, seq_len, mask_start, mask_len, mask_bits);
+
             { int st = 1; while(st < seq_len && st < 256) st <<= 1;
             softmax_kernel<<<num_q, st, st * sizeof(float), stream>>>(
                 ab.attn_scores, num_q, seq_len); }
@@ -6572,6 +6579,43 @@ struct QwenModel {
         }
         commit_path_node_ids_ready = true;
     }
+    // Tree-branch accept: an accepted node sat at KV position pos_base+slot
+    // but belongs at pos_base+depth. Its K/V were RoPE'd at the depth position
+    // already (forward_*_tree uses depth-based RoPE), so committing is a pure
+    // storage move of one token's K/V per attention layer.
+    void kv_move_token(int from_pos, int to_pos, cudaStream_t stream = 0, int slot = 0) {
+        if (from_pos == to_pos) return;
+        for (int layer = 0; layer < cfg.num_layers; layer++) {
+            if (!is_attn_layer(layer)) continue;
+            int g = gpu->layer_gpu[layer];
+            cudaSetDevice(g);
+            if (use_turboquant) {
+                auto& tq = tq_kv_caches[layer];
+                int bpt = tq.blocks_per_token;
+                size_t off = kv_slot_offset(slot) * (size_t)bpt;
+                cudaMemcpyAsync(tq.k + off + (size_t)to_pos * bpt,
+                                tq.k + off + (size_t)from_pos * bpt,
+                                (size_t)bpt * sizeof(block_tq3),
+                                cudaMemcpyDeviceToDevice, stream);
+                cudaMemcpyAsync(tq.v + off + (size_t)to_pos * bpt,
+                                tq.v + off + (size_t)from_pos * bpt,
+                                (size_t)bpt * sizeof(block_tq3),
+                                cudaMemcpyDeviceToDevice, stream);
+            } else if (!use_q8_kv) {
+                auto& kv = kv_caches[layer];
+                size_t row = (size_t)cfg.num_kv_heads * cfg.head_dim;
+                size_t off = kv_slot_offset(slot) * row;
+                cudaMemcpyAsync(kv.k + off + (size_t)to_pos * row,
+                                kv.k + off + (size_t)from_pos * row,
+                                row * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+                cudaMemcpyAsync(kv.v + off + (size_t)to_pos * row,
+                                kv.v + off + (size_t)from_pos * row,
+                                row * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+            }
+            // (Q8 KV: tree mode unsupported — caller guards.)
+        }
+    }
+
     void commit_tree_gdn_path(const int* host_slots, int path_len) {
         if (path_len <= 0) return;
         if (!tree_ready || !tree_qkv_persist_ready) return;

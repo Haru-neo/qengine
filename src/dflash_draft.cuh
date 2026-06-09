@@ -28,8 +28,38 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 
 namespace dflash {
+
+// ── DFLASH_DRAFT_PROF=1: phase timers inside draft_forward_cached ─────────
+// (device-sync per phase — measurement runs only; prints every 200 calls)
+struct DraftProf {
+    bool on = false;
+    double t_newrows = 0, t_unwrap = 0, t_proj = 0, t_rope = 0,
+           t_attn = 0, t_oproj_mlp = 0, t_other = 0;
+    long calls = 0;
+    DraftProf() { const char* e = getenv("DFLASH_DRAFT_PROF"); on = e && atoi(e) != 0; }
+    static double ms_since(std::chrono::high_resolution_clock::time_point t0) {
+        cudaDeviceSynchronize();
+        return std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t0).count();
+    }
+    void dump_maybe() {
+        if (++calls % 200) return;
+        double tot = t_newrows + t_unwrap + t_proj + t_rope + t_attn + t_oproj_mlp + t_other;
+        printf("[DRAFT-PROF] calls=%ld tot=%.0fms (%.2fms/call): newrows=%.0f(%.0f%%) "
+               "unwrap=%.0f(%.0f%%) proj=%.0f(%.0f%%) rope=%.0f(%.0f%%) attn=%.0f(%.0f%%) "
+               "oproj+mlp=%.0f(%.0f%%) other=%.0f(%.0f%%)\n",
+               calls, tot, tot / calls,
+               t_newrows, 100*t_newrows/tot, t_unwrap, 100*t_unwrap/tot,
+               t_proj, 100*t_proj/tot, t_rope, 100*t_rope/tot,
+               t_attn, 100*t_attn/tot, t_oproj_mlp, 100*t_oproj_mlp/tot,
+               t_other, 100*t_other/tot);
+        fflush(stdout);
+    }
+};
+inline DraftProf g_draft_prof;
 
 // ── Compile-time draft dimensions (z-lab/Qwen3.5-27B-DFlash, fixed) ────────
 struct DraftConfig {
@@ -1037,6 +1067,8 @@ inline void draft_forward_cached(
     int first_new_abs = last_pos - n_new + 1;          // absolute pos of first new row
 
     // ── (A) project the new context rows' K/V into the ring ───────────────
+    auto& dp = g_draft_prof;
+    auto t0 = std::chrono::high_resolution_clock::now();
     if (n_new > 0) {
         // target_feat for new rows = LAST n_new rows of C_view (newest = newly committed)
         const half* C_new = target_hidden_cat
@@ -1074,6 +1106,7 @@ inline void draft_forward_cached(
         }
     }
     m.cache_last_pos = last_pos;
+    if (dp.on) { dp.t_newrows += DraftProf::ms_since(t0); t0 = std::chrono::high_resolution_clock::now(); }
 
     // ── (B) 5-layer forward of the 16 noise tokens over cached context ────
     cudaMemcpyAsync(m.h_buf, noise_embed, (size_t)q_len * C::hidden_size * sizeof(half),
@@ -1085,12 +1118,14 @@ inline void draft_forward_cached(
         const DraftLayer& L = m.layers[il];
 
         half* hn = m.attn_out_buf;
+        if (dp.on) t0 = std::chrono::high_resolution_clock::now();
         rms_norm(hn, m.h_buf, L.attn_norm, q_len, C::hidden_size, C::rms_eps, stream);
 
         // Q from noise
         q8gemm::launch_quantize_input_q8_1(hn, m.xq_scratch, q_len, C::hidden_size, stream);
         q8gemm::launch_gemm_q8_0_q8_1(L.wq, m.xq_scratch, m.q_buf, C::q_dim, q_len, C::hidden_size, stream);
         launch_per_head_rms_norm(m.q_buf, L.q_norm, q_len, C::num_q_heads, C::head_dim, C::rms_eps, stream);
+        if (dp.on) { dp.t_proj += DraftProf::ms_since(t0); t0 = std::chrono::high_resolution_clock::now(); }
 
         // unwrap cached context K/V (pre-RoPE) into k_buf[0..ctx_len), v_buf[0..ctx_len)
         cudaMemcpyAsync(m.k_buf, m.kctx_cache[il] + (size_t)ring_start * C::kv_dim,
@@ -1104,23 +1139,29 @@ inline void draft_forward_cached(
                             (size_t)u_seg2 * C::kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, stream);
         }
 
-        // noise K/V appended at [ctx_len..total_k); k_norm the noise rows only
-        q8gemm::launch_quantize_input_q8_1(hn, m.xq_scratch, q_len, C::hidden_size, stream);
+        if (dp.on) { dp.t_unwrap += DraftProf::ms_since(t0); t0 = std::chrono::high_resolution_clock::now(); }
+
+        // noise K/V appended at [ctx_len..total_k); k_norm the noise rows only.
+        // (hn is already quantized in xq_scratch from the Q projection above —
+        // nothing touches xq_scratch in between, so skip the re-quantize.)
         half* k_n = m.k_buf + (size_t)ctx_len * C::kv_dim;
         half* v_n = m.v_buf + (size_t)ctx_len * C::kv_dim;
         q8gemm::launch_gemm_q8_0_q8_1(L.wk, m.xq_scratch, k_n, C::kv_dim, q_len, C::hidden_size, stream);
         q8gemm::launch_gemm_q8_0_q8_1(L.wv, m.xq_scratch, v_n, C::kv_dim, q_len, C::hidden_size, stream);
         launch_per_head_rms_norm(k_n, L.k_norm, q_len, C::num_kv_heads, C::head_dim, C::rms_eps, stream);
+        if (dp.on) { dp.t_proj += DraftProf::ms_since(t0); t0 = std::chrono::high_resolution_clock::now(); }
 
         // RoPE Q and the FULL K (context pre-RoPE + noise pre-RoPE) — window-relative positions
         launch_rope_neox(m.q_buf, positions_q, q_len,   C::num_q_heads,  C::head_dim, C::head_dim, C::rope_theta, stream);
         launch_rope_neox(m.k_buf, positions_k, total_k, C::num_kv_heads, C::head_dim, C::head_dim, C::rope_theta, stream);
+        if (dp.on) { dp.t_rope += DraftProf::ms_since(t0); t0 = std::chrono::high_resolution_clock::now(); }
 
         // attention (non-causal full)
         float scale = 1.0f / sqrtf((float)C::head_dim);
         launch_attn_full(m.q_buf, m.k_buf, m.v_buf, m.attn_out_buf,
                          q_len, total_k, C::num_q_heads, C::num_kv_heads, C::head_dim,
                          scale, stream);
+        if (dp.on) { dp.t_attn += DraftProf::ms_since(t0); t0 = std::chrono::high_resolution_clock::now(); }
 
         // output projection + residual
         {
@@ -1143,9 +1184,11 @@ inline void draft_forward_cached(
             q8gemm::launch_gemm_q8_0_q8_1(L.w_down, m.xq_scratch, ffn_out, C::hidden_size, q_len, C::intermediate_size, stream);
             launch_residual_add(m.h_buf, ffn_out, (size_t)q_len * C::hidden_size, stream);
         }
+        if (dp.on) { dp.t_oproj_mlp += DraftProf::ms_since(t0); }
     }
 
     rms_norm(m.h_buf, m.h_buf, m.out_norm, q_len, C::hidden_size, C::rms_eps, stream);
+    if (dp.on) dp.dump_maybe();
 }
 
 inline void free_draft(DraftModel& m) {

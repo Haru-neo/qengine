@@ -315,6 +315,22 @@ __global__ void attn_score_kernel_h(
     }
 }
 
+// Tree-mask post-pass: stamps -INF onto already-computed scores for tree
+// slots the query may not attend (sibling branches). Lets the TQ / Q8 score
+// kernels (which have no masked variants) support branching-tree verify:
+// score normally, then mask before softmax. grid = num_q, block >= mask_len.
+__global__ void apply_tree_mask_kernel(
+    float* __restrict__ scores, int seq_len,
+    int mask_start, int mask_len, uint32_t mask_bits
+) {
+    int k = threadIdx.x;
+    if (k >= mask_len) return;
+    int pos = mask_start + k;
+    if (pos >= seq_len) return;
+    if (!((mask_bits >> k) & 1u))
+        scores[(size_t)blockIdx.x * seq_len + pos] = -INFINITY;
+}
+
 // DDTree: same as attn_score_kernel_h but writes -INF for KV slots that the
 // current query is not allowed to attend to (sibling tree branches). A mask
 // is applied to positions in [mask_start, mask_start + mask_len) — bit k of
