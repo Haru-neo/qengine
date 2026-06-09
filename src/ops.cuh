@@ -751,6 +751,26 @@ __global__ void dequant_embd_q8_0_row(
     out[idx] = __float2half(__half2float(row[blk].d) * row[blk].qs[elem]);
 }
 
+// Batched variant: dequant N embedding rows in ONE launch. ids is a device
+// array of N token ids; out row b receives embed(ids[b]). grid = (H/256, N).
+// Replaces N back-to-back dequant_embd_q8_0_row launches in the DFlash loop
+// (launch latency is per-iter fixed cost there).
+__global__ void dequant_embd_q8_0_rows(
+    const void* __restrict__ embd, half* __restrict__ out,
+    const int* __restrict__ ids, int H
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= H) return;
+    int token_id = ids[blockIdx.y];
+    struct __align__(4) bq8_0 { int8_t qs[32]; uint16_t pad; half d; };
+    int blocks_per_row = H / 32;
+    const bq8_0* row = (const bq8_0*)embd + (size_t)token_id * blocks_per_row;
+    int blk = idx / 32;
+    int elem = idx % 32;
+    out[(size_t)blockIdx.y * H + idx] =
+        __float2half(__half2float(row[blk].d) * row[blk].qs[elem]);
+}
+
 // Q8_K: 256 elements per block, float scale + int8 quants (used by Gemma)
 __global__ void dequant_embd_q8k_row(
     const void* __restrict__ embd, half* __restrict__ out, int token_id, int H
@@ -817,6 +837,37 @@ __global__ void argmax_half_kernel(const half* __restrict__ logits, int N, int* 
     if (threadIdx.x == 0) out_idx[0] = s_idx[0];
 }
 
+// Batched row-wise argmax: grid.x = row index into logits [n, V]; one launch
+// replaces n sequential argmax_half_kernel launches (DFlash per-iter cost).
+__global__ void argmax_half_rows_kernel(const half* __restrict__ logits, int V,
+                                        int* __restrict__ out_idx) {
+    __shared__ float s_val[1024];
+    __shared__ int   s_idx[1024];
+    const half* row = logits + (size_t)blockIdx.x * V;
+
+    float my_max = -1e38f;
+    int   my_arg = 0;
+    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+        float v = __half2float(row[i]);
+        if (v > my_max) { my_max = v; my_arg = i; }
+    }
+    s_val[threadIdx.x] = my_max;
+    s_idx[threadIdx.x] = my_arg;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            float a = s_val[threadIdx.x];
+            float b = s_val[threadIdx.x + stride];
+            if (b > a) {
+                s_val[threadIdx.x] = b;
+                s_idx[threadIdx.x] = s_idx[threadIdx.x + stride];
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out_idx[blockIdx.x] = s_idx[0];
+}
+
 // Top-2 argmax: out_top2[0]=argmax, out_top2[1]=2nd-largest index.
 // Each thread scans strided slice keeping (m1,a1)(m2,a2). Block merges
 // per-thread top-2 pairs into the block top-2 via O(N log N) reduction.
@@ -862,6 +913,50 @@ __global__ void argmax_top2_half_kernel(const half* __restrict__ logits,
     if (threadIdx.x == 0) {
         out_top2[0] = s_i1[0];
         out_top2[1] = s_i2[0];
+    }
+}
+
+// Batched row-wise top-2: grid.x = row; out[2*row]=argmax, out[2*row+1]=2nd.
+__global__ void argmax_top2_half_rows_kernel(const half* __restrict__ logits,
+                                             int V, int* __restrict__ out_top2) {
+    __shared__ float s_v1[1024]; __shared__ int s_i1[1024];
+    __shared__ float s_v2[1024]; __shared__ int s_i2[1024];
+    const half* row = logits + (size_t)blockIdx.x * V;
+
+    float m1 = -1e38f; int a1 = 0;
+    float m2 = -1e38f; int a2 = 0;
+    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+        float v = __half2float(row[i]);
+        if (v > m1)      { m2 = m1; a2 = a1; m1 = v; a1 = i; }
+        else if (v > m2) { m2 = v;  a2 = i; }
+    }
+    s_v1[threadIdx.x] = m1; s_i1[threadIdx.x] = a1;
+    s_v2[threadIdx.x] = m2; s_i2[threadIdx.x] = a2;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            float aL = s_v1[threadIdx.x],  aR  = s_v1[threadIdx.x + stride];
+            float aL2 = s_v2[threadIdx.x], aR2 = s_v2[threadIdx.x + stride];
+            int   iL = s_i1[threadIdx.x],  iR  = s_i1[threadIdx.x + stride];
+            int   iL2 = s_i2[threadIdx.x], iR2 = s_i2[threadIdx.x + stride];
+            float top1, top2; int top1_i, top2_i;
+            if (aL >= aR) {
+                top1 = aL; top1_i = iL;
+                if (aR >= aL2) { top2 = aR;  top2_i = iR;  }
+                else           { top2 = aL2; top2_i = iL2; }
+            } else {
+                top1 = aR; top1_i = iR;
+                if (aL >= aR2) { top2 = aL;  top2_i = iL;  }
+                else           { top2 = aR2; top2_i = iR2; }
+            }
+            s_v1[threadIdx.x] = top1; s_i1[threadIdx.x] = top1_i;
+            s_v2[threadIdx.x] = top2; s_i2[threadIdx.x] = top2_i;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        out_top2[2 * blockIdx.x]     = s_i1[0];
+        out_top2[2 * blockIdx.x + 1] = s_i2[0];
     }
 }
 

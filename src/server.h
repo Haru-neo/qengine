@@ -1330,9 +1330,11 @@ struct HttpServer {
             std::string finish_reason = !parsed_calls.empty() ? "tool_calls"
                 : (gen_truncated.load(std::memory_order_relaxed) ? "length" : "stop");
 
-            // Clean content: strip <think> and <tool_call> blocks
-            std::string clean_content = strip_think_block(full_text);
-            clean_content = strip_tool_calls(clean_content);
+            // Clean content: KEEP <think> blocks so non-stream clients see the
+            // reasoning too (matches the streaming path, which never strips it).
+            // 2026-06-09: think strip disabled by user config. Still strip
+            // <tool_call> blocks — those leave as structured tool_calls fields.
+            std::string clean_content = strip_tool_calls(full_text);
 
             std::ostringstream json;
             json << "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"model\":\""

@@ -1769,6 +1769,10 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     half*  tree_logits_buf = nullptr;   // [budget*V] on last_gpu
     int*   tree_d_argmax   = nullptr;   // [budget] on last_gpu
     int*   tree_h_argmax   = nullptr;   // [budget] pinned
+    int*   tree_d_argmax2  = nullptr;   // [2*block_size] on last_gpu (draft top-2, DFLASH_POS_ACCEPT stats)
+    int*   tree_h_argmax2  = nullptr;   // [2*block_size] pinned
+    int*   tree_d_embed_ids = nullptr;  // [2*block_size] on GPU0 (batched embed dequant ids)
+    int*   tree_h_embed_ids = nullptr;  // [2*block_size] pinned
     float* tree_host_transfer = nullptr;// [budget*H] pinned for GPU→GPU copy
     QuantInput qi_logits_tree;
     half*  h_final_draft2_tree = nullptr;  // second ping-pong buffer for budget > 3
@@ -1952,6 +1956,14 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         cudaMalloc(&tree_logits_buf, (size_t)tb_alloc * V * sizeof(half));
         cudaMalloc(&tree_d_argmax,   (size_t)tb_alloc * sizeof(int));
         cudaMallocHost(&tree_h_argmax, (size_t)tb_alloc * sizeof(int));
+        cudaMalloc(&tree_d_argmax2,   (size_t)2 * tb_alloc * sizeof(int));
+        cudaMallocHost(&tree_h_argmax2, (size_t)2 * tb_alloc * sizeof(int));
+        // Batched embed-dequant token-id staging (GPU0: embeds live there).
+        // [0..15] = draft noise ids, [16..31] = verify tree token ids.
+        cudaSetDevice(0);
+        cudaMalloc(&tree_d_embed_ids, (size_t)2 * tb_alloc * sizeof(int));
+        cudaMallocHost(&tree_h_embed_ids, (size_t)2 * tb_alloc * sizeof(int));
+        cudaSetDevice(last_gpu);
         cudaMallocHost(&tree_host_transfer, (size_t)tb_alloc * H * sizeof(float));
         if (!h_final_draft1) cudaMalloc(&h_final_draft1, H * sizeof(half));   // reused for self-chain MTP
         // Second ping-pong buffer for chain depths > 3 (budget > 3).
@@ -2199,6 +2211,8 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                g_logits = 0, g_mtp = 0, g_other = 0;
         // DFlash tree-verify sub-phase timers (the untimed 27B 16-token forward).
         double g_tv_xfer = 0, g_tv_attn = 0, g_tv_gdn = 0, g_tv_mlp = 0, g_tv_cap = 0;
+        // DFlash draft sub-phase timers (inside g_mtp).
+        double g_dr_embed = 0, g_dr_fwd = 0, g_dr_bridge = 0, g_dr_lmhead = 0;
         int g_steps = 0, g_spec_iters = 0;
         // PROFILE_FA=1 zeroes the device-side fused-FA phase cycle counters
         // (g_fa_phase_cyc[0..4]: decode/score/softmax/value/tile_cnt) on each
@@ -2996,41 +3010,73 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
 
                 // (1) noise = [embed(anchor_tok), embed(MASK)*15]
                 cudaSetDevice(0);
+                auto dre0 = prof_now();
                 half* noise = dflash_state.d_noise_embed;
-                auto fold_embed_row = [&](half* dst, int tok) {
-                    if (embd_t->type == GGML_TYPE_Q8_0)      dequant_embd_q8_0_row<<<(H+255)/256,256>>>(embd_t->data, dst, tok, H);
-                    else if (embd_t->type == GGML_TYPE_Q5_K) dequant_embd_q5k_row_v2<<<(H+255)/256,256>>>(embd_t->data, dst, tok, H);
-                    else if (embd_t->type == GGML_TYPE_Q6_K) dequant_embd_q6k_row_v2<<<(H+255)/256,256>>>(embd_t->data, dst, tok, H);
-                };
-                fold_embed_row(noise, anchor_tok);
-                for (int i = 1; i < B; i++) fold_embed_row(noise + (size_t)i*H, dflash::DraftConfig::mask_token_id);
+                if (embd_t->type == GGML_TYPE_Q8_0) {
+                    // Batched: 16 dequant launches -> 1 (ids via pinned H2D).
+                    tree_h_embed_ids[0] = anchor_tok;
+                    for (int i = 1; i < B; i++) tree_h_embed_ids[i] = dflash::DraftConfig::mask_token_id;
+                    cudaMemcpyAsync(tree_d_embed_ids, tree_h_embed_ids, (size_t)B*sizeof(int), cudaMemcpyHostToDevice, 0);
+                    dim3 eg((H+255)/256, B);
+                    dequant_embd_q8_0_rows<<<eg,256>>>(embd_t->data, noise, tree_d_embed_ids, H);
+                } else {
+                    auto fold_embed_row = [&](half* dst, int tok) {
+                        if (embd_t->type == GGML_TYPE_Q5_K)      dequant_embd_q5k_row_v2<<<(H+255)/256,256>>>(embd_t->data, dst, tok, H);
+                        else if (embd_t->type == GGML_TYPE_Q6_K) dequant_embd_q6k_row_v2<<<(H+255)/256,256>>>(embd_t->data, dst, tok, H);
+                    };
+                    fold_embed_row(noise, anchor_tok);
+                    for (int i = 1; i < B; i++) fold_embed_row(noise + (size_t)i*H, dflash::DraftConfig::mask_token_id);
+                }
+                if (do_gen_prof) g_dr_embed += prof_sync_ms(dre0, 0);
 
                 // (2) positions + (3) draft forward over windowed C[..step-1]
                 int W_df = model.dflash_cap.window;
                 int ctx_used = (ctx_len_draft < W_df) ? ctx_len_draft : W_df;
                 const half* C_view = model.dflash_window_view(step - 1, ctx_used);
                 dflash::prepare_positions(dflash_state, ctx_used);
+                auto drf0 = prof_now();
                 if (dflash_cache_on)
                     dflash::draft_forward_cached(dflash_state.draft, C_view, noise,
                                           dflash_state.d_pos_q, dflash_state.d_pos_k, ctx_used, /*last_pos=*/step - 1, 0);
                 else
                     dflash::draft_forward(dflash_state.draft, C_view, noise,
                                           dflash_state.d_pos_q, dflash_state.d_pos_k, ctx_used, 0);
+                if (do_gen_prof) g_dr_fwd += prof_sync_ms(drf0, 0);
 
-                // (4) draft lm_head -> draft_chain[d] = draft pred @ step+1+d (slots 1..15)
+                // (4) draft lm_head -> draft_chain[d] = draft pred @ step+1+d.
+                // Only rows 1..tree_budget-1 are consumed (row 0 = anchor's own
+                // posterior, unused; rows >= tree_budget never verified) -> GEMM
+                // exactly those rows. Row-independent quantize+GEMV = identical
+                // logits for the consumed rows, ~B/(budget-1) x less lm_head work.
+                int n_dr = tree_budget - 1;                    // draft rows consumed
                 static half* host_pinned_draft_f = nullptr;
                 if (!host_pinned_draft_f) cudaMallocHost(&host_pinned_draft_f, (size_t)B*H*sizeof(half));
+                auto drb0 = prof_now();
                 cudaSetDevice(0); cudaDeviceSynchronize();
-                cudaMemcpy(host_pinned_draft_f, dflash_state.draft.h_buf, (size_t)B*H*sizeof(half), cudaMemcpyDeviceToHost);
+                cudaMemcpy(host_pinned_draft_f, dflash_state.draft.h_buf + (size_t)1*H, (size_t)n_dr*H*sizeof(half), cudaMemcpyDeviceToHost);
                 cudaSetDevice(last_gpu);
-                cudaMemcpy(tree_norm_buf, host_pinned_draft_f, (size_t)B*H*sizeof(half), cudaMemcpyHostToDevice);
-                qi_logits_tree.quantize_chunk(tree_norm_buf, H, B, 0);
-                quant_gemv_chunk(out_w->data, out_w->type, qi_logits_tree.q8_buf, tree_logits_buf, H, V, B, 0);
-                for (int b = 0; b < B; b++)
-                    argmax_half_kernel<<<1,1024>>>(tree_logits_buf + (size_t)b*V, V, tree_d_argmax + b);
-                cudaMemcpy(tree_h_argmax, tree_d_argmax, (size_t)B*sizeof(int), cudaMemcpyDeviceToHost);
+                cudaMemcpy(tree_norm_buf, host_pinned_draft_f, (size_t)n_dr*H*sizeof(half), cudaMemcpyHostToDevice);
+                if (do_gen_prof) g_dr_bridge += prof_sync_ms(drb0, last_gpu);
+                auto drl0 = prof_now();
+                qi_logits_tree.quantize_chunk(tree_norm_buf, H, n_dr, 0);
+                quant_gemv_chunk(out_w->data, out_w->type, qi_logits_tree.q8_buf, tree_logits_buf, H, V, n_dr, 0);
+                // DFLASH_POS_ACCEPT=1: also pull the drafter's top-2 per slot so the
+                // accept stats can report "would a top-2 leaf branch have recovered
+                // the first mismatch?" (tree-drafting upside measurement). top-1 of
+                // argmax_top2 == argmax_half -> chain identical, stats-only path.
+                static const bool fold_pos_accept = getenv("DFLASH_POS_ACCEPT") != nullptr;
+                int fold_top2[16];
                 int fold_chain[16];
-                for (int d = 0; d < B-1; d++) fold_chain[d] = tree_h_argmax[d+1];
+                if (fold_pos_accept) {
+                    argmax_top2_half_rows_kernel<<<n_dr,1024>>>(tree_logits_buf, V, tree_d_argmax2);
+                    cudaMemcpy(tree_h_argmax2, tree_d_argmax2, (size_t)2*n_dr*sizeof(int), cudaMemcpyDeviceToHost);
+                    for (int d = 0; d < n_dr; d++) { fold_chain[d] = tree_h_argmax2[2*d]; fold_top2[d] = tree_h_argmax2[2*d+1]; }
+                } else {
+                    argmax_half_rows_kernel<<<n_dr,1024>>>(tree_logits_buf, V, tree_d_argmax);
+                    cudaMemcpy(tree_h_argmax, tree_d_argmax, (size_t)n_dr*sizeof(int), cudaMemcpyDeviceToHost);
+                    for (int d = 0; d < n_dr; d++) fold_chain[d] = tree_h_argmax[d];
+                }
+                if (do_gen_prof) g_dr_lmhead += prof_sync_ms(drl0, last_gpu);
                 if (do_gen_prof) g_mtp += prof_sync_ms(df0, last_gpu);
 
                 // (5) verify: tokens=[anchor_tok, fold_chain[0..14]] @ pos_base=step
@@ -3039,11 +3085,20 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 for (int t = 1; t < tree_budget; t++) { tokens_h[t] = fold_chain[t-1]; host_parents[t] = t-1; }
                 cudaSetDevice(0);
                 auto se0 = prof_now();
-                for (int b = 0; b < tree_budget; b++) {
-                    half* dst = tree_hidden_half[0] + (size_t)b*H;
-                    if (embd_t->type == GGML_TYPE_Q8_0)      dequant_embd_q8_0_row<<<(H+255)/256,256>>>(embd_t->data, dst, tokens_h[b], H);
-                    else if (embd_t->type == GGML_TYPE_Q5_K) dequant_embd_q5k_row_v2<<<(H+255)/256,256>>>(embd_t->data, dst, tokens_h[b], H);
-                    else if (embd_t->type == GGML_TYPE_Q6_K) dequant_embd_q6k_row_v2<<<(H+255)/256,256>>>(embd_t->data, dst, tokens_h[b], H);
+                if (embd_t->type == GGML_TYPE_Q8_0) {
+                    // Batched: budget dequant launches -> 1 (ids slot [16..31] of
+                    // the staging buffer; slot [0..15] may still be in flight for
+                    // the draft noise H2D on this stream).
+                    for (int b = 0; b < tree_budget; b++) tree_h_embed_ids[16+b] = tokens_h[b];
+                    cudaMemcpyAsync(tree_d_embed_ids+16, tree_h_embed_ids+16, (size_t)tree_budget*sizeof(int), cudaMemcpyHostToDevice, 0);
+                    dim3 eg((H+255)/256, tree_budget);
+                    dequant_embd_q8_0_rows<<<eg,256>>>(embd_t->data, tree_hidden_half[0], tree_d_embed_ids+16, H);
+                } else {
+                    for (int b = 0; b < tree_budget; b++) {
+                        half* dst = tree_hidden_half[0] + (size_t)b*H;
+                        if (embd_t->type == GGML_TYPE_Q5_K)      dequant_embd_q5k_row_v2<<<(H+255)/256,256>>>(embd_t->data, dst, tokens_h[b], H);
+                        else if (embd_t->type == GGML_TYPE_Q6_K) dequant_embd_q6k_row_v2<<<(H+255)/256,256>>>(embd_t->data, dst, tokens_h[b], H);
+                    }
                 }
                 half_to_float_kernel<<<(tree_budget*H+255)/256,256>>>(tree_hidden_half[0], tree_hidden[0], tree_budget*H);
                 if (do_gen_prof) g_embed += prof_sync_ms(se0, 0);
@@ -3081,8 +3136,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     rms_norm_f32in(tree_norm_buf, h_tree, (half*)out_norm_t->data, tree_budget, H, model.cfg.rms_norm_eps, 0);
                 qi_logits_tree.quantize_chunk(tree_norm_buf, H, tree_budget, 0);
                 quant_gemv_chunk(out_w->data, out_w->type, qi_logits_tree.q8_buf, tree_logits_buf, H, V, tree_budget, 0);
-                for (int b = 0; b < tree_budget; b++)
-                    argmax_half_kernel<<<1,1024>>>(tree_logits_buf + (size_t)b*V, V, tree_d_argmax + b);
+                argmax_half_rows_kernel<<<tree_budget,1024>>>(tree_logits_buf, V, tree_d_argmax);
                 cudaMemcpy(tree_h_argmax, tree_d_argmax, (size_t)tree_budget*sizeof(int), cudaMemcpyDeviceToHost);
                 if (do_gen_prof) { g_logits += prof_sync_ms(sl0, last_gpu); g_spec_iters++; g_steps++; }
 
@@ -3092,6 +3146,33 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 for (int i = 0; i < tree_budget - 1; i++) {
                     if (tree_h_argmax[i] == fold_chain[i]) accept_drafts++;
                     else break;
+                }
+                // DFLASH_POS_ACCEPT stats: per-position conditional accept curve
+                // p_k = matched[k]/reached[k], plus top-2 recovery rate at the
+                // first mismatch q_k = top2hit[k]/mismatch[k] (= the win a leaf
+                // branch at depth k+1 would capture).
+                if (fold_pos_accept) {
+                    static long f_reached[16] = {0}, f_matched[16] = {0};
+                    static long f_mismatch[16] = {0}, f_top2hit[16] = {0};
+                    static long f_iters = 0;
+                    for (int i = 0; i < tree_budget - 1; i++) {
+                        f_reached[i]++;
+                        if (tree_h_argmax[i] == fold_chain[i]) { f_matched[i]++; }
+                        else {
+                            f_mismatch[i]++;
+                            if (tree_h_argmax[i] == fold_top2[i]) f_top2hit[i]++;
+                            break;
+                        }
+                    }
+                    if (++f_iters % 64 == 0) {
+                        printf("[POS-ACCEPT] iters=%ld p_k:", f_iters);
+                        for (int i = 0; i < tree_budget - 1; i++)
+                            printf(" %.2f", f_reached[i] ? (double)f_matched[i]/f_reached[i] : 0.0);
+                        printf("  q_k(top2|miss):");
+                        for (int i = 0; i < tree_budget - 1; i++)
+                            printf(" %.2f/%ld", f_mismatch[i] ? (double)f_top2hit[i]/f_mismatch[i] : 0.0, f_mismatch[i]);
+                        printf("\n"); fflush(stdout);
+                    }
                 }
                 int accept_len_slots = accept_drafts + 1;     // slots 0..accept_drafts (positions step..step+accept_drafts)
                 model.commit_tree_gdn_chain(accept_len_slots);
@@ -4271,6 +4352,13 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                    tv, g_tv_xfer, 100.0*g_tv_xfer/tv, g_tv_attn, 100.0*g_tv_attn/tv,
                    g_tv_gdn, 100.0*g_tv_gdn/tv, g_tv_mlp, 100.0*g_tv_mlp/tv,
                    g_tv_cap, 100.0*g_tv_cap/tv);
+            double dr = g_dr_embed + g_dr_fwd + g_dr_bridge + g_dr_lmhead;
+            if (dr > 0)
+                printf("[GEN PROF DRAFT] total=%.1fms  embed=%.1f(%.0f%%) fwd=%.1f(%.0f%%) "
+                       "bridge=%.1f(%.0f%%) lmhead=%.1f(%.0f%%)  (inside mtp; per-iter=%.2fms)\n",
+                       dr, g_dr_embed, 100.0*g_dr_embed/dr, g_dr_fwd, 100.0*g_dr_fwd/dr,
+                       g_dr_bridge, 100.0*g_dr_bridge/dr, g_dr_lmhead, 100.0*g_dr_lmhead/dr,
+                       g_spec_iters ? dr/g_spec_iters : 0.0);
             fflush(stdout);
         }
         if (g_profile_attn && g_pt_calls > 0) {

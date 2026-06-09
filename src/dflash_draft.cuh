@@ -685,11 +685,151 @@ __global__ void attn_full_kernel(
     }
 }
 
+// FA-tiled drafter attention. The legacy attn_full_kernel reads K with one
+// thread per key row (each thread streams its own 256B row -> fully
+// uncoalesced, ~8-16x HBM amplification + L2 thrash). At the drafter's 4096
+// window that kernel dominates the whole draft forward. This version stages
+// K/V in BM-row smem tiles with float4 coalesced loads and runs an online-
+// softmax accumulation:
+//   grid  = (q_len, n_kv_heads), block = 128 threads = 4 warps
+//   warp g owns q-head (kv_head*GQA + g): lane r scores tile row r
+//   acc:  thread t owns output dim t for all GQA heads
+// Row stride is padded (+2 halfs) so lane-r smem reads are conflict-free.
+// fp32 math, same softmax up to fp reorder (greedy-equivalent).
+template<int HD, int GQA, int BM>
+__global__ void attn_full_fa_kernel(
+    const half* __restrict__ Q,
+    const half* __restrict__ K,
+    const half* __restrict__ V,
+    half* __restrict__ Y,
+    int q_len, int total_k, int n_q_heads, int n_kv_heads, float scale
+) {
+    constexpr int PAD    = 2;
+    constexpr int STRIDE = HD + PAD;
+    int q_tok   = blockIdx.x;
+    int kv_head = blockIdx.y;
+    int tid  = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+
+    __shared__ half  q_s[GQA * HD];
+    __shared__ half  k_tile[BM * STRIDE];
+    __shared__ half  v_tile[BM * STRIDE];
+    __shared__ float p_smem[GQA * BM];
+    __shared__ float fct_s[GQA];     // online-softmax rescale per head
+    __shared__ float linv_s[GQA];    // final 1/l per head
+
+    // Load the GQA query heads for this q_tok (coalesced).
+    for (int i = tid; i < GQA * HD; i += blockDim.x) {
+        int g = i / HD, c = i - g * HD;
+        int q_head = kv_head * GQA + g;
+        q_s[i] = Q[((size_t)q_tok * n_q_heads + q_head) * HD + c];
+    }
+    __syncthreads();
+
+    float m_w = -INFINITY;           // per (warp=head) running max (lanes agree)
+    float l_w = 0.0f;                // running denom
+    float acc[GQA];                  // thread owns dim=tid for each head
+    #pragma unroll
+    for (int g = 0; g < GQA; g++) acc[g] = 0.0f;
+
+    constexpr int H2       = HD / 2;             // half2s per row
+    constexpr int ROWS_PER = 128 / H2;           // rows loaded per pass
+
+    for (int tile = 0; tile < total_k; tile += BM) {
+        int tile_len = min(BM, total_k - tile);
+        // ---- cooperative K/V tile load (half2: coalesced 128B/warp, and
+        //      4B-aligned for any even STRIDE) ----
+        #pragma unroll
+        for (int pass = 0; pass < BM / ROWS_PER; pass++) {
+            int r  = pass * ROWS_PER + tid / H2;
+            int c2 = (tid % H2) * 2;
+            if (r < tile_len) {
+                size_t base = ((size_t)(tile + r) * n_kv_heads + kv_head) * HD + c2;
+                *(half2*)&k_tile[r * STRIDE + c2] = *(const half2*)&K[base];
+                *(half2*)&v_tile[r * STRIDE + c2] = *(const half2*)&V[base];
+            }
+        }
+        __syncthreads();
+
+        // ---- scores: warp g, lane r ----
+        if (warp < GQA) {
+            int g = warp;
+            float s = -INFINITY;
+            if (lane < tile_len) {
+                float acc_s = 0.0f;
+                const half* qp = q_s + g * HD;
+                const half* kp = k_tile + lane * STRIDE;
+                #pragma unroll
+                for (int i = 0; i < HD; i += 2) {
+                    half2 qv = *(const half2*)&qp[i];
+                    half2 kv = *(const half2*)&kp[i];
+                    float2 qf = __half22float2(qv);
+                    float2 kf = __half22float2(kv);
+                    acc_s += qf.x * kf.x + qf.y * kf.y;
+                }
+                s = acc_s * scale;
+            }
+            // tile max
+            float m_tile = s;
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+                m_tile = fmaxf(m_tile, __shfl_xor_sync(0xffffffff, m_tile, o));
+            float m_new  = fmaxf(m_w, m_tile);
+            float factor = (m_w == -INFINITY) ? 0.0f : expf(m_w - m_new);
+            float p = (lane < tile_len) ? expf(s - m_new) : 0.0f;
+            float p_sum = p;
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+                p_sum += __shfl_xor_sync(0xffffffff, p_sum, o);
+            l_w = l_w * factor + p_sum;
+            m_w = m_new;
+            p_smem[g * BM + lane] = p;
+            if (lane == 0) fct_s[g] = factor;
+        }
+        __syncthreads();
+
+        // ---- accumulate output: thread owns dim d = tid ----
+        if (tid < HD) {
+            #pragma unroll
+            for (int g = 0; g < GQA; g++) {
+                float a = acc[g] * fct_s[g];
+                const float* pr = p_smem + g * BM;
+                for (int r = 0; r < tile_len; r++)
+                    a += pr[r] * __half2float(v_tile[r * STRIDE + tid]);
+                acc[g] = a;
+            }
+        }
+        __syncthreads();   // before next tile overwrites k/v_tile
+    }
+
+    if (warp < GQA && lane == 0) linv_s[warp] = 1.0f / l_w;
+    __syncthreads();
+
+    if (tid < HD) {
+        #pragma unroll
+        for (int g = 0; g < GQA; g++) {
+            int q_head = kv_head * GQA + g;
+            Y[((size_t)q_tok * n_q_heads + q_head) * HD + tid] =
+                __float2half(acc[g] * linv_s[g]);
+        }
+    }
+}
+
 inline void launch_attn_full(
     const half* Q, const half* K, const half* V, half* Y,
     int q_len, int total_k, int n_q_heads, int n_kv_heads, int head_dim, float scale,
     cudaStream_t stream = 0
 ) {
+    // FA-tiled fast path (drafter shape: HD=128, GQA=4). DFLASH_ATTN_FA=0
+    // reverts to the legacy kernel for A/B.
+    static const bool fa_on = !(getenv("DFLASH_ATTN_FA") && atoi(getenv("DFLASH_ATTN_FA")) == 0);
+    if (fa_on && head_dim == 128 && n_q_heads == 4 * n_kv_heads) {
+        dim3 grid(q_len, n_kv_heads);
+        attn_full_fa_kernel<128, 4, 32><<<grid, 128, 0, stream>>>(
+            Q, K, V, Y, q_len, total_k, n_q_heads, n_kv_heads, scale);
+        return;
+    }
     int threads = 128;
     dim3 grid(q_len, n_q_heads);
     size_t smem = (total_k + head_dim) * sizeof(float);
