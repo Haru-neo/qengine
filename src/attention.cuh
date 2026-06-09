@@ -1917,7 +1917,13 @@ __global__ void flash_attn_chunk_fused_split_tq3(
     // window) instead of O(context), flattening the long-context gen curve. The
     // DFlash drafter is itself windowed to ~4096, so a verify window >= that
     // checks the drafter's predictions over the same span it conditioned on.
-    int sink_tok = 0, int window_tok = 0
+    int sink_tok = 0, int window_tok = 0,
+    // Optional branching-tree verify (DFLASH_TREE): tree nodes occupy KV slots
+    // [start_pos, start_pos+sub_n) in BFS order (ancestors always at lower
+    // slots), so the per-query slot-causal cutoff stays valid; tree_mask[t]
+    // additionally drops non-ancestor slots inside that range (bit j = query t
+    // may attend slot start_pos+j). nullptr = chain (all bits set).
+    const uint32_t* __restrict__ tree_mask = nullptr
 ) {
     static_assert(HD % TQ_BLOCK_SIZE == 0, "HD must be multiple of 128");
     constexpr int N_WARPS         = BLOCK / 32;
@@ -1934,6 +1940,7 @@ __global__ void flash_attn_chunk_fused_split_tq3(
     int tid  = threadIdx.x;
     int warp = tid >> 5;
     int lane = tid & 31;
+    uint32_t tmask_q = tree_mask ? tree_mask[t_idx] : 0xffffffffu;
 
     int total_tiles     = (active_end_max + BM - 1) / BM;
     int tiles_per_split = (total_tiles + K_SPLITS - 1) / K_SPLITS;
@@ -2088,7 +2095,11 @@ __global__ void flash_attn_chunk_fused_split_tq3(
                 for (int off = 16; off > 0; off >>= 1)
                     partial += __shfl_xor_sync(0xffffffff, partial, off);
                 if (lane == 0) {
-                    float val = (r < tile_len) ? partial * scale : -INFINITY;
+                    int gkey = tile_start + r;
+                    bool vis = (r < tile_len)
+                            && (gkey < start_pos
+                                || ((tmask_q >> (gkey - start_pos)) & 1u));
+                    float val = vis ? partial * scale : -INFINITY;
                     s_smem[g * BM + r] = val;
                 }
             }
@@ -2184,7 +2195,8 @@ __global__ void flash_attn_chunk_block_sparse_split_tq3(
     float*            __restrict__ part_o,
     int num_q, int num_kv,
     int start_pos, int sub_n, int sub_n_max,
-    float scale, int top_k, int block_size_n
+    float scale, int top_k, int block_size_n,
+    const uint32_t* __restrict__ tree_mask = nullptr   // see dense kernel
 ) {
     static_assert(HD % TQ_BLOCK_SIZE == 0, "HD must be multiple of 128");
     constexpr int N_WARPS         = BLOCK / 32;
@@ -2201,6 +2213,7 @@ __global__ void flash_attn_chunk_block_sparse_split_tq3(
     int tid  = threadIdx.x;
     int warp = tid >> 5;
     int lane = tid & 31;
+    uint32_t tmask_q = tree_mask ? tree_mask[t_idx] : 0xffffffffu;
 
     // Partition the top_k selected blocks across K_SPLITS (mirrors the fp16
     // block-sparse kernel). Each split owns [tk_lo, tk_hi) of the block list.
@@ -2334,7 +2347,11 @@ __global__ void flash_attn_chunk_block_sparse_split_tq3(
                     for (int off = 16; off > 0; off >>= 1)
                         partial += __shfl_xor_sync(0xffffffff, partial, off);
                     if (lane == 0) {
-                        float val = (r < tile_len) ? partial * scale : -INFINITY;
+                        int gkey = tile_start + r;
+                        bool vis = (r < tile_len)
+                                && (gkey < start_pos
+                                    || ((tmask_q >> (gkey - start_pos)) & 1u));
+                        float val = vis ? partial * scale : -INFINITY;
                         s_smem[g * BM + r] = val;
                     }
                 }

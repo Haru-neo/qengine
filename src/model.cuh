@@ -3668,7 +3668,14 @@ struct QwenModel {
         static const bool tq_verify_batched_tree =
             !(getenv("DFLASH_VERIFY_BATCHED") && atoi(getenv("DFLASH_VERIFY_BATCHED")) == 0);
         bool kv_ok_for_batch = (!use_turboquant || tq_verify_batched_tree) && !use_q8_kv;
-        if (batch_chain && tree_is_chain && kv_ok_for_batch
+        // Branching trees ride the same batched path when the KV is TQ: nodes
+        // are written at slot positions (BFS order keeps the slot-causal
+        // cutoff valid), RoPE uses depth positions, and the masked TQ kernels
+        // drop non-ancestor slots via tree_mask_d. fp16/Q8 KV fall through to
+        // the per-token masked loop below.
+        bool tree_batch_ok = tree_is_chain
+                          || (use_turboquant && tq_verify_batched_tree && tree_mask_ready);
+        if (batch_chain && tree_batch_ok && kv_ok_for_batch
             && tree_chain_pos_ready && n_tokens > 1) {
             int g = gpu->layer_gpu[layer];
             int base_off = (int)kv_slot_offset(slot);
@@ -3678,7 +3685,7 @@ struct QwenModel {
             tree_chain_pos_h.resize(n_tokens);
             tree_chain_dst_h.resize(n_tokens);
             for (int i = 0; i < n_tokens; i++) {
-                tree_chain_pos_h[i] = pos_base + i;
+                tree_chain_pos_h[i] = pos_base + (tree_is_chain ? i : tree_depth_host[i]);
                 tree_chain_dst_h[i] = base_off + pos_base + i;
             }
             cudaSetDevice(g);
@@ -3689,7 +3696,8 @@ struct QwenModel {
             forward_attn_step_batched(layer, hidden_tree, n_tokens,
                                       tree_chain_slot_ids_h.data(),
                                       tree_chain_pos_h.data(),
-                                      tree_chain_dst_d[g], tree_chain_pos_d[g], stream);
+                                      tree_chain_dst_d[g], tree_chain_pos_d[g], stream,
+                                      tree_is_chain ? nullptr : tree_mask_d[g]);
             return;
         }
 
@@ -3728,7 +3736,8 @@ struct QwenModel {
                                    const int* slot_pos_host,
                                    const int* dst_kv_pos_dev,   // [N] = slot*slot_max_seq + pos
                                    const int* slot_pos_dev,     // [N] (for RoPE)
-                                   cudaStream_t stream) {
+                                   cudaStream_t stream,
+                                   const uint32_t* tree_mask_dev = nullptr) {
         int g = gpu->layer_gpu[layer];
         auto& ab = attn_bufs[g];
         auto& buf = bufs[g];
@@ -3945,7 +3954,8 @@ struct QwenModel {
                         <<<fg, BLOCK, smem24, stream>>>(
                             ab.attn_chunk_q_post, tq_k_slot, tq_v_slot, ab.sparse_block_index,
                             ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
-                            num_q, num_kv, pos_base, N, ATTN_NB, scale, top_k, BLOCK_N);
+                            num_q, num_kv, pos_base, N, ATTN_NB, scale, top_k, BLOCK_N,
+                            tree_mask_dev);
                     flash_attn_split_merge<HD, GQA, BLOCK, K_SPLITS><<<mg, BLOCK, 0, stream>>>(
                         ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
                         ab.attn_chunk_out, num_q, N, ATTN_NB);
@@ -3959,7 +3969,8 @@ struct QwenModel {
                         <<<fg, BLOCK, smem16, stream>>>(
                             ab.attn_chunk_q_post, tq_k_slot, tq_v_slot, ab.sparse_block_index,
                             ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
-                            num_q, num_kv, pos_base, N, ATTN_NB, scale, top_k, BLOCK_N);
+                            num_q, num_kv, pos_base, N, ATTN_NB, scale, top_k, BLOCK_N,
+                            tree_mask_dev);
                     flash_attn_split_merge<HD, GQA, BLOCK, K_SPLITS><<<mg, BLOCK, 0, stream>>>(
                         ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
                         ab.attn_chunk_out, num_q, N, ATTN_NB);
@@ -3970,7 +3981,8 @@ struct QwenModel {
                     <<<fg, BLOCK, smem24, stream>>>(
                         ab.attn_chunk_q_post, tq_k_slot, tq_v_slot,
                         ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
-                        num_q, num_kv, pos_base, N, ATTN_NB, active_end_max, scale, vsink, vwin);
+                        num_q, num_kv, pos_base, N, ATTN_NB, active_end_max, scale, vsink, vwin,
+                        tree_mask_dev);
                 flash_attn_split_merge<HD, GQA, BLOCK, K_SPLITS>
                     <<<mg, BLOCK, 0, stream>>>(
                         ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
@@ -3981,7 +3993,8 @@ struct QwenModel {
                     <<<fg, BLOCK, smem16, stream>>>(
                         ab.attn_chunk_q_post, tq_k_slot, tq_v_slot,
                         ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
-                        num_q, num_kv, pos_base, N, ATTN_NB, active_end_max, scale, vsink, vwin);
+                        num_q, num_kv, pos_base, N, ATTN_NB, active_end_max, scale, vsink, vwin,
+                        tree_mask_dev);
                 flash_attn_split_merge<HD, GQA, BLOCK, K_SPLITS>
                     <<<mg, BLOCK, 0, stream>>>(
                         ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
@@ -6457,6 +6470,10 @@ struct QwenModel {
     bool  tree_is_chain = false;
     std::vector<int*> tree_chain_pos_d;
     std::vector<int*> tree_chain_dst_d;
+    // Per-GPU ancestor bitmasks for branching-tree batched verify
+    // (uploaded by upload_parent_ids; read by the masked TQ kernels).
+    std::vector<uint32_t*> tree_mask_d;
+    bool  tree_mask_ready = false;
     bool  tree_chain_pos_ready = false;
     std::vector<int> tree_chain_slot_ids_h;
     std::vector<int> tree_chain_pos_h;
@@ -6538,6 +6555,24 @@ struct QwenModel {
         // over consecutive KV positions, so the batched single-slot attn path
         // is bit-equivalent and far faster than the per-token loop.
         tree_is_chain = is_chain;
+        // Branching trees: ship the ancestor bitmasks to every GPU so the
+        // batched TQ verify kernels can mask sibling branches in-kernel.
+        if (!is_chain) {
+            if (!tree_mask_ready) {
+                tree_mask_d.assign(gpu->num_gpus, nullptr);
+                for (int g = 0; g < gpu->num_gpus; g++) {
+                    cudaSetDevice(g);
+                    cudaMalloc(&tree_mask_d[g], (size_t)tree_budget * sizeof(uint32_t));
+                }
+                tree_mask_ready = true;
+            }
+            for (int g = 0; g < gpu->num_gpus; g++) {
+                cudaSetDevice(g);
+                cudaMemcpyAsync(tree_mask_d[g], tree_ancestor_bits_host.data(),
+                                (size_t)tree_budget * sizeof(uint32_t),
+                                cudaMemcpyHostToDevice, stream);
+            }
+        }
     }
 
     // Scratch per-GPU buffers for chain commit's node_ids, lazily sized to

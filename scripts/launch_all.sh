@@ -43,9 +43,14 @@ echo 9717 | sudo -S nvidia-smi -lgc 1380,1380 >/dev/null 2>&1 || true
 cd "$ROOT"
 
 # Chat server (GPUs 0,1,2) — DFlash speculative decode.
-# Retrained drafter (AL~3.1) + lossless block-sparse verify (budget=4) beats the
+# Retrained drafter (AL~3.1) + lossless block-sparse verify beats the
 # old MTP path, especially on long context: MTP gen falls off hard as KV grows
 # (measured 24 t/s @0.5K -> 7.4 t/s @17K), DFlash stays flat (~21 t/s @100K).
+# DFLASH_BUDGET=8: 2026-06-09 sweep (FA-tiled drafter build) — short/medium
+# context verify is weight-read-bound so slots are ~free up to 8:
+# b4 19.5s -> b8 17.6s on a 601-tok short gen (AL 2.58 -> 3.54); b12 regresses.
+# Past DFLASH_BUDGET_LONG_CTX (default 32768) the engine auto-drops to
+# DFLASH_BUDGET_LONG (default 4), preserving the old long-context tuning.
 # PP_LAYER_BOUNDS=17,40 thins GPU0 to make room for the 1.97GB drafter (else OOM).
 # DFlash auto-disables the MTP paths and skips loading the MTP head.
 CHAT_DRAFTER=${CHAT_DRAFTER:-/home/paru/ue_training/dflash_train/trained_new/drafter.safetensors}
@@ -53,7 +58,7 @@ rm -f "$LOG_DIR/main_27b.log"
 CUDA_VISIBLE_DEVICES=0,1,2 \
 MTP_TQ=1 MLP_GATEUP_FUSED=1 MLP_GATEUP_FUSED_KERNEL=1 \
 DFLASH=1 DFLASH_DRAFT_PATH="$CHAT_DRAFTER" \
-DFLASH_VERIFY_BLOCKSPARSE=1 DFLASH_BUDGET=4 \
+DFLASH_VERIFY_BLOCKSPARSE=1 DFLASH_BUDGET=8 \
 PP_LAYER_BOUNDS=17,40 \
 MINF_SPARSE_ATTN=1 MINF_BUDGET=0.10 \
 MINF_PROFILE_PATH=$ROOT/profiles/27B_block_sparse.bin \

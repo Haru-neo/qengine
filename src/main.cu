@@ -3018,9 +3018,25 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 return v;
             }();
             static const int tree_dup = getenv("DFLASH_TREE_DUP") ? atoi(getenv("DFLASH_TREE_DUP")) : 1;
+            // Context-dynamic verify budget. Short/medium context is weight-
+            // read-bound (slots ~free up to 8: measured b4 19.5s -> b8 17.6s
+            // on 601-tok short, AL 2.58 -> 3.54), but per-query KV decode
+            // grows with context, so very long contexts keep the smaller
+            // budget that was tuned there. DFLASH_BUDGET stays the short-ctx
+            // (and allocation) budget; DFLASH_BUDGET_LONG / _LONG_CTX set the
+            // long-context budget and the switchover position.
+            static const int budget_long = []{
+                const char* e = getenv("DFLASH_BUDGET_LONG");
+                return e ? atoi(e) : 4; }();
+            static const int budget_long_ctx = []{
+                const char* e = getenv("DFLASH_BUDGET_LONG_CTX");
+                return e ? atoi(e) : 32768; }();
+            const int eff_budget = (step < budget_long_ctx)
+                ? tree_budget
+                : std::min(tree_budget, std::max(2, budget_long));
             const int tree_chain_M = dflash_tree_on
-                ? std::max(2, tree_budget - (int)tree_alt_depths.size() * (1 + tree_dup))
-                : tree_budget;
+                ? std::max(2, eff_budget - (int)tree_alt_depths.size() * (1 + tree_dup))
+                : eff_budget;
             if (dflash_fold_enabled && slot == 0 && dflash_enabled
                 && sampler.grammar == nullptr && step >= (int)prompt_ids.size()) {
                 auto df0 = prof_now();
@@ -3113,27 +3129,27 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 // GDN takes the general parent_ids scan. Accept = root-to-leaf
                 // walk matching posterior; commits go through the path APIs.
                 std::vector<int> tokens_h(tree_budget), host_parents(tree_budget);
-                int n_ver = tree_budget;     // nodes actually verified
+                int n_ver = eff_budget;      // nodes actually verified
                 tokens_h[0] = anchor_tok; host_parents[0] = -1;
                 if (dflash_tree_on) {
                     int M = tree_chain_M;    // main-chain slots (incl. root)
                     for (int t = 1; t < M; t++) { tokens_h[t] = fold_chain[t-1]; host_parents[t] = t-1; }
                     int s = M;
                     for (int d : tree_alt_depths) {
-                        if (d < 1 || d >= M || s >= tree_budget) continue;
+                        if (d < 1 || d >= M || s >= eff_budget) continue;
                         tokens_h[s] = fold_top2[d-1]; host_parents[s] = d - 1;
                         int prev = s; s++;
-                        for (int j = 0; j < tree_dup && s < tree_budget && d + j < M - 1; j++) {
+                        for (int j = 0; j < tree_dup && s < eff_budget && d + j < M - 1; j++) {
                             tokens_h[s] = fold_chain[d + j]; host_parents[s] = prev;
                             prev = s; s++;
                         }
                     }
                     n_ver = s;
-                    // fill tail (not verified, but upload reads tree_budget ints)
-                    for (int t = s; t < tree_budget; t++) { tokens_h[t] = fold_chain[0]; host_parents[t] = 0; }
                 } else {
-                    for (int t = 1; t < tree_budget; t++) { tokens_h[t] = fold_chain[t-1]; host_parents[t] = t-1; }
+                    for (int t = 1; t < eff_budget; t++) { tokens_h[t] = fold_chain[t-1]; host_parents[t] = t-1; }
                 }
+                // fill tail (not verified, but upload reads tree_budget ints)
+                for (int t = n_ver; t < tree_budget; t++) { tokens_h[t] = tokens_h[0]; host_parents[t] = t - 1; }
                 cudaSetDevice(0);
                 auto se0 = prof_now();
                 if (embd_t->type == GGML_TYPE_Q8_0) {
@@ -3209,7 +3225,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     }
                     accept_drafts = (int)accept_path.size() - 1;
                 } else {
-                    for (int i = 0; i < tree_budget - 1; i++) {
+                    for (int i = 0; i < n_ver - 1; i++) {
                         if (tree_h_argmax[i] == fold_chain[i]) accept_drafts++;
                         else break;
                     }
@@ -3222,7 +3238,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     static long f_reached[16] = {0}, f_matched[16] = {0};
                     static long f_mismatch[16] = {0}, f_top2hit[16] = {0};
                     static long f_iters = 0;
-                    for (int i = 0; i < tree_budget - 1; i++) {
+                    for (int i = 0; i < n_ver - 1; i++) {
                         f_reached[i]++;
                         if (tree_h_argmax[i] == fold_chain[i]) { f_matched[i]++; }
                         else {
@@ -3233,10 +3249,10 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     }
                     if (++f_iters % 64 == 0) {
                         printf("[POS-ACCEPT] iters=%ld p_k:", f_iters);
-                        for (int i = 0; i < tree_budget - 1; i++)
+                        for (int i = 0; i < n_ver - 1; i++)
                             printf(" %.2f", f_reached[i] ? (double)f_matched[i]/f_reached[i] : 0.0);
                         printf("  q_k(top2|miss):");
-                        for (int i = 0; i < tree_budget - 1; i++)
+                        for (int i = 0; i < n_ver - 1; i++)
                             printf(" %.2f/%ld", f_mismatch[i] ? (double)f_top2hit[i]/f_mismatch[i] : 0.0, f_mismatch[i]);
                         printf("\n"); fflush(stdout);
                     }
@@ -3258,7 +3274,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     model.dflash_commit_tree_capture(commit_slots.data(), accept_len_slots, step);  // C[step..step+accept]
                 }
 
-                if (accept_drafts == tree_budget - 1) tree_accept_full_count++;
+                if (accept_drafts == n_ver - 1) tree_accept_full_count++;
                 else if (accept_drafts > 0)            tree_accept_partial_count++;
                 else                                    tree_reject_count++;
                 spec_accept_count += accept_drafts;
