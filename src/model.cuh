@@ -408,6 +408,16 @@ struct QwenModel {
         half* tree_scratch   = nullptr;
         half* tree_host_pin  = nullptr;   // [tree_budget * hidden] pinned for cross-GPU
         int   tree_capacity  = 0;         // budget the scratch was sized for
+
+        // Prefill capture staging: chunked-prefill captures land here via
+        // sync-free async D2H (same comp stream as the producing kernel),
+        // then ONE per-slot bulk H2D into gpu0_buf at the first draft of the
+        // request (dflash_capture_flush). Same [window, n_slots, hidden]
+        // layout as gpu0_buf. Each slot is written by exactly one GPU's
+        // worker thread, so the per-slot dirty ranges need no locking.
+        half*     host_ring = nullptr;    // pinned, [window * n_slots * hidden]
+        long long stage_lo[16];           // dirty abs-position range per slot
+        long long stage_hi[16];           // (hi exclusive; lo > hi = clean)
     };
     DFlashCapture dflash_cap;
 
@@ -437,7 +447,11 @@ struct QwenModel {
         cudaMemset(dflash_cap.gpu0_buf, 0, buf_bytes);
         if (W < max_ctx_tokens) {   // windowed: need an unwrap scratch for wrapped reads
             cudaMalloc(&dflash_cap.unwrap, buf_bytes);
+            // Serve mode: prefill-capture staging ring (sync-free captures).
+            cudaMallocHost(&dflash_cap.host_ring, buf_bytes);
+            memset(dflash_cap.host_ring, 0, buf_bytes);
         }
+        for (int i = 0; i < 16; i++) { dflash_cap.stage_lo[i] = LLONG_MAX; dflash_cap.stage_hi[i] = -1; }
         cudaMallocHost(&dflash_cap.host_pinned, H * sizeof(half));
         for (int g = 0; g < gpu->num_gpus; g++) {
             cudaSetDevice(g);
@@ -632,39 +646,129 @@ struct QwenModel {
             fflush(stderr);
         }
 
+        // Persistent grow-only scratch (per src GPU — prefill v3 launches
+        // captures from per-GPU worker threads concurrently) + batched 2D
+        // copies. The old per-call cudaMalloc/cudaMallocHost + per-token
+        // memcpy loop cost ~25-30% of an 18K prefill (measured 43.6s with
+        // capture off vs 61.6s on, 2026-06-09).
         cudaSetDevice(src_gpu);
         size_t bytes = (size_t)n_tokens * H * sizeof(half);
-        half* chunk_half = nullptr;
-        cudaMalloc(&chunk_half, bytes);
+        if (cap_dev_scratch_sz[src_gpu] < bytes) {
+            if (cap_dev_scratch[src_gpu]) cudaFree(cap_dev_scratch[src_gpu]);
+            cudaMalloc(&cap_dev_scratch[src_gpu], bytes);
+            cap_dev_scratch_sz[src_gpu] = bytes;
+        }
+        half* chunk_half = cap_dev_scratch[src_gpu];
         int total = n_tokens * H;
         float_to_half_kernel<<<(total+255)/256, 256, 0, stream>>>(
             h_chunk_fp32, chunk_half, total);
 
-        if (src_gpu == 0) {
-            for (int i = 0; i < n_tokens; i++) {
-                half* dst = dflash_cap.gpu0_buf
-                          + ((size_t)((cb+i) % dflash_cap.window) * dflash_cap.n_slots + slot) * H;
-                cudaMemcpyAsync(dst, chunk_half + (size_t)i * H, H * sizeof(half),
-                                cudaMemcpyDeviceToDevice, stream);
-            }
+        // Ring layout: token (cb+i) lands at row ((cb+i)%window), row stride
+        // n_slots*H. A chunk is <=2 contiguous row ranges -> <=2 2D copies.
+        int W  = dflash_cap.window;
+        int NS = dflash_cap.n_slots;
+        auto copy2d_to_ring = [&](const half* src, cudaMemcpyKind kind, cudaStream_t st) {
+            int start = cb % W;
+            int n1 = std::min(n_tokens, W - start);
+            cudaMemcpy2DAsync(
+                dflash_cap.gpu0_buf + ((size_t)start * NS + slot) * H,
+                (size_t)NS * H * sizeof(half),
+                src, (size_t)H * sizeof(half),
+                (size_t)H * sizeof(half), n1, kind, st);
+            if (n_tokens > n1)
+                cudaMemcpy2DAsync(
+                    dflash_cap.gpu0_buf + (size_t)slot * H,
+                    (size_t)NS * H * sizeof(half),
+                    src + (size_t)n1 * H, (size_t)H * sizeof(half),
+                    (size_t)H * sizeof(half), (size_t)(n_tokens - n1), kind, st);
+        };
+
+        if (ctx_base == 0 && dflash_cap.host_ring) {
+            // Serve path: SYNC-FREE staging. 2D D2H from this GPU's comp
+            // stream straight into the pinned host ring (gpu0_buf layout).
+            // Stream order protects chunk_half reuse (next capture's
+            // float_to_half on the same stream waits for this copy); the
+            // worker thread never blocks, so the v3 prefill pipeline keeps
+            // its overlap. dflash_capture_flush() uploads at first draft.
+            int start = cb % W;
+            int n1 = std::min(n_tokens, W - start);
+            cudaMemcpy2DAsync(
+                dflash_cap.host_ring + ((size_t)start * NS + slot) * H,
+                (size_t)NS * H * sizeof(half),
+                chunk_half, (size_t)H * sizeof(half),
+                (size_t)H * sizeof(half), n1, cudaMemcpyDeviceToHost, stream);
+            if (n_tokens > n1)
+                cudaMemcpy2DAsync(
+                    dflash_cap.host_ring + (size_t)slot * H,
+                    (size_t)NS * H * sizeof(half),
+                    chunk_half + (size_t)n1 * H, (size_t)H * sizeof(half),
+                    (size_t)H * sizeof(half), (size_t)(n_tokens - n1),
+                    cudaMemcpyDeviceToHost, stream);
+            long long lo = cb, hi = (long long)cb + n_tokens;
+            if (lo < dflash_cap.stage_lo[slot]) dflash_cap.stage_lo[slot] = lo;
+            if (hi > dflash_cap.stage_hi[slot]) dflash_cap.stage_hi[slot] = hi;
+        } else if (src_gpu == 0) {
+            copy2d_to_ring(chunk_half, cudaMemcpyDeviceToDevice, stream);
         } else {
-            half* host_buf = nullptr;
-            cudaMallocHost(&host_buf, bytes);
+            if (cap_host_scratch_sz[src_gpu] < bytes) {
+                if (cap_host_scratch[src_gpu]) cudaFreeHost(cap_host_scratch[src_gpu]);
+                cudaMallocHost(&cap_host_scratch[src_gpu], bytes);
+                cap_host_scratch_sz[src_gpu] = bytes;
+            }
+            half* host_buf = cap_host_scratch[src_gpu];
             cudaMemcpyAsync(host_buf, chunk_half, bytes,
                             cudaMemcpyDeviceToHost, stream);
             cudaStreamSynchronize(stream);
             cudaSetDevice(0);
-            for (int i = 0; i < n_tokens; i++) {
-                half* dst = dflash_cap.gpu0_buf
-                          + ((size_t)((cb+i) % dflash_cap.window) * dflash_cap.n_slots + slot) * H;
-                cudaMemcpy(dst, host_buf + (size_t)i * H, H * sizeof(half),
-                           cudaMemcpyHostToDevice);
-            }
-            cudaFreeHost(host_buf);
+            copy2d_to_ring(host_buf, cudaMemcpyHostToDevice, 0);
+            // host_buf is reused by this GPU's next capture — drain the H2D
+            // before returning (cheap vs the old per-token sync copy storm).
+            cudaStreamSynchronize(0);
         }
         cudaSetDevice(src_gpu);
-        cudaFree(chunk_half);
     }
+
+    // Upload staged prefill captures into gpu0_buf. Called (on GPU 0) right
+    // before the drafter first reads C for a request; no-op when clean.
+    // Caller must have drained the prefill pipeline (the serve path does a
+    // full cudaDeviceSynchronize after prefill) so the staged D2H copies are
+    // complete. Copies issue on `stream` and the drafter consumes on the
+    // same stream, so no extra sync is needed.
+    void dflash_capture_flush(cudaStream_t stream = 0) {
+        if (!dflash_cap.enabled || !dflash_cap.host_ring) return;
+        int H = cfg.hidden_size;
+        int W  = dflash_cap.window;
+        int NS = dflash_cap.n_slots;
+        cudaSetDevice(0);
+        for (int slot = 0; slot < NS && slot < 16; slot++) {
+            long long lo = dflash_cap.stage_lo[slot], hi = dflash_cap.stage_hi[slot];
+            if (lo > hi) continue;                       // clean
+            if (hi - lo > W) lo = hi - W;                // only last window rows live
+            int n_rows = (int)(hi - lo);
+            int start  = (int)(lo % W);
+            int n1 = std::min(n_rows, W - start);
+            cudaMemcpy2DAsync(
+                dflash_cap.gpu0_buf + ((size_t)start * NS + slot) * H,
+                (size_t)NS * H * sizeof(half),
+                dflash_cap.host_ring + ((size_t)start * NS + slot) * H,
+                (size_t)NS * H * sizeof(half),
+                (size_t)H * sizeof(half), n1, cudaMemcpyHostToDevice, stream);
+            if (n_rows > n1)
+                cudaMemcpy2DAsync(
+                    dflash_cap.gpu0_buf + (size_t)slot * H,
+                    (size_t)NS * H * sizeof(half),
+                    dflash_cap.host_ring + (size_t)slot * H,
+                    (size_t)NS * H * sizeof(half),
+                    (size_t)H * sizeof(half), (size_t)(n_rows - n1),
+                    cudaMemcpyHostToDevice, stream);
+            dflash_cap.stage_lo[slot] = LLONG_MAX;
+            dflash_cap.stage_hi[slot] = -1;
+        }
+    }
+    half*  cap_dev_scratch[8]     = {nullptr};
+    size_t cap_dev_scratch_sz[8]  = {0};
+    half*  cap_host_scratch[8]    = {nullptr};
+    size_t cap_host_scratch_sz[8] = {0};
 
     void init_config(GGUFFile& gguf) {
         auto arch = gguf.get_str("general.architecture");

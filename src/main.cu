@@ -3068,6 +3068,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 // (2) positions + (3) draft forward over windowed C[..step-1]
                 int W_df = model.dflash_cap.window;
                 int ctx_used = (ctx_len_draft < W_df) ? ctx_len_draft : W_df;
+                model.dflash_capture_flush(0);   // staged prefill captures -> gpu0_buf (no-op when clean)
                 const half* C_view = model.dflash_window_view(step - 1, ctx_used);
                 dflash::prepare_positions(dflash_state, ctx_used);
                 auto drf0 = prof_now();
@@ -3532,6 +3533,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         // (2) positions + windowed C view (cap drafter ctx to the ring window)
                         int W_df = model.dflash_cap.window;
                         int ctx_used = (ctx_len_draft < W_df) ? ctx_len_draft : W_df;
+                        model.dflash_capture_flush(0);   // staged prefill captures -> gpu0_buf
                         const half* C_view = model.dflash_window_view(step, ctx_used);
                         dflash::prepare_positions(dflash_state, ctx_used);
 
