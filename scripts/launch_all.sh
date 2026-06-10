@@ -55,18 +55,19 @@ cd "$ROOT"
 # DFlash auto-disables the MTP paths and skips loading the MTP head.
 CHAT_DRAFTER=${CHAT_DRAFTER:-/home/paru/ue_training/dflash_train/trained_new/drafter.safetensors}
 rm -f "$LOG_DIR/main_27b.log"
+# Single slot is REQUIRED for DFlash (slot-0-only capture buffer); a multi-entry
+# --slot-caps would force num_slots>1 and silently disable DFlash. --max-seq sets
+# the 256K KV cap for the one slot.
+# (NOTE: NO comment lines may sit anywhere inside the backslash-continued
+#  env block below — a continued assignment line that ends in a comment
+#  becomes an assignment-only statement and NONE of the env reaches the
+#  server. That exact bug shipped the chat onto 4 GPUs / fp16 KV / no DFLASH
+#  on 2026-06-10, twice.)
 CUDA_VISIBLE_DEVICES=0,1,2 \
 MTP_TQ=1 MLP_GATEUP_FUSED=1 MLP_GATEUP_FUSED_KERNEL=1 \
 DFLASH=1 DFLASH_DRAFT_PATH="$CHAT_DRAFTER" \
 DFLASH_VERIFY_BLOCKSPARSE=1 DFLASH_BUDGET=8 \
 PP_LAYER_BOUNDS=17,40 \
-# Single slot is REQUIRED for DFlash (slot-0-only capture buffer); a multi-entry
-# --slot-caps would force num_slots>1 and silently disable DFlash. --max-seq sets
-# the 256K KV cap for the one slot.
-# (NOTE: comments must NOT sit between the env line-continuations and nohup —
-#  a backslash-continued assignment line that ends in a comment becomes an
-#  assignment-only statement, and NONE of the env reaches the server. That
-#  exact bug shipped the chat server onto 4 GPUs with fp16 KV on 2026-06-10.)
 MINF_SPARSE_ATTN=1 MINF_BUDGET=0.10 \
 MINF_PROFILE_PATH=$ROOT/profiles/27B_block_sparse.bin \
 nohup "$BIN" "$CHAT_MODEL" \
