@@ -608,6 +608,10 @@ struct HttpServer {
     // Optional stats hook: returns "queue=N active=M slots=K" so /stats can
     // surface scheduler health without exposing the whole scheduler.
     std::function<std::string()> stats_fn;
+    // Speculative-prefill research: GET /probe?trunc_w=..&eps=..&keep=.. —
+    // runtime-tunable probe knobs so a parameter sweep doesn't need a model
+    // reload per point. Returns current values as JSON.
+    std::function<std::string(const std::string&)> probe_fn;
     // Optional vision hooks. When set, the server will route OpenAI image_url
     // entries (data: URLs only) through `vision_encode_fn` to populate the
     // per-process vision embed buffer, then prepend the resulting
@@ -1480,6 +1484,11 @@ struct HttpServer {
         else if (method == "GET" && path == "/stats") {
             std::string stats = stats_fn ? stats_fn() : std::string("{}");
             send_response(client_fd, 200, "application/json", stats);
+        }
+        // Research probe knobs (speculative prefill); see probe_fn.
+        else if (method == "GET" && path.rfind("/probe", 0) == 0) {
+            std::string resp = probe_fn ? probe_fn(path) : std::string("{}");
+            send_response(client_fd, 200, "application/json", resp);
         }
         else {
             send_response(client_fd, 404, "application/json",

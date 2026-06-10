@@ -2555,6 +2555,47 @@ struct QwenModel {
     };
     std::vector<GDNState> gdn_states;
     int gdn_qkv_dim_cached = 0;     // qkv_dim (set in init_gdn_states)
+
+    // ── Speculative-prefill research probes (2026-06-10, env-gated off) ─────
+    // Probe A: during chunked prefill, zero GDN conv/rec state right before
+    // the chunk containing this absolute position (-1 = off). Models the
+    // "27B recomputes only the last W prompt tokens" leg of the 0.8B
+    // KV-generator prefill plan — GDN state then covers only [~trunc_pos, n).
+    long long probe_gdn_trunc_pos = -1;
+    // Probe B: inject per-head-row relative gaussian noise into the K/V that
+    // gets STORED (post-RoPE, pre-quant) for positions < probe_kv_noise_max_pos.
+    // Models the 0.8B KV-projection error to measure the greedy/needle budget.
+    long long probe_kv_noise_max_pos = -1;
+    float probe_kv_noise_eps_k = 0.f;
+    float probe_kv_noise_eps_v = 0.f;
+
+    // ── KV-extract staging (0.8B KV-generator training data, 2026-06-10) ────
+    // When kvext_k_host != nullptr (dflash-extract mode, DFLASH_EXTRACT_KV=1),
+    // forward_attn_chunk async-copies each attn layer's post-k_norm PRE-RoPE K
+    // and its V chunk into these pinned host buffers at
+    //   [attn_idx * kvext_cap + start_pos] * kv_dim.
+    // Pre-RoPE K is the projection target (position-invariant); RoPE is
+    // re-applied deterministically when the projected KV is written into the
+    // 27B cache. Stream-ordered D2H on the layer's stream, single slot only.
+    half* kvext_k_host = nullptr;
+    half* kvext_v_host = nullptr;
+    long long kvext_cap = 0;
+    int kvext_n_attn = 0;
+    std::vector<int> kvext_attn_idx;  // layer -> attn index, -1 for GDN
+
+    void init_kvext(long long cap) {
+        kvext_cap = cap;
+        kvext_attn_idx.assign(cfg.num_layers, -1);
+        kvext_n_attn = 0;
+        for (int l = 0; l < cfg.num_layers; l++)
+            if (is_attn_layer(l)) kvext_attn_idx[l] = kvext_n_attn++;
+        int kv_dim = cfg.num_kv_heads * cfg.head_dim;
+        size_t bytes = (size_t)kvext_n_attn * cap * kv_dim * sizeof(half);
+        cudaMallocHost(&kvext_k_host, bytes);
+        cudaMallocHost(&kvext_v_host, bytes);
+        printf("[kvext] staging %d attn layers x %lld tokens x kv_dim=%d (2 x %.1f MB pinned)\n",
+               kvext_n_attn, cap, kv_dim, bytes / 1048576.0);
+    }
     int gdn_rec_per_slot = 0;       // num_v * k_dim * v_dim
 
     inline float* gdn_conv_slot(int layer, int slot) {
@@ -2791,6 +2832,92 @@ struct QwenModel {
     // Returns N restored if hit (caller skips first N tokens of prefill),
     // or 0 on miss. The slot's state is fully reset on hit (not via the
     // global reset), so this method must run BEFORE the caller's reset.
+    // ── Speculative-prefill KV injection (research, 2026-06-10) ─────────────
+    // Reads a DFKV-style file WITHOUT the ids array:
+    //   [i32 magic 0x44464B49 "DFKI"][i32 L][i32 n_attn][i32 kv_dim]
+    //   [f16 K[n_attn][L][kv_dim]]  (pre-RoPE, post-k_norm)
+    //   [f16 V[n_attn][L][kv_dim]]
+    // Applies RoPE to K with positions [0, L) and quantizes both into each
+    // attn layer's KV cache (TQ / Q8 / fp16) for `slot`. Caller must have
+    // reset the slot first; caller then resumes chunked prefill at L.
+    // Returns L on success, -1 on failure. Research path: synchronous,
+    // allocates and frees its own scratch.
+    int kv_inject_from_file(const char* path, int slot) {
+        FILE* f = fopen(path, "rb");
+        if (!f) { fprintf(stderr, "[kv-inject] cannot open %s\n", path); return -1; }
+        int32_t magic = 0, L = 0, n_attn_f = 0, kvd_f = 0;
+        if (fread(&magic, 4, 1, f) != 1 || fread(&L, 4, 1, f) != 1 ||
+            fread(&n_attn_f, 4, 1, f) != 1 || fread(&kvd_f, 4, 1, f) != 1 ||
+            magic != 0x44464B49) {
+            fprintf(stderr, "[kv-inject] bad header in %s\n", path); fclose(f); return -1;
+        }
+        const int kv_dim = cfg.num_kv_heads * cfg.head_dim;
+        int n_attn = 0;
+        for (int l = 0; l < cfg.num_layers; l++) if (is_attn_layer(l)) n_attn++;
+        if (kvd_f != kv_dim || n_attn_f != n_attn || L <= 0 ||
+            (long long)L > (long long)slot_capacity(slot)) {
+            fprintf(stderr, "[kv-inject] shape mismatch: file n_attn=%d kv_dim=%d L=%d vs model %d/%d cap=%d\n",
+                    n_attn_f, kvd_f, L, n_attn, kv_dim, slot_capacity(slot));
+            fclose(f); return -1;
+        }
+        std::vector<half> hbuf((size_t)L * kv_dim);
+        const int hd = cfg.head_dim, num_kv = cfg.num_kv_heads;
+        const int rope_dim = rope.rope_dim, half_rope = rope_dim / 2;
+        size_t plane_elems = (size_t)L * kv_dim;
+        size_t slot_kv_elem_off = kv_slot_offset(slot) * kv_dim;
+        // Per-GPU scratch, lazily allocated for the largest plane.
+        half* dscratch[8] = {};
+        auto get_scratch = [&](int g) -> half* {
+            if (!dscratch[g]) { cudaSetDevice(g); cudaMalloc(&dscratch[g], plane_elems * sizeof(half)); }
+            return dscratch[g];
+        };
+        // Pass 1 = K planes (RoPE applied), pass 2 = V planes (raw).
+        for (int pass = 0; pass < 2; pass++) {
+            for (int layer = 0; layer < cfg.num_layers; layer++) {
+                if (!is_attn_layer(layer)) continue;
+                if (fread(hbuf.data(), sizeof(half), plane_elems, f) != plane_elems) {
+                    fprintf(stderr, "[kv-inject] short read (pass %d layer %d)\n", pass, layer);
+                    fclose(f);
+                    for (int g = 0; g < 8; g++) if (dscratch[g]) { cudaSetDevice(g); cudaFree(dscratch[g]); }
+                    return -1;
+                }
+                int g = gpu->layer_gpu[layer];
+                cudaSetDevice(g);
+                half* dev = get_scratch(g);
+                cudaMemcpy(dev, hbuf.data(), plane_elems * sizeof(half), cudaMemcpyHostToDevice);
+                if (pass == 0) {
+                    dim3 rgrid((num_kv * half_rope + 255) / 256, L);
+                    apply_rope_kernel_chunk<<<rgrid, 256>>>(
+                        dev, rope.sin_table(g), rope.cos_table(g),
+                        /*start_pos=*/0, num_kv, hd, rope_dim, L);
+                }
+                if (use_turboquant) {
+                    auto& tq = tq_kv_caches[layer];
+                    int bpt = tq.blocks_per_token;
+                    size_t slot_blk_off = kv_slot_offset(slot) * bpt;
+                    block_tq3* dst = (pass == 0 ? tq.k : tq.v) + slot_blk_off;
+                    int blocks = L * bpt;
+                    tq3_quantize_kernel<<<(blocks + 31) / 32, 32>>>(dev, dst, blocks);
+                } else if (use_q8_kv) {
+                    auto& q8 = q8_kv_caches[layer];
+                    int bpt = q8.blocks_per_token;
+                    size_t slot_blk_off = kv_slot_offset(slot) * bpt;
+                    block_q8_0_aligned* dst = (pass == 0 ? q8.k : q8.v) + slot_blk_off;
+                    int blocks = L * bpt;
+                    quantize_kv_q8_0_kern<<<blocks, 32>>>(dev, dst, blocks);
+                } else {
+                    auto& kv = kv_caches[layer];
+                    half* dst = (pass == 0 ? kv.k : kv.v) + slot_kv_elem_off;
+                    cudaMemcpy(dst, dev, plane_elems * sizeof(half), cudaMemcpyDeviceToDevice);
+                }
+            }
+        }
+        fclose(f);
+        for (int g = 0; g < 8; g++)
+            if (dscratch[g]) { cudaSetDevice(g); cudaDeviceSynchronize(); cudaFree(dscratch[g]); }
+        return L;
+    }
+
     int try_restore_prefix_cache(const std::vector<int>& prompt_tokens,
                                  int requested_cached, int slot = 0) {
         ensure_prefix_caches();
@@ -3322,7 +3449,7 @@ struct QwenModel {
     // ============ Chunked GDN forward (process N tokens together) ============
     // hidden_chunk: [n_tokens, H] FP32 — read & updated in-place.
     // `slot` selects per-request recurrent state (default 0 = legacy single-slot).
-    void forward_gdn_chunk(int layer, float* hidden_chunk, int n_tokens, cudaStream_t stream, int slot = 0) {
+    void forward_gdn_chunk(int layer, float* hidden_chunk, int n_tokens, cudaStream_t stream, int slot = 0, int start_pos = -1) {
         int g = gpu->layer_gpu[layer];
         auto& buf = bufs[g];
         auto& gb = gdn_bufs[g];
@@ -3335,6 +3462,17 @@ struct QwenModel {
         int v_total = num_v * v_dim;
         float* conv_state_slot = gdn_conv_slot(layer, slot);
         float* rec_state_slot  = gdn_rec_slot(layer, slot);
+
+        // Probe A (speculative prefill): zero this layer's slot state just
+        // before processing the chunk that contains trunc_pos. Stream-ordered
+        // on this layer's compute stream, so it is correct under the v3
+        // multi-threaded pipeline (each layer sees its chunks in order).
+        if (probe_gdn_trunc_pos >= 0 && start_pos >= 0 &&
+            (long long)start_pos <= probe_gdn_trunc_pos &&
+            probe_gdn_trunc_pos < (long long)start_pos + n_tokens) {
+            cudaMemsetAsync(conv_state_slot, 0, (size_t)gdn_qkv_dim_cached * 4 * sizeof(float), stream);
+            cudaMemsetAsync(rec_state_slot,  0, (size_t)gdn_rec_per_slot  * sizeof(float), stream);
+        }
 
         auto* norm_w  = t(blk(layer, "attn_norm.weight"));
         auto* qkv_w   = t(blk(layer, "attn_qkv.weight"));
@@ -4462,6 +4600,21 @@ struct QwenModel {
             attn_dump_h("q_after_qnorm", ab.attn_chunk_q_post + (size_t)target_t * total_qg);
             attn_dump_h("k_after_qnorm", ab.attn_chunk_k + (size_t)target_t * kv_dim);
 
+            // KV-extract: stage post-k_norm PRE-RoPE K + V (V is never RoPE'd)
+            // for this chunk. Enqueued before the in-place RoPE below on the
+            // same stream, so the D2H reads the pre-RoPE values.
+            if (kvext_k_host) {
+                int li = kvext_attn_idx[layer];
+                if (li >= 0 && (long long)start_pos + n_tokens <= kvext_cap) {
+                    size_t off = ((size_t)li * kvext_cap + start_pos) * kv_dim;
+                    size_t nb = (size_t)n_tokens * kv_dim * sizeof(half);
+                    cudaMemcpyAsync(kvext_k_host + off, ab.attn_chunk_k, nb,
+                                    cudaMemcpyDeviceToHost, stream);
+                    cudaMemcpyAsync(kvext_v_host + off, ab.attn_chunk_v, nb,
+                                    cudaMemcpyDeviceToHost, stream);
+                }
+            }
+
             dim3 rope_q_grid((num_q  * half_rope + 255) / 256, n_tokens);
             dim3 rope_k_grid((num_kv * half_rope + 255) / 256, n_tokens);
             // M-RoPE path is engaged when main() set up the per-token
@@ -4494,6 +4647,21 @@ struct QwenModel {
             }
             attn_dump_h("q_after_rope", ab.attn_chunk_q_post + (size_t)target_t * total_qg);
             attn_dump_h("k_after_rope", ab.attn_chunk_k + (size_t)target_t * kv_dim);
+        }
+        // Probe B (speculative prefill): perturb the K/V about to be stored
+        // for distant positions with per-head-row relative gaussian noise.
+        // Sits after RoPE/k_norm so the noise lands on exactly what the cache
+        // keeps — i.e. it models the stored-KV error of a learned projection.
+        if (probe_kv_noise_max_pos > (long long)start_pos &&
+            (probe_kv_noise_eps_k > 0.f || probe_kv_noise_eps_v > 0.f)) {
+            int n_noise = (int)std::min<long long>(n_tokens, probe_kv_noise_max_pos - start_pos);
+            dim3 ngrid(num_kv, n_noise);
+            if (probe_kv_noise_eps_k > 0.f)
+                kv_noise_inject_kernel<<<ngrid, 256, 0, stream>>>(
+                    ab.attn_chunk_k, hd, kv_dim, probe_kv_noise_eps_k, layer * 2 + 0, start_pos);
+            if (probe_kv_noise_eps_v > 0.f)
+                kv_noise_inject_kernel<<<ngrid, 256, 0, stream>>>(
+                    ab.attn_chunk_v, hd, kv_dim, probe_kv_noise_eps_v, layer * 2 + 1, start_pos);
         }
         // Bulk KV cache append. fp16 path: copy attn_chunk_k/v directly into
         // kv.k/kv.v at offset start_pos. TQ path: (1) quantize new K/V into

@@ -2529,6 +2529,52 @@ __global__ void tq3_kpool_ms_update_kern(
 
 // One thread block per Q8_0 block (32 elements). 32 threads per block.
 // in[n_blocks * 32] (fp16) → out[n_blocks] (block_q8_0_aligned).
+// ── Speculative-prefill probe: relative gaussian KV noise ───────────────────
+// Adds eps * rms(head_row) * N(0,1) to each element of a [n_tokens × kv_dim]
+// fp16 K or V chunk buffer, one block per (kv_head, token). Deterministic
+// hash-based Box-Muller keyed on (salt, absolute position, head, dim) so runs
+// are reproducible. Expected per-head-row relative L2 error == eps.
+__device__ inline unsigned kvn_hash(unsigned x) {
+    x ^= x >> 16; x *= 0x7feb352dU;
+    x ^= x >> 15; x *= 0x846ca68bU;
+    x ^= x >> 16; return x;
+}
+__global__ void kv_noise_inject_kernel(
+    half* __restrict__ buf, int hd, int kv_dim,
+    float eps, int salt, int start_pos)
+{
+    int head = blockIdx.x, trow = blockIdx.y;
+    int tid = threadIdx.x;
+    half* row = buf + (size_t)trow * kv_dim + (size_t)head * hd;
+    float v = (tid < hd) ? __half2float(row[tid]) : 0.f;
+    // Block-level sum of squares: warp shuffle + shared cross-warp reduce.
+    __shared__ float warp_sums[8];
+    float ss = v * v;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, o);
+    if ((tid & 31) == 0) warp_sums[tid >> 5] = ss;
+    __syncthreads();
+    if (tid < 32) {
+        int nw = (blockDim.x + 31) >> 5;
+        float s = (tid < nw) ? warp_sums[tid] : 0.f;
+        #pragma unroll
+        for (int o = 4; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+        if (tid == 0) warp_sums[0] = s;
+    }
+    __syncthreads();
+    float rms = sqrtf(warp_sums[0] / (float)hd);
+    if (tid < hd) {
+        unsigned key = ((unsigned)(start_pos + trow) * 2654435761u)
+                     ^ ((unsigned)salt * 40503u)
+                     ^ ((unsigned)head << 26) ^ (unsigned)tid;
+        unsigned h1 = kvn_hash(key), h2 = kvn_hash(key ^ 0x9e3779b9u);
+        float u1 = ((float)(h1 >> 8) + 1.0f) * (1.0f / 16777216.0f);
+        float u2 = (float)(h2 >> 8) * (1.0f / 16777216.0f);
+        float z = sqrtf(-2.0f * logf(u1)) * cosf(6.2831853f * u2);
+        row[tid] = __float2half(v + eps * rms * z);
+    }
+}
+
 __global__ void quantize_kv_q8_0_kern(
     const half*               __restrict__ in,
     block_q8_0_aligned*       __restrict__ out,

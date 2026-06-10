@@ -29,6 +29,16 @@ static int g_image_pad_id = -1;
 // buffer per GPU because the layers are spread across 4 cards with no P2P
 // (Volta CMP). forward_attn_chunk in model.cuh dereferences
 // g_mrope_pos_*[g] for whichever GPU it's running on. nullptr → 1D fallback.
+// ── Speculative-prefill research probe knobs ────────────────────────────────
+// Env-seeded at startup, runtime-tunable via GET /probe (see server.h). The
+// per-request setup in the chunked-prefill path reads these atomics.
+static long long probe_env_ll(const char* n, long long d) { const char* e = getenv(n); return e ? atoll(e) : d; }
+static float     probe_env_f (const char* n, float d)     { const char* e = getenv(n); return e ? (float)atof(e) : d; }
+std::atomic<long long> g_probe_trunc_w{probe_env_ll("GDN_TRUNC_W", -1)};
+std::atomic<long long> g_probe_keep{probe_env_ll("KV_NOISE_KEEP_LAST", 2048)};
+std::atomic<float> g_probe_eps_k{probe_env_f("KV_NOISE_EPS_K", probe_env_f("KV_NOISE_EPS", 0.f))};
+std::atomic<float> g_probe_eps_v{probe_env_f("KV_NOISE_EPS_V", probe_env_f("KV_NOISE_EPS", 0.f))};
+
 int* g_mrope_pos_t[4] = {nullptr, nullptr, nullptr, nullptr};
 int* g_mrope_pos_h[4] = {nullptr, nullptr, nullptr, nullptr};
 int* g_mrope_pos_w[4] = {nullptr, nullptr, nullptr, nullptr};
@@ -641,6 +651,18 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
         fprintf(stderr, "[dflash-extract] DFLASH_EXTRACT_TGT requires DFLASH_EXTRACT_PIPELINE=0 (single-stream)\n"); return 1;
     }
 
+    // DFLASH_EXTRACT_KV=1: dump per-attn-layer post-k_norm PRE-RoPE K + V per
+    // token — the 0.8B KV-generator distill targets (speculative prefill).
+    // Writes DFKV records to kv_chunk_*.bin INSTEAD of the DFC1/2 C records
+    // (the trainer only needs token ids + 27B KV). Single-stream only.
+    //   record: [i32 magic 0x44464B56 "DFKV"][i32 L][i32 n_attn][i32 kv_dim]
+    //           [i32 ids[L]][f16 K[n_attn][L][kv_dim]][f16 V[n_attn][L][kv_dim]]
+    const bool extract_kv = (getenv("DFLASH_EXTRACT_KV") != nullptr);
+    if (extract_kv && use_pipeline) {
+        fprintf(stderr, "[dflash-extract] DFLASH_EXTRACT_KV requires DFLASH_EXTRACT_PIPELINE=0 (single-stream)\n"); return 1;
+    }
+    if (extract_kv) model.init_kvext((long long)max_L);
+
     // ── 1. meta.json ──
     {
         std::string meta = out_dir + "/meta.json";
@@ -752,6 +774,49 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
         cur_chunk_records++;
     };
 
+    // ── KV chunk-file stream (DFLASH_EXTRACT_KV) ──
+    std::vector<std::pair<std::string,int>> kv_chunk_index;
+    FILE* kv_chunk_f = nullptr;
+    int   kv_chunk_idx = -1;
+    char  kv_chunk_name[64] = {0};
+    size_t kv_chunk_bytes_cur = 0;
+    int    kv_chunk_records = 0;
+    auto kv_ensure_chunk = [&](size_t need_bytes) {
+        if (kv_chunk_f == nullptr || (kv_chunk_bytes_cur + need_bytes > chunk_bytes && kv_chunk_records > 0)) {
+            if (kv_chunk_f) {
+                fclose(kv_chunk_f);
+                kv_chunk_index.push_back({std::string(kv_chunk_name), kv_chunk_records});
+            }
+            kv_chunk_idx++;
+            snprintf(kv_chunk_name, sizeof(kv_chunk_name), "kv_chunk_%03d.bin", kv_chunk_idx);
+            std::string path = no_write ? std::string("/dev/null") : (out_dir + "/" + kv_chunk_name);
+            kv_chunk_f = fopen(path.c_str(), "wb");
+            kv_chunk_bytes_cur = 0;
+            kv_chunk_records = 0;
+            printf("[dflash-extract] opened %s\n", kv_chunk_name);
+        }
+    };
+    auto write_kv_record = [&](int L, const int* ids_ptr) {
+        const int n_attn = model.kvext_n_attn;
+        const int kvd = model.cfg.num_kv_heads * model.cfg.head_dim;
+        size_t plane = (size_t)L * kvd;
+        size_t rec_bytes = sizeof(int32_t) * 4 + (size_t)L * sizeof(int32_t)
+                         + 2 * (size_t)n_attn * plane * sizeof(half);
+        kv_ensure_chunk(rec_bytes);
+        int32_t magic = 0x44464B56, Lw = L, na = n_attn, kd = kvd;  // "DFKV"
+        fwrite(&magic, sizeof(int32_t), 1, kv_chunk_f);
+        fwrite(&Lw,    sizeof(int32_t), 1, kv_chunk_f);
+        fwrite(&na,    sizeof(int32_t), 1, kv_chunk_f);
+        fwrite(&kd,    sizeof(int32_t), 1, kv_chunk_f);
+        fwrite(ids_ptr, sizeof(int32_t), L, kv_chunk_f);
+        for (int li = 0; li < n_attn; li++)
+            fwrite(model.kvext_k_host + (size_t)li * model.kvext_cap * kvd, sizeof(half), plane, kv_chunk_f);
+        for (int li = 0; li < n_attn; li++)
+            fwrite(model.kvext_v_host + (size_t)li * model.kvext_cap * kvd, sizeof(half), plane, kv_chunk_f);
+        kv_chunk_bytes_cur += rec_bytes;
+        kv_chunk_records++;
+    };
+
     auto t_start = std::chrono::high_resolution_clock::now();
     size_t total_tokens = 0;
 
@@ -839,7 +904,7 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
                     }
                     bool is_attn = model.is_attn_layer(layer);
                     if (is_attn) model.forward_attn_chunk(layer, h_chunk, chunk_pos, chunk_n, 0);
-                    else         model.forward_gdn_chunk (layer, h_chunk, chunk_n, 0);
+                    else         model.forward_gdn_chunk (layer, h_chunk, chunk_n, 0, /*slot=*/0, chunk_pos);
                     if (model.layer_is_moe[layer]) model.forward_moe_chunk(layer, h_chunk, chunk_n, 0);
                     else                           model.forward_mlp_chunk(layer, h_chunk, chunk_n, 0);
                     model.dflash_capture_chunk(layer, h_chunk, chunk_pos, chunk_n, g, 0);
@@ -855,12 +920,19 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
             }
 
             cudaSetDevice(0); cudaDeviceSynchronize();
-            size_t c_count = (size_t)L * N_TGT * H;
-            host_C.resize(c_count);
-            cudaMemcpy(host_C.data(), model.dflash_cap.gpu0_buf,
-                       c_count * sizeof(half), cudaMemcpyDeviceToHost);
-            write_record(L, ids.data(), host_C.data(), c_count,
-                         extract_tgt ? host_tgt.data() : nullptr);
+            if (extract_kv) {
+                // kvext D2H copies ran on every GPU's stream 0 — sync them all
+                // before reading the pinned staging buffers.
+                for (int g = 1; g < n_gpus; g++) { cudaSetDevice(g); cudaDeviceSynchronize(); }
+                write_kv_record(L, ids.data());
+            } else {
+                size_t c_count = (size_t)L * N_TGT * H;
+                host_C.resize(c_count);
+                cudaMemcpy(host_C.data(), model.dflash_cap.gpu0_buf,
+                           c_count * sizeof(half), cudaMemcpyDeviceToHost);
+                write_record(L, ids.data(), host_C.data(), c_count,
+                             extract_tgt ? host_tgt.data() : nullptr);
+            }
             total_tokens += L;
 
             if ((si + 1) % 64 == 0 || si + 1 == sequences.size()) {
@@ -956,7 +1028,7 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
                 model.reset_slot_segment_stream(w.slot, gpu_segs[s].l_lo, gpu_segs[s].l_hi, g, cs);
             for (int layer = gpu_segs[s].l_lo; layer < gpu_segs[s].l_hi; layer++) {
                 if (model.is_attn_layer(layer)) model.forward_attn_chunk(layer, h_chunk, w.pos, w.n, cs, w.slot);
-                else                            model.forward_gdn_chunk (layer, h_chunk, w.n, cs, w.slot);
+                else                            model.forward_gdn_chunk (layer, h_chunk, w.n, cs, w.slot, w.pos);
                 if (model.layer_is_moe[layer])  model.forward_moe_chunk(layer, h_chunk, w.n, cs);
                 else                            model.forward_mlp_chunk(layer, h_chunk, w.n, cs);
                 model.dflash_capture_chunk(layer, h_chunk, w.pos, w.n, g, cs, w.ctx_base);
@@ -1173,6 +1245,32 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
         fclose(chunk_f);
         chunk_index.push_back({std::string(cur_chunk_name), cur_chunk_records});
     }
+    // Close last KV chunk + write kv_chunks.txt + kv_meta.json.
+    if (kv_chunk_f) {
+        fclose(kv_chunk_f);
+        kv_chunk_index.push_back({std::string(kv_chunk_name), kv_chunk_records});
+        std::string kt = out_dir + "/kv_chunks.txt";
+        FILE* kf = fopen(kt.c_str(), "w");
+        if (kf) {
+            for (auto& e : kv_chunk_index) fprintf(kf, "%s %d\n", e.first.c_str(), e.second);
+            fclose(kf);
+        }
+        std::string km = out_dir + "/kv_meta.json";
+        FILE* kmf = fopen(km.c_str(), "w");
+        if (kmf) {
+            fprintf(kmf, "{\"format\":\"DFKV\", \"n_attn\":%d, \"kv_dim\":%d, "
+                         "\"k_stage\":\"post_k_norm_pre_rope\", \"attn_layer_ids\":[",
+                    model.kvext_n_attn, model.cfg.num_kv_heads * model.cfg.head_dim);
+            bool first = true;
+            for (int l = 0; l < model.cfg.num_layers; l++)
+                if (model.kvext_attn_idx.size() > (size_t)l && model.kvext_attn_idx[l] >= 0) {
+                    fprintf(kmf, "%s%d", first ? "" : ",", l); first = false;
+                }
+            fprintf(kmf, "]}\n");
+            fclose(kmf);
+        }
+        printf("[dflash-extract] wrote %zu kv chunks + kv_meta.json\n", kv_chunk_index.size());
+    }
     {
         std::string ct = out_dir + "/chunks.txt";
         FILE* cf = fopen(ct.c_str(), "w");
@@ -1299,7 +1397,7 @@ int run_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, const SamplingPara
                     auto ta0 = prof_now();
                     bool is_attn = model.is_attn_layer(layer);
                     if (is_attn) model.forward_attn_chunk(layer, h_chunk, chunk_pos, chunk_n, 0);
-                    else         model.forward_gdn_chunk (layer, h_chunk, chunk_n, 0);
+                    else         model.forward_gdn_chunk (layer, h_chunk, chunk_n, 0, /*slot=*/0, chunk_pos);
                     double ms_al = sync_ms(ta0, g);
                     if (is_attn) t_attn += ms_al; else t_gdn += ms_al;
 
@@ -2099,6 +2197,22 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
             // Reset only this slot's state. For slot 0 with num_slots=1
             // this is equivalent to reset_all_states (the previous default).
             model.reset_slot_states(slot);
+            // ── Speculative-prefill KV injection (research, env-gated) ──────
+            // KV_INJECT_FILE: fill attn KV for [0, L_inj) from offline-
+            // projected pre-RoPE K/V, leave GDN state zeroed (validated by
+            // the GDN-truncation probe), resume chunked prefill at L_inj.
+            // File is re-read every request (eval driver rewrites it per
+            // prompt). Run eval servers with PREFIX_CACHE_AUTO=0 + DFLASH=0.
+            static const char* kv_inj_path = getenv("KV_INJECT_FILE");
+            if (kv_inj_path) {
+                int L_inj = model.kv_inject_from_file(kv_inj_path, slot);
+                if (L_inj > 0 && L_inj < (int)prompt_ids.size() - 1) {
+                    prefix_skip = L_inj;
+                    printf("[KV-INJECT slot=%d] filled %d tok from %s, prefill resumes at %d\n",
+                           slot, L_inj, kv_inj_path, L_inj);
+                    fflush(stdout);
+                }
+            }
         }
         // Chunk-aligned snapshot point for THIS request. Only save when the
         // chunked prefill crosses this exact boundary. Capped to prompt_len-1
@@ -2149,6 +2263,27 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         // token so the existing per-token loop handles logits + sampling for it.
         int prompt_len = (int)prompt_ids.size();
         int prefill_len = prompt_len > 1 ? prompt_len - 1 : 0;
+        // ── Speculative-prefill research probes (env-gated, default off).
+        // GDN_TRUNC_W=<W>: GDN state covers only the last ~W prompt tokens.
+        // KV_NOISE_EPS[_K/_V]=<eps> + KV_NOISE_KEEP_LAST=<W, def 2048>: noise
+        // on stored K/V for all but the last W prompt positions.
+        // NOTE: run probe servers with PREFIX_CACHE_AUTO=0 — a prefix-cache
+        // hit skips re-prefill of the early range and bypasses both probes.
+        {
+            const long long pr_trunc_w = g_probe_trunc_w.load();
+            const long long pr_keep    = g_probe_keep.load();
+            model.probe_gdn_trunc_pos = (pr_trunc_w > 0 && (long long)prefill_len > pr_trunc_w)
+                                      ? (long long)prefill_len - pr_trunc_w : -1;
+            float ek = g_probe_eps_k.load();
+            float ev = g_probe_eps_v.load();
+            model.probe_kv_noise_eps_k = ek;
+            model.probe_kv_noise_eps_v = ev;
+            model.probe_kv_noise_max_pos = ((ek > 0.f || ev > 0.f) && (long long)prefill_len > pr_keep)
+                                         ? (long long)prefill_len - pr_keep : -1;
+            if (model.probe_gdn_trunc_pos >= 0 || model.probe_kv_noise_max_pos >= 0)
+                fprintf(stderr, "[PROBE] gdn_trunc_pos=%lld kv_noise_max_pos=%lld eps_k=%.3f eps_v=%.3f (prefill_len=%d)\n",
+                        model.probe_gdn_trunc_pos, model.probe_kv_noise_max_pos, ek, ev, prefill_len);
+        }
         int chunk_pos = prefix_skip;
         // Per-request running index over g_vision_embeds rows. Used by the
         // image_pad splice below; lives in this scope so it auto-resets to 0
@@ -2322,7 +2457,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 float* h_chunk = v2_gpu_hidden[g][buf];
                 for (int layer = gpu_segs[s].l_lo; layer < gpu_segs[s].l_hi; layer++) {
                     if (model.is_attn_layer(layer)) model.forward_attn_chunk(layer, h_chunk, pos, n, cs, slot);
-                    else                            model.forward_gdn_chunk(layer, h_chunk, n, cs, slot);
+                    else                            model.forward_gdn_chunk(layer, h_chunk, n, cs, slot, pos);
                     if (model.layer_is_moe[layer]) model.forward_moe_chunk(layer, h_chunk, n, cs);
                     else                           model.forward_mlp_chunk(layer, h_chunk, n, cs);
                     model.dflash_capture_chunk(layer, h_chunk, pos, n, g, cs);
@@ -2466,7 +2601,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 float* h_chunk = v2_gpu_hidden[g][buf];
                 for (int layer = gpu_segs[s].l_lo; layer < gpu_segs[s].l_hi; layer++) {
                     if (model.is_attn_layer(layer)) model.forward_attn_chunk(layer, h_chunk, pos, n, cs, slot);
-                    else                            model.forward_gdn_chunk(layer, h_chunk, n, cs, slot);
+                    else                            model.forward_gdn_chunk(layer, h_chunk, n, cs, slot, pos);
                     if (model.layer_is_moe[layer]) model.forward_moe_chunk(layer, h_chunk, n, cs);
                     else                           model.forward_mlp_chunk(layer, h_chunk, n, cs);
                     model.dflash_capture_chunk(layer, h_chunk, pos, n, g, cs);
@@ -2673,7 +2808,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         if (is_attn) {
                             model.forward_attn_chunk(layer, h_chunk, chunk_pos, chunk_n, cs, slot);
                         } else {
-                            model.forward_gdn_chunk(layer, h_chunk, chunk_n, cs, slot);
+                            model.forward_gdn_chunk(layer, h_chunk, chunk_n, cs, slot, chunk_pos);
                         }
                         if (model.layer_is_moe[layer]) model.forward_moe_chunk(layer, h_chunk, chunk_n, cs);
                         else                           model.forward_mlp_chunk(layer, h_chunk, chunk_n, cs);
@@ -2831,7 +2966,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                                 model.forward_gdn(layer, h_t, 0, slot);
                             }
                         } else {
-                            model.forward_gdn_chunk(layer, h_chunk, chunk_n, 0, slot);
+                            model.forward_gdn_chunk(layer, h_chunk, chunk_n, 0, slot, chunk_pos);
                         }
                     }
                     if (do_prof) {
@@ -5032,6 +5167,35 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     server.api_key = api_key;
     server.proxy_embed_url  = proxy_embed_url;
     server.proxy_rerank_url = proxy_rerank_url;
+    server.probe_fn = [&](const std::string& pth) {
+        size_t qs = pth.find('?');
+        if (qs != std::string::npos) {
+            std::string q = pth.substr(qs + 1);
+            size_t p = 0;
+            while (p < q.size()) {
+                size_t amp = q.find('&', p);
+                std::string kv = (amp == std::string::npos) ? q.substr(p) : q.substr(p, amp - p);
+                size_t eq = kv.find('=');
+                if (eq != std::string::npos) {
+                    std::string k = kv.substr(0, eq), v = kv.substr(eq + 1);
+                    if      (k == "trunc_w") g_probe_trunc_w = atoll(v.c_str());
+                    else if (k == "keep")    g_probe_keep    = atoll(v.c_str());
+                    else if (k == "eps")   { g_probe_eps_k = (float)atof(v.c_str());
+                                             g_probe_eps_v = (float)atof(v.c_str()); }
+                    else if (k == "eps_k")   g_probe_eps_k = (float)atof(v.c_str());
+                    else if (k == "eps_v")   g_probe_eps_v = (float)atof(v.c_str());
+                }
+                if (amp == std::string::npos) break;
+                p = amp + 1;
+            }
+        }
+        std::ostringstream os;
+        os << "{\"trunc_w\":" << g_probe_trunc_w.load()
+           << ",\"keep\":"    << g_probe_keep.load()
+           << ",\"eps_k\":"   << g_probe_eps_k.load()
+           << ",\"eps_v\":"   << g_probe_eps_v.load() << "}";
+        return os.str();
+    };
     server.stats_fn = [&]() {
         int active = 0;
         if (num_slots > 1) {
@@ -5495,7 +5659,7 @@ static bool run_embed_forward_range(EmbedForwardCtx& C,
             if (model.is_attn_layer(layer))
                 model.forward_attn_chunk(layer, h_chunk, chunk_pos, chunk_n, /*stream=*/0);
             else
-                model.forward_gdn_chunk(layer, h_chunk, chunk_n, /*stream=*/0);
+                model.forward_gdn_chunk(layer, h_chunk, chunk_n, /*stream=*/0, /*slot=*/0, chunk_pos);
             if (prof) { cudaSetDevice(g); cudaDeviceSynchronize(); }
             auto p1 = std::chrono::high_resolution_clock::now();
             model.forward_mlp_chunk(layer, h_chunk, chunk_n, /*stream=*/0);
