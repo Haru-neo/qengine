@@ -4955,8 +4955,14 @@ struct QwenModel {
         // 27B/9B hybrid: HD=256, num_kv=4, GQA = num_q/num_kv (6 or 4).
         // Qwen3-4B dense embed/reranker: HD=128, num_q=32, num_kv=8, GQA=4
         // (full rope_dim=128, applied pre-FA below — FA kernels are rope-agnostic).
-        bool can_flash_hybrid = (hd == 256 && num_kv == 4
-                              && (num_q == 24 || num_q == 16));
+        // 0.8B kvgen hybrid (HD=256, num_kv=2, num_q=8) rides the GQA=4
+        // template instantiations (the `num_q == 24 ? 6 : 4` dispatches):
+        // grid.x = num_kv and smem sizing only depend on GQA, not num_kv.
+        // Without this it silently fell back to the strict path — 410 tok/s
+        // at 12K and O(L^2)-score-buffer pain at 100K+ (2026-06-12).
+        bool can_flash_hybrid = (hd == 256
+                              && ((num_kv == 4 && (num_q == 24 || num_q == 16))
+                               || (num_kv == 2 && num_q == 8)));
         bool can_flash_dense  = (hd == 128 && num_kv == 8 && num_q == 32);
         bool can_flash = g_use_flash_attn && (can_flash_hybrid || can_flash_dense);
         while (sub_processed < n_tokens) {

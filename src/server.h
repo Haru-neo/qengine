@@ -631,6 +631,10 @@ struct HttpServer {
     std::function<std::vector<float>(const std::string& /*instruction*/,
                                      const std::string& /*query*/,
                                      const std::vector<std::string>& /*docs*/)> rerank_fn;
+    // Speculative-prefill KV-generator sidecar (--mode kvgen): POST /kvgen,
+    // body json in -> json out. Heavy payloads (token ids, KV planes) travel
+    // as file paths inside the json, not as json arrays.
+    std::function<std::string(const std::string&)> kvgen_fn;
     // Reverse-proxy targets ("host:port") on the chat server. Empty = the
     // chat process will return 501 / no endpoint for that service.
     std::string proxy_embed_url;   // e.g. "127.0.0.1:8001"
@@ -1452,6 +1456,13 @@ struct HttpServer {
         // POST /v1/chat/completions
         else if (method == "POST" && (path == "/v1/chat/completions" || path == "/api/chat")) {
             handle_completions(client_fd, body);
+        }
+        // POST /kvgen — speculative-prefill KV-generator sidecar
+        else if (method == "POST" && path == "/kvgen") {
+            if (kvgen_fn) send_response(client_fd, 200, "application/json",
+                                        kvgen_fn(body));
+            else send_response(client_fd, 501, "application/json",
+                               "{\"error\":{\"message\":\"kvgen endpoint disabled\"}}");
         }
         // POST /v1/embeddings — local sidecar OR proxy to backend
         else if (method == "POST" && path == "/v1/embeddings") {

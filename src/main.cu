@@ -6097,6 +6097,266 @@ int serve_embed(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port,
     return server.start(port) ? 0 : 1;
 }
 
+// ===== Speculative-prefill KV-generator sidecar (--mode kvgen) =============
+// Runs the (finetuned) 0.8B hybrid over a prompt, captures per-layer hidden
+// states (the WLS heads' taps), projects them to the 27B's pre-RoPE K/V and
+// writes a DFKI2 (int8 + group-128 scales) inject file. Replaces the
+// transformers predictor (1197s @ 250K — qchunk O(L^2) math SDPA) with the
+// engine's chunked prefill. Single-GPU (launch with CUDA_VISIBLE_DEVICES=3).
+//
+// POST /kvgen {"ids_file":"<raw int32 file>","keep":2048,"out":"<dfki2 path>"}
+
+// Gather 3 tap-level buffers (float [n,1024]) into one half [n, 3*1024] row.
+__global__ void kvgen_gather_half(const float* __restrict__ l0,
+                                  const float* __restrict__ l1,
+                                  const float* __restrict__ l2,
+                                  half* __restrict__ out, int n, int d) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * 3 * d) return;
+    int t = i / (3 * d), r = i % (3 * d), which = r / d, col = r % d;
+    const float* src = which == 0 ? l0 : which == 1 ? l1 : l2;
+    out[i] = __float2half(src[(size_t)t * d + col]);
+}
+
+__global__ void kvgen_bias_add(half* __restrict__ out, const half* __restrict__ b,
+                               int n, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * N) return;
+    out[i] = __hadd(out[i], b[i % N]);
+}
+
+// Group-128 int8 quantize of a 1024-col slice of the head output [n, 2048].
+// grid (n, 8), 128 threads. q: [n,1024] int8, s: [n,8] fp16.
+__global__ void kvgen_quant_group(const half* __restrict__ src, int row_stride,
+                                  int col_off, int8_t* __restrict__ q,
+                                  half* __restrict__ s, int n) {
+    int t = blockIdx.x, gi = blockIdx.y, lane = threadIdx.x;
+    const half* row = src + (size_t)t * row_stride + col_off + gi * 128;
+    __shared__ float red[128];
+    float x = __half2float(row[lane]);
+    red[lane] = fabsf(x);
+    __syncthreads();
+    for (int off = 64; off > 0; off >>= 1) {
+        if (lane < off) red[lane] = fmaxf(red[lane], red[lane + off]);
+        __syncthreads();
+    }
+    float scale = red[0] / 127.f;
+    if (lane == 0) s[(size_t)t * 8 + gi] = __float2half(scale);
+    int qi = scale > 0.f ? (int)nearbyintf(x / scale) : 0;
+    qi = max(-127, min(127, qi));
+    q[(size_t)t * 1024 + gi * 128 + lane] = (int8_t)qi;
+}
+
+struct KVGenHeads {
+    int n = 0, in_dim = 0, out_dim = 0;
+    std::vector<int> map, taps;        // taps[li*3 + k]
+    std::vector<void*> w_q8;           // device block_q8_0_aligned per head
+    std::vector<half*> bias;           // device fp16 [out_dim]
+};
+
+static bool load_kvgen_heads(const char* path, KVGenHeads& H) {
+    FILE* f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "[kvgen] cannot open heads %s\n", path); return false; }
+    int32_t magic = 0;
+    if (fread(&magic, 4, 1, f) != 1 || magic != 0x4B564748 ||
+        fread(&H.n, 4, 1, f) != 1 || fread(&H.in_dim, 4, 1, f) != 1 ||
+        fread(&H.out_dim, 4, 1, f) != 1) {
+        fprintf(stderr, "[kvgen] bad heads header\n"); fclose(f); return false;
+    }
+    H.map.resize(H.n); H.taps.resize(H.n * 3);
+    if (fread(H.map.data(), 4, H.n, f) != (size_t)H.n ||
+        fread(H.taps.data(), 4, H.n * 3, f) != (size_t)H.n * 3) { fclose(f); return false; }
+    size_t wn = (size_t)H.out_dim * H.in_dim;
+    std::vector<half> wbuf(wn), bbuf(H.out_dim);
+    half* dW_f16; cudaMalloc(&dW_f16, wn * sizeof(half));
+    for (int i = 0; i < H.n; i++) {
+        if (fread(wbuf.data(), 2, wn, f) != wn ||
+            fread(bbuf.data(), 2, H.out_dim, f) != (size_t)H.out_dim) { fclose(f); return false; }
+        void* wq; cudaMalloc(&wq, wn / 32 * sizeof(block_q8_0_aligned));
+        half* b;  cudaMalloc(&b, H.out_dim * sizeof(half));
+        cudaMemcpy(dW_f16, wbuf.data(), wn * 2, cudaMemcpyHostToDevice);
+        cudaMemcpy(b, bbuf.data(), H.out_dim * 2, cudaMemcpyHostToDevice);
+        quantize_kv_q8_0_kern<<<(unsigned)(wn / 32), 32>>>(
+            dW_f16, (block_q8_0_aligned*)wq, (int)(wn / 32));
+        cudaDeviceSynchronize();
+        H.w_q8.push_back(wq); H.bias.push_back(b);
+    }
+    cudaFree(dW_f16);
+    fclose(f);
+    printf("[kvgen] %d heads loaded (in=%d out=%d), Q8 on GPU\n",
+           H.n, H.in_dim, H.out_dim);
+    return true;
+}
+
+int serve_kvgen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
+    QwenModel model;
+    model.gpu = &gpu_model;
+    model.init_config(gguf);
+    model.alloc_buffers();
+    model.init_gdn_states(1);
+    long long max_seq = 262144;
+    if (const char* e = getenv("KVGEN_MAX_SEQ")) max_seq = atoll(e);
+    model.init_attention((int)max_seq, 1);
+    {
+        const char* fa_env = getenv("FLASH_ATTN");
+        g_use_flash_attn = (fa_env == nullptr) ? true : (fa_env[0] == '1');
+    }
+    const int H = model.cfg.hidden_size;          // 1024
+    const int n_layers = model.cfg.num_layers;    // 24
+    printf("[kvgen] model: H=%d layers=%d max_seq=%lld\n", H, n_layers, max_seq);
+    for (int l = 0; l < n_layers; l++)
+        if (gpu_model.layer_gpu[l] != 0) {
+            fprintf(stderr, "[kvgen] needs single-GPU layout (layer %d on GPU %d)\n",
+                    l, gpu_model.layer_gpu[l]);
+            return 1;
+        }
+
+    const char* heads_path = getenv("KVGEN_HEADS");
+    KVGenHeads HD;
+    if (!heads_path || !load_kvgen_heads(heads_path, HD)) return 1;
+    const int KVD = HD.out_dim / 2;               // 1024 (27B kv_dim)
+    const int NG = KVD / 128;                     // 8 scale groups
+
+    constexpr int CH = QwenModel::CHUNK_SIZE;
+    auto* embd_t = gpu_model.get("token_embd.weight");
+    auto* onorm_t = gpu_model.get("output_norm.weight");
+    cudaSetDevice(0);
+    // tap-level union -> per-level float chunk buffers (level 0=embed unused,
+    // i=post layer i-1, n_layers=final norm)
+    std::vector<float*> lvl(n_layers + 1, nullptr);
+    for (int v : HD.taps) {
+        if (v < 0 || v > n_layers) { fprintf(stderr, "[kvgen] bad tap %d\n", v); return 1; }
+        if (!lvl[v]) cudaMalloc(&lvl[v], (size_t)CH * H * sizeof(float));
+    }
+    float* hbuf;       cudaMalloc(&hbuf, (size_t)CH * H * sizeof(float));
+    half*  emb_h;      cudaMalloc(&emb_h, H * sizeof(half));
+    half*  norm_h;     cudaMalloc(&norm_h, (size_t)CH * H * sizeof(half));
+    half*  Xbuf;       cudaMalloc(&Xbuf, (size_t)CH * HD.in_dim * sizeof(half));
+    half*  OUTb;       cudaMalloc(&OUTb, (size_t)CH * HD.out_dim * sizeof(half));
+    int8_t* dq;        cudaMalloc(&dq, (size_t)CH * KVD);
+    half*  dsc;        cudaMalloc(&dsc, (size_t)CH * NG * sizeof(half));
+    int8_t* hq;        cudaMallocHost(&hq, (size_t)CH * KVD);
+    half*  hsc;        cudaMallocHost(&hsc, (size_t)CH * NG * sizeof(half));
+    QuantInput kvq;
+
+    std::mutex mu;
+    auto kvgen_fn = [&](const std::string& body) -> std::string {
+        std::lock_guard<std::mutex> lk(mu);
+        auto field = [&](const char* key) -> std::string {
+            std::string pat = std::string("\"") + key + "\"";
+            size_t p = body.find(pat);
+            if (p == std::string::npos) return "";
+            p = body.find(':', p + pat.size());
+            size_t q1 = body.find('"', p);
+            size_t q2 = body.find('"', q1 + 1);
+            if (q1 == std::string::npos || q2 == std::string::npos) return "";
+            return body.substr(q1 + 1, q2 - q1 - 1);
+        };
+        std::string ids_file = field("ids_file"), out_path = field("out");
+        int keep = 2048;
+        if (size_t p = body.find("\"keep\""); p != std::string::npos)
+            keep = atoi(body.c_str() + body.find(':', p) + 1);
+        if (ids_file.empty() || out_path.empty())
+            return "{\"error\":\"need ids_file and out\"}";
+        FILE* fi = fopen(ids_file.c_str(), "rb");
+        if (!fi) return "{\"error\":\"cannot open ids_file\"}";
+        fseek(fi, 0, SEEK_END);
+        long L = ftell(fi) / 4;
+        fseek(fi, 0, SEEK_SET);
+        std::vector<int> ids(L);
+        if (fread(ids.data(), 4, L, fi) != (size_t)L) { fclose(fi); return "{\"error\":\"short ids read\"}"; }
+        fclose(fi);
+        int L_inj = (int)L - keep;
+        if (L_inj <= 0 || L > max_seq) return "{\"error\":\"bad length\"}";
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+        cudaSetDevice(0);
+        model.reset_slot_states(0);
+        size_t plane = (size_t)L_inj * (KVD + NG * 2);   // [q][scales]
+        size_t s_off = (size_t)L_inj * KVD;
+        std::string tmp = out_path + ".tmp";
+        FILE* fo = fopen(tmp.c_str(), "wb");
+        if (!fo) return "{\"error\":\"cannot open out\"}";
+        int32_t hdr[4] = {0x44464B32, L_inj, HD.n, KVD};
+        fwrite(hdr, 4, 4, fo);
+        if (ftruncate(fileno(fo), 16 + 2 * (long long)HD.n * plane) != 0) {
+            fclose(fo); return "{\"error\":\"ftruncate failed\"}";
+        }
+
+        for (int pos = 0; pos < L_inj; pos += CH) {
+            int n = std::min(CH, L_inj - pos);
+            for (int t = 0; t < n; t++) {
+                dequant_embd_q8_0_row<<<(H + 255) / 256, 256>>>(
+                    embd_t->data, emb_h, ids[pos + t], H);
+                half_to_float_kernel<<<(H + 255) / 256, 256>>>(
+                    emb_h, hbuf + (size_t)t * H, H);
+            }
+            for (int layer = 0; layer < n_layers; layer++) {
+                if (model.is_attn_layer(layer))
+                    model.forward_attn_chunk(layer, hbuf, pos, n, 0);
+                else
+                    model.forward_gdn_chunk(layer, hbuf, n, 0, 0, pos);
+                model.forward_mlp_chunk(layer, hbuf, n, 0);
+                if (lvl[layer + 1] && layer + 1 < n_layers)
+                    cudaMemcpyAsync(lvl[layer + 1], hbuf,
+                                    (size_t)n * H * sizeof(float),
+                                    cudaMemcpyDeviceToDevice, 0);
+            }
+            // level n_layers = final RMSNorm output (hs[24] in HF indexing)
+            if (lvl[n_layers]) {
+                if (onorm_t->type == GGML_TYPE_F32)
+                    rms_norm_f32in_f32w(norm_h, hbuf, (float*)onorm_t->data,
+                                        n, H, model.cfg.rms_norm_eps, 0);
+                else
+                    rms_norm_f32in(norm_h, hbuf, (half*)onorm_t->data,
+                                   n, H, model.cfg.rms_norm_eps, 0);
+                half_to_float_kernel<<<((size_t)n * H + 255) / 256, 256>>>(
+                    norm_h, lvl[n_layers], n * H);
+            }
+            for (int li = 0; li < HD.n; li++) {
+                const float* t0p = lvl[HD.taps[li * 3 + 0]];
+                const float* t1p = lvl[HD.taps[li * 3 + 1]];
+                const float* t2p = lvl[HD.taps[li * 3 + 2]];
+                kvgen_gather_half<<<((size_t)n * HD.in_dim + 255) / 256, 256>>>(
+                    t0p, t1p, t2p, Xbuf, n, H);
+                kvq.quantize_chunk(Xbuf, HD.in_dim, n, 0);
+                quant_gemv_chunk(HD.w_q8[li], GGML_TYPE_Q8_0, kvq.q8_buf,
+                                 OUTb, HD.in_dim, HD.out_dim, n, 0);
+                kvgen_bias_add<<<((size_t)n * HD.out_dim + 255) / 256, 256>>>(
+                    OUTb, HD.bias[li], n, HD.out_dim);
+                for (int pass = 0; pass < 2; pass++) {  // 0=K cols, 1=V cols
+                    dim3 grid(n, NG);
+                    kvgen_quant_group<<<grid, 128>>>(OUTb, HD.out_dim,
+                                                     pass * KVD, dq, dsc, n);
+                    cudaMemcpy(hq, dq, (size_t)n * KVD, cudaMemcpyDeviceToHost);
+                    cudaMemcpy(hsc, dsc, (size_t)n * NG * 2, cudaMemcpyDeviceToHost);
+                    size_t pi = (size_t)(pass * HD.n + li);
+                    fseek(fo, 16 + pi * plane + (size_t)pos * KVD, SEEK_SET);
+                    fwrite(hq, 1, (size_t)n * KVD, fo);
+                    fseek(fo, 16 + pi * plane + s_off + (size_t)pos * NG * 2, SEEK_SET);
+                    fwrite(hsc, 1, (size_t)n * NG * 2, fo);
+                }
+            }
+        }
+        fclose(fo);
+        rename(tmp.c_str(), out_path.c_str());
+        double secs = std::chrono::duration<double>(
+            std::chrono::high_resolution_clock::now() - t0).count();
+        printf("[kvgen] %d tok -> %s (%.1fs, %.0f tok/s)\n",
+               L_inj, out_path.c_str(), secs, L_inj / secs);
+        fflush(stdout);
+        char resp[256];
+        snprintf(resp, sizeof(resp), "{\"l_inj\":%d,\"seconds\":%.2f}", L_inj, secs);
+        return std::string(resp);
+    };
+
+    HttpServer server;
+    server.port = port;
+    server.kvgen_fn = kvgen_fn;
+    printf("[kvgen] listening on :%d\n", port);
+    return server.start(port) ? 0 : 1;
+}
+
 int serve_rerank(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port,
                  const Tokenizer& tok, const std::string& model_name) {
     QwenModel model;
@@ -6830,6 +7090,8 @@ int main(int argc, char** argv) {
             ret = run_dflash_extract(gguf, gpu_model, n_gpus,
                                      dflash_corpus_path, dflash_out_dir, dflash_chunk_bytes);
         }
+    } else if (serve_port > 0 && service_mode == "kvgen") {
+        ret = serve_kvgen(gguf, gpu_model, n_gpus, serve_port);
     } else if (serve_port > 0 && service_mode == "embed") {
         ret = serve_embed(gguf, gpu_model, n_gpus, serve_port, tokenizer, model_name);
     } else if (serve_port > 0 && service_mode == "rerank") {
