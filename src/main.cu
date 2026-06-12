@@ -1668,6 +1668,13 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         model.init_attention(max_seq, num_slots);
     }
 
+    // SPEC_LORA=<file>: merge the spec-prefill adaptation LoRA into the Q8_0
+    // attn weights in place (export_lora_engine.py format). Whole-server
+    // scope — run dedicated spec-prefill/eval servers with this; keep it off
+    // the normal chat server until merged-weight quality is regression-checked.
+    if (const char* lora_path = getenv("SPEC_LORA"))
+        model.apply_spec_lora(lora_path);
+
     int H = model.cfg.hidden_size;
     int V = model.cfg.vocab_size;
     int last_gpu = gpu_model.layer_gpu[model.cfg.num_layers - 1];
@@ -2214,6 +2221,33 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 }
             }
         }
+        // ── Salient-segment recompute list (multi-segment speculative prefill).
+        // KV_INJECT_SEGS: text file, one "a b" pair per line — token ranges
+        // [a, b) inside the injected prefix whose KV must be RECOMPUTED over
+        // the (noisy) predicted prefix, overwriting the injected entries.
+        // Re-read every request (eval driver rewrites it per prompt). Each
+        // segment and the final tail start from zero GDN/conv state (the
+        // HF-validated condition). v3 pipeline only.
+        std::vector<std::pair<int,int>> inj_segs;
+        if (prefix_skip > 0 && getenv("KV_INJECT_FILE")) {
+            static const char* segs_path = getenv("KV_INJECT_SEGS");
+            if (segs_path) {
+                if (FILE* sf = fopen(segs_path, "r")) {
+                    int a, b;
+                    while (fscanf(sf, "%d %d", &a, &b) == 2) {
+                        a = std::max(a, 1);
+                        b = std::min(b, prefix_skip);
+                        if (a < b) inj_segs.push_back({a, b});
+                    }
+                    fclose(sf);
+                    std::sort(inj_segs.begin(), inj_segs.end());
+                    printf("[KV-INJECT slot=%d] %zu recompute segments (%d tok)\n",
+                           slot, inj_segs.size(),
+                           (int)[&]{ long long s=0; for (auto& p : inj_segs) s += p.second-p.first; return s; }());
+                    fflush(stdout);
+                }
+            }
+        }
         // Chunk-aligned snapshot point for THIS request. Only save when the
         // chunked prefill crosses this exact boundary. Capped to prompt_len-1
         // (chunked prefill stops one short of the last prompt token). In auto
@@ -2416,6 +2450,12 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         // one-time drain barrier at snapshot_target (see below).
         const bool use_pipeline_v2 = alloc_pp_v2 && common_pipe_ok && !use_pipeline_v3;
         const bool use_pipeline = common_pipe_ok && !use_pipeline_v2 && !use_pipeline_v3;
+        if (!inj_segs.empty() && !use_pipeline_v3) {
+            fprintf(stderr, "[KV-INJECT] WARNING: recompute segments need the v3 "
+                    "pipeline (PREFILL_PIPELINE_V3) — ignoring %zu segments\n",
+                    inj_segs.size());
+            inj_segs.clear();
+        }
 
         if (use_pipeline_v3) {
             // ── Multi-threaded chunked prefill (PREFILL_PIPELINE_V3) ───────────
@@ -2450,10 +2490,15 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     half_to_float_kernel<<<(H+255)/256,256,0,s0>>>(gpu_hidden_half[0], h_in + (size_t)t * H, H);
                 }
             };
-            auto v3_seg = [&](int s, int buf, int pos, int n){
+            auto v3_seg = [&](int s, int buf, int pos, int n, int rst){
                 int g = gpu_segs[s].g;
                 cudaSetDevice(g);
                 cudaStream_t cs = prefill_comp_stream[g];
+                // First chunk of a recompute segment (or of the tail after
+                // segments): zero this stage's GDN/conv state, stream-ordered
+                // before the chunk's kernels — per-stage FIFO keeps it correct.
+                if (rst) model.reset_gdn_slot_segment_stream(
+                             slot, gpu_segs[s].l_lo, gpu_segs[s].l_hi, g, cs);
                 float* h_chunk = v2_gpu_hidden[g][buf];
                 for (int layer = gpu_segs[s].l_lo; layer < gpu_segs[s].l_hi; layer++) {
                     if (model.is_attn_layer(layer)) model.forward_attn_chunk(layer, h_chunk, pos, n, cs, slot);
@@ -2473,7 +2518,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 cudaEventRecord(v2_dh[s][buf], prefill_d2h_stream[g]);
             };
             // Buffer free-list + per-stage work queues.
-            struct W { int buf, pos, n; };
+            struct W { int buf, pos, n, rst; };
             std::mutex mtx; std::condition_variable cv;
             std::deque<int> free_bufs; for (int b=0;b<NB;b++) free_bufs.push_back(b);
             std::vector<std::deque<W>> q(nseg);
@@ -2495,7 +2540,7 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         cudaEventSynchronize(v2_dh[s-1][w.buf]);  // host-coherent: prev D2H done
                         cudaMemcpyAsync(v2_gpu_hidden[gpu_segs[s].g][w.buf], v2_host_xfer[w.buf],
                             (size_t)w.n * H * sizeof(float), cudaMemcpyHostToDevice, prefill_comp_stream[gpu_segs[s].g]);
-                        v3_seg(s, w.buf, w.pos, w.n);
+                        v3_seg(s, w.buf, w.pos, w.n, w.rst);
                         if (s < last_seg) {
                             v3_d2h(s, w.buf, w.n);
                             { std::lock_guard<std::mutex> lk(mtx); q[s+1].push_back(w); } cv.notify_all();
@@ -2508,36 +2553,54 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     if (s < last_seg) { std::lock_guard<std::mutex> lk(mtx); q_done[s+1] = true; cv.notify_all(); }
                 });
             }
-            // Producer (this thread) = stage 0.
+            // Producer (this thread) = stage 0. Admission ranges: each salient
+            // recompute segment, then the tail [chunk_pos, prefill_len). Every
+            // range after the first starts from zero GDN state (rst on its
+            // first chunk; the slot was fully reset before injection, so the
+            // first range starts zero already — rst is still set, harmless).
+            struct PRange { int a, b; };
+            std::vector<PRange> pranges;
+            for (auto& sg : inj_segs) pranges.push_back({sg.first, sg.second});
+            pranges.push_back({chunk_pos, prefill_len});
+            const int multi_range = pranges.size() > 1 ? 1 : 0;
             cudaSetDevice(g0);
-            int v3_pos = chunk_pos; bool v3_cancel = false;
+            bool v3_cancel = false;
             bool v3_snap_pending = (snapshot_target > prefix_skip);
-            while (v3_pos < prefill_len) {
-                if (cancelled && cancelled->load(std::memory_order_relaxed)) { v3_cancel = true; break; }
-                // Snapshot drain barrier: when all tokens < snapshot_target are
-                // admitted, wait for the pipeline to fully drain (every buffer
-                // back in the free-list = all in-flight chunks done), save a
-                // consistent KV/GDN snapshot, then resume. One-time, ~= tail.
-                if (v3_snap_pending && v3_pos >= snapshot_target) {
+            for (size_t ri = 0; ri < pranges.size() && !v3_cancel; ri++) {
+                int v3_pos = pranges[ri].a;
+                const int range_end = pranges[ri].b;
+                const bool is_tail = (ri + 1 == pranges.size());
+                int rst = multi_range;
+                while (v3_pos < range_end) {
+                    if (cancelled && cancelled->load(std::memory_order_relaxed)) { v3_cancel = true; break; }
+                    // Snapshot drain barrier: when all tokens < snapshot_target are
+                    // admitted, wait for the pipeline to fully drain (every buffer
+                    // back in the free-list = all in-flight chunks done), save a
+                    // consistent KV/GDN snapshot, then resume. One-time, ~= tail.
+                    // (Tail range only; snapshots are disabled on inject-mode
+                    // eval servers, and a mid-segment snapshot would be wrong.)
+                    if (is_tail && v3_snap_pending && v3_pos >= snapshot_target) {
+                        { std::unique_lock<std::mutex> lk(mtx);
+                          cv.wait(lk, [&]{ return (int)free_bufs.size() == NB; }); }
+                        for (int g = 0; g < n_gpus; g++) { cudaSetDevice(g); cudaStreamSynchronize(prefill_comp_stream[g]); }
+                        model.save_prefix_snapshot(prompt_ids, snapshot_target, slot);
+                        printf("[CACHE] snapshot saved at pos=%d (v3)\n", snapshot_target);
+                        fflush(stdout);
+                        cudaSetDevice(g0);
+                        v3_snap_pending = false;
+                    }
+                    int n = std::min(CHUNK_SIZE, range_end - v3_pos);
+                    int buf;
                     { std::unique_lock<std::mutex> lk(mtx);
-                      cv.wait(lk, [&]{ return (int)free_bufs.size() == NB; }); }
-                    for (int g = 0; g < n_gpus; g++) { cudaSetDevice(g); cudaStreamSynchronize(prefill_comp_stream[g]); }
-                    model.save_prefix_snapshot(prompt_ids, snapshot_target, slot);
-                    printf("[CACHE] snapshot saved at pos=%d (v3)\n", snapshot_target);
-                    fflush(stdout);
-                    cudaSetDevice(g0);
-                    v3_snap_pending = false;
+                      cv.wait(lk, [&]{ return !free_bufs.empty(); });
+                      buf = free_bufs.front(); free_bufs.pop_front(); }
+                    v3_embed(buf, v3_pos, n);
+                    v3_seg(0, buf, v3_pos, n, rst);
+                    v3_d2h(0, buf, n);
+                    { std::lock_guard<std::mutex> lk(mtx); q[1].push_back({buf, v3_pos, n, rst}); } cv.notify_all();
+                    rst = 0;
+                    v3_pos += n;
                 }
-                int n = std::min(CHUNK_SIZE, prefill_len - v3_pos);
-                int buf;
-                { std::unique_lock<std::mutex> lk(mtx);
-                  cv.wait(lk, [&]{ return !free_bufs.empty(); });
-                  buf = free_bufs.front(); free_bufs.pop_front(); }
-                v3_embed(buf, v3_pos, n);
-                v3_seg(0, buf, v3_pos, n);
-                v3_d2h(0, buf, n);
-                { std::lock_guard<std::mutex> lk(mtx); q[1].push_back({buf, v3_pos, n}); } cv.notify_all();
-                v3_pos += n;
             }
             { std::lock_guard<std::mutex> lk(mtx); q_done[1] = true; cv.notify_all(); }
             for (auto& t : workers) t.join();

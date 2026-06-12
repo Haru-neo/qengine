@@ -104,6 +104,60 @@ struct LayerBuffers {
     half* mlp_chunk_down = nullptr;  // [CHUNK_SIZE * H]  ffn_down proj
 };
 
+// ============ Spec-prefill LoRA merge (SPEC_LORA=<file>) ==================
+// Merge a low-rank delta (scale * B @ A, HF [out, in] layout == GGUF memory
+// layout) into a Q8_0 weight in place: per 32-elem block dequant + add +
+// requant. One CUDA block (32 threads = 1 warp) per Q8_0 block; the delta
+// row segment is recomputed from the factors (r madds/elem) so the file
+// ships ~MBs of factors instead of GBs of dense deltas.
+// NOTE: operates on the GPU-resident block_q8_0_aligned layout (36 B,
+// qs at offset 0, d at offset 34 — see quant_gemv.cuh), NOT the GGUF
+// on-disk 34 B layout: the loader repacks every Q8_0 weight at load time.
+// Getting this wrong turns the whole model to garbage (2026-06-12).
+__global__ void lora_merge_q8_0(uint8_t* __restrict__ w,
+                                const half* __restrict__ A,   // [r, in]
+                                const half* __restrict__ B,   // [out, r]
+                                int in, int r, float scale) {
+    const long long bi = blockIdx.x;          // Q8_0 block index
+    const int blocks_per_row = in / 32;
+    const int o  = (int)(bi / blocks_per_row);
+    const int i0 = (int)(bi % blocks_per_row) * 32;
+    uint8_t* blk = w + bi * 36;               // block_q8_0_aligned
+    half* dp = (half*)(blk + 34);
+    int8_t* qs = (int8_t*)blk;
+    const int lane = threadIdx.x;
+    float delta = 0.f;
+    for (int k = 0; k < r; k++)
+        delta += __half2float(B[(size_t)o * r + k])
+               * __half2float(A[(size_t)k * in + i0 + lane]);
+    float v = __half2float(*dp) * (float)qs[lane] + scale * delta;
+    // warp absmax reduce -> new block scale
+    float amax = fabsf(v);
+    for (int off = 16; off > 0; off >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
+    float d_new = amax / 127.f;
+    float q = (d_new > 0.f) ? v / d_new : 0.f;
+    int qi = (int)nearbyintf(q);
+    qi = max(-127, min(127, qi));
+    __syncwarp();
+    if (lane == 0) *dp = __float2half(d_new);
+    qs[lane] = (int8_t)qi;
+}
+
+// DFKI2 (int8 + group-128 fp16 scales) plane dequant for KV injection.
+// q: [L, kv_dim] int8, s: [L, kv_dim/128] fp16, out: [L, kv_dim] fp16.
+__global__ void dfki2_dequant_kernel(const int8_t* __restrict__ q,
+                                     const half* __restrict__ s,
+                                     half* __restrict__ out,
+                                     long long n, int kv_dim) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int col = (int)(i % kv_dim);
+    long long row = i / kv_dim;
+    float sc = __half2float(s[row * (kv_dim / 128) + col / 128]);
+    out[i] = __float2half((float)q[i] * sc);
+}
+
 // ============ MoE helper kernels (qmoe_ prefix to avoid clashing with the
 // identically-purposed kernels in gemma_model.cuh, which shares this TU) ====
 
@@ -2842,15 +2896,68 @@ struct QwenModel {
     // reset the slot first; caller then resumes chunked prefill at L.
     // Returns L on success, -1 on failure. Research path: synchronous,
     // allocates and frees its own scratch.
+    // Merge spec-prefill adaptation LoRA factors (export_lora_engine.py) into
+    // the Q8_0 attn weights in place. Call once after weight load. Returns
+    // the number of tensors merged, or -1 on error.
+    int apply_spec_lora(const char* path) {
+        FILE* f = fopen(path, "rb");
+        if (!f) { fprintf(stderr, "[spec-lora] cannot open %s\n", path); return -1; }
+        int32_t magic = 0, n_ent = 0;
+        if (fread(&magic, 4, 1, f) != 1 || fread(&n_ent, 4, 1, f) != 1 ||
+            magic != 0x4C4F5241) {
+            fprintf(stderr, "[spec-lora] bad header\n"); fclose(f); return -1;
+        }
+        int merged = 0;
+        for (int e = 0; e < n_ent; e++) {
+            int32_t nlen, out, in, r; float scale;
+            if (fread(&nlen, 4, 1, f) != 1) break;
+            std::string name(nlen, 0);
+            if (fread(name.data(), 1, nlen, f) != (size_t)nlen ||
+                fread(&out, 4, 1, f) != 1 || fread(&in, 4, 1, f) != 1 ||
+                fread(&r, 4, 1, f) != 1 || fread(&scale, 4, 1, f) != 1) break;
+            std::vector<half> hA((size_t)r * in), hB((size_t)out * r);
+            if (fread(hA.data(), 2, hA.size(), f) != hA.size() ||
+                fread(hB.data(), 2, hB.size(), f) != hB.size()) break;
+            GPUTensor* w = t(name);
+            if (!w || w->type != GGML_TYPE_Q8_0 ||
+                (int)w->dims[0] != in || (int)w->dims[1] != out) {
+                fprintf(stderr, "[spec-lora] skip %s (missing/type/shape mismatch)\n",
+                        name.c_str());
+                continue;
+            }
+            cudaSetDevice(w->gpu_id);
+            half *dA, *dB;
+            cudaMalloc(&dA, hA.size() * 2); cudaMalloc(&dB, hB.size() * 2);
+            cudaMemcpy(dA, hA.data(), hA.size() * 2, cudaMemcpyHostToDevice);
+            cudaMemcpy(dB, hB.data(), hB.size() * 2, cudaMemcpyHostToDevice);
+            long long nblocks = (long long)out * (in / 32);
+            lora_merge_q8_0<<<(unsigned)nblocks, 32>>>(
+                (uint8_t*)w->data, dA, dB, in, r, scale);
+            cudaDeviceSynchronize();
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess)
+                fprintf(stderr, "[spec-lora] kernel err on %s: %s\n",
+                        name.c_str(), cudaGetErrorString(err));
+            else merged++;
+            cudaFree(dA); cudaFree(dB);
+        }
+        fclose(f);
+        printf("[spec-lora] merged %d/%d tensors from %s\n", merged, n_ent, path);
+        fflush(stdout);
+        return merged;
+    }
+
     int kv_inject_from_file(const char* path, int slot) {
         FILE* f = fopen(path, "rb");
         if (!f) { fprintf(stderr, "[kv-inject] cannot open %s\n", path); return -1; }
         int32_t magic = 0, L = 0, n_attn_f = 0, kvd_f = 0;
         if (fread(&magic, 4, 1, f) != 1 || fread(&L, 4, 1, f) != 1 ||
             fread(&n_attn_f, 4, 1, f) != 1 || fread(&kvd_f, 4, 1, f) != 1 ||
-            magic != 0x44464B49) {
+            (magic != 0x44464B49 && magic != 0x44464B32)) {
             fprintf(stderr, "[kv-inject] bad header in %s\n", path); fclose(f); return -1;
         }
+        // DFKI2: int8 planes + group-128 fp16 scales (halves file + PCIe).
+        const bool is_int8 = (magic == 0x44464B32);
         const int kv_dim = cfg.num_kv_heads * cfg.head_dim;
         int n_attn = 0;
         for (int l = 0; l < cfg.num_layers; l++) if (is_attn_layer(l)) n_attn++;
@@ -2860,35 +2967,72 @@ struct QwenModel {
                     n_attn_f, kvd_f, L, n_attn, kv_dim, slot_capacity(slot));
             fclose(f); return -1;
         }
-        std::vector<half> hbuf((size_t)L * kv_dim);
         const int hd = cfg.head_dim, num_kv = cfg.num_kv_heads;
         const int rope_dim = rope.rope_dim, half_rope = rope_dim / 2;
         size_t plane_elems = (size_t)L * kv_dim;
+        size_t plane_bytes = plane_elems * sizeof(half);
+        const int ng = kv_dim / 128;
+        // on-file bytes per plane ([int8 q][fp16 scales] when int8)
+        size_t file_plane_bytes = is_int8 ? plane_elems + (size_t)L * ng * 2
+                                          : plane_bytes;
         size_t slot_kv_elem_off = kv_slot_offset(slot) * kv_dim;
-        // Per-GPU scratch, lazily allocated for the largest plane.
+        // Cross-GPU async pipeline: the 16 attn planes live on 3 GPUs whose
+        // PCIe x1 links are independent — serial sync H2D wasted ~25s of the
+        // ~34s inject time at 100K. Per-GPU stream + double-buffered PINNED
+        // staging: fread fills buffer b while buffer b^1's H2D is in flight;
+        // RoPE/quant kernels chain in-stream after their plane's H2D (single
+        // device scratch per GPU is safe — in-stream FIFO orders next H2D
+        // after the previous plane's kernels).
         half* dscratch[8] = {};
-        auto get_scratch = [&](int g) -> half* {
-            if (!dscratch[g]) { cudaSetDevice(g); cudaMalloc(&dscratch[g], plane_elems * sizeof(half)); }
-            return dscratch[g];
+        uint8_t* draw[8] = {};   // raw int8+scales staging (DFKI2 only)
+        half* pinbuf[8][2] = {};
+        cudaEvent_t pinev[8][2] = {};
+        cudaStream_t istream[8] = {};
+        int pin_rr[8] = {};
+        bool fail = false;
+        auto ensure_gpu = [&](int g) {
+            if (istream[g]) return;
+            cudaSetDevice(g);
+            cudaStreamCreate(&istream[g]);
+            cudaMalloc(&dscratch[g], plane_bytes);
+            if (is_int8) cudaMalloc(&draw[g], file_plane_bytes);
+            for (int b = 0; b < 2; b++) {
+                cudaMallocHost(&pinbuf[g][b], file_plane_bytes);
+                cudaEventCreate(&pinev[g][b]);
+                cudaEventRecord(pinev[g][b], istream[g]);
+            }
         };
         // Pass 1 = K planes (RoPE applied), pass 2 = V planes (raw).
-        for (int pass = 0; pass < 2; pass++) {
-            for (int layer = 0; layer < cfg.num_layers; layer++) {
+        for (int pass = 0; pass < 2 && !fail; pass++) {
+            for (int layer = 0; layer < cfg.num_layers && !fail; layer++) {
                 if (!is_attn_layer(layer)) continue;
-                if (fread(hbuf.data(), sizeof(half), plane_elems, f) != plane_elems) {
-                    fprintf(stderr, "[kv-inject] short read (pass %d layer %d)\n", pass, layer);
-                    fclose(f);
-                    for (int g = 0; g < 8; g++) if (dscratch[g]) { cudaSetDevice(g); cudaFree(dscratch[g]); }
-                    return -1;
-                }
                 int g = gpu->layer_gpu[layer];
+                ensure_gpu(g);
                 cudaSetDevice(g);
-                half* dev = get_scratch(g);
-                cudaMemcpy(dev, hbuf.data(), plane_elems * sizeof(half), cudaMemcpyHostToDevice);
+                int b = (pin_rr[g]++) & 1;
+                cudaEventSynchronize(pinev[g][b]);  // staging buffer free again
+                if (fread(pinbuf[g][b], 1, file_plane_bytes, f) != file_plane_bytes) {
+                    fprintf(stderr, "[kv-inject] short read (pass %d layer %d)\n", pass, layer);
+                    fail = true; break;
+                }
+                if (is_int8) {
+                    cudaMemcpyAsync(draw[g], pinbuf[g][b], file_plane_bytes,
+                                    cudaMemcpyHostToDevice, istream[g]);
+                    cudaEventRecord(pinev[g][b], istream[g]);
+                    dfki2_dequant_kernel<<<(unsigned)((plane_elems + 255) / 256), 256,
+                                           0, istream[g]>>>(
+                        (const int8_t*)draw[g],
+                        (const half*)(draw[g] + plane_elems),
+                        dscratch[g], (long long)plane_elems, kv_dim);
+                } else {
+                    cudaMemcpyAsync(dscratch[g], pinbuf[g][b], plane_bytes,
+                                    cudaMemcpyHostToDevice, istream[g]);
+                    cudaEventRecord(pinev[g][b], istream[g]);
+                }
                 if (pass == 0) {
                     dim3 rgrid((num_kv * half_rope + 255) / 256, L);
-                    apply_rope_kernel_chunk<<<rgrid, 256>>>(
-                        dev, rope.sin_table(g), rope.cos_table(g),
+                    apply_rope_kernel_chunk<<<rgrid, 256, 0, istream[g]>>>(
+                        dscratch[g], rope.sin_table(g), rope.cos_table(g),
                         /*start_pos=*/0, num_kv, hd, rope_dim, L);
                 }
                 if (use_turboquant) {
@@ -2897,25 +3041,38 @@ struct QwenModel {
                     size_t slot_blk_off = kv_slot_offset(slot) * bpt;
                     block_tq3* dst = (pass == 0 ? tq.k : tq.v) + slot_blk_off;
                     int blocks = L * bpt;
-                    tq3_quantize_kernel<<<(blocks + 31) / 32, 32>>>(dev, dst, blocks);
+                    tq3_quantize_kernel<<<(blocks + 31) / 32, 32, 0, istream[g]>>>(
+                        dscratch[g], dst, blocks);
                 } else if (use_q8_kv) {
                     auto& q8 = q8_kv_caches[layer];
                     int bpt = q8.blocks_per_token;
                     size_t slot_blk_off = kv_slot_offset(slot) * bpt;
                     block_q8_0_aligned* dst = (pass == 0 ? q8.k : q8.v) + slot_blk_off;
                     int blocks = L * bpt;
-                    quantize_kv_q8_0_kern<<<blocks, 32>>>(dev, dst, blocks);
+                    quantize_kv_q8_0_kern<<<blocks, 32, 0, istream[g]>>>(
+                        dscratch[g], dst, blocks);
                 } else {
                     auto& kv = kv_caches[layer];
                     half* dst = (pass == 0 ? kv.k : kv.v) + slot_kv_elem_off;
-                    cudaMemcpy(dst, dev, plane_elems * sizeof(half), cudaMemcpyDeviceToDevice);
+                    cudaMemcpyAsync(dst, dscratch[g], plane_bytes,
+                                    cudaMemcpyDeviceToDevice, istream[g]);
                 }
             }
         }
         fclose(f);
-        for (int g = 0; g < 8; g++)
-            if (dscratch[g]) { cudaSetDevice(g); cudaDeviceSynchronize(); cudaFree(dscratch[g]); }
-        return L;
+        for (int g = 0; g < 8; g++) {
+            if (!istream[g]) continue;
+            cudaSetDevice(g);
+            cudaStreamSynchronize(istream[g]);
+            cudaFree(dscratch[g]);
+            if (draw[g]) cudaFree(draw[g]);
+            for (int b = 0; b < 2; b++) {
+                cudaFreeHost(pinbuf[g][b]);
+                cudaEventDestroy(pinev[g][b]);
+            }
+            cudaStreamDestroy(istream[g]);
+        }
+        return fail ? -1 : L;
     }
 
     int try_restore_prefix_cache(const std::vector<int>& prompt_tokens,
@@ -3158,6 +3315,28 @@ struct QwenModel {
             cudaSetDevice(g);
             cudaMemset(gdn_states[layer].conv_state + conv_off, 0, conv_sz);
             cudaMemset(gdn_states[layer].rec_state  + rec_off,  0, rec_sz);
+        }
+    }
+
+    // Stream-ordered GDN-only reset for slot, restricted to layers [l_lo,l_hi)
+    // on GPU g. Multi-segment speculative prefill: each recompute segment must
+    // start from zero GDN/conv state (the probe-validated injection condition)
+    // WITHOUT touching the injected KV cache — so this is the GDN half of
+    // reset_slot_segment_stream, enqueued on the compute stream right before
+    // the segment's first chunk at each pipeline stage.
+    void reset_gdn_slot_segment_stream(int slot, int l_lo, int l_hi, int g,
+                                       cudaStream_t stream) {
+        if (slot < 0 || slot >= num_slots) return;
+        cudaSetDevice(g);
+        size_t conv_off = (size_t)slot * gdn_qkv_dim_cached * 4;
+        size_t rec_off  = (size_t)slot * gdn_rec_per_slot;
+        size_t conv_sz  = (size_t)gdn_qkv_dim_cached * 4 * sizeof(float);
+        size_t rec_sz   = (size_t)gdn_rec_per_slot * sizeof(float);
+        for (int layer = l_lo; layer < l_hi; layer++) {
+            if (layer < 0 || layer >= cfg.num_layers) continue;
+            if (!gdn_states[layer].conv_state) continue;
+            cudaMemsetAsync(gdn_states[layer].conv_state + conv_off, 0, conv_sz, stream);
+            cudaMemsetAsync(gdn_states[layer].rec_state  + rec_off,  0, rec_sz,  stream);
         }
     }
 
