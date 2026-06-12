@@ -108,7 +108,11 @@ __global__ void __launch_bounds__(BLOCK, 4) flash_attn_chunk_block_sparse_split(
     float m_w = -INFINITY;
     float l_w = 0.0f;
 
-    const int* bi_row = block_index + ((size_t)kv_head * sub_n + t_idx) * top_k;
+    // Row stride is sub_n_max, matching the builders' write
+    // (build_block_index*_kern: (kv_head*sub_n_max + t_idx)*top_k) and the
+    // tq3 variant. With sub_n stride, a partial sub-chunk (sub_n < sub_n_max)
+    // made kv_head>=1 read rows the builder never wrote this launch.
+    const int* bi_row = block_index + ((size_t)kv_head * sub_n_max + t_idx) * top_k;
     int inner_per_block = block_size_n / BM;  // tiles per index entry
 
     for (int tk = tk_lo; tk < tk_hi; tk++) {
@@ -174,7 +178,12 @@ __global__ void __launch_bounds__(BLOCK, 4) flash_attn_chunk_block_sparse_split(
             // Online softmax + V accumulate (matches flash_attn_chunk_fused_split).
             if (warp < GQA) {
                 int g = warp;
-                float s_val = s_smem[g * BM + lane];
+                // Row is BM floats but the warp is 32 lanes: lanes >= BM must
+                // not read past the row (next head's scores for g<GQA-1 —
+                // phantom softmax mass — and past the dynamic smem allocation
+                // for the last head, which faults when smem size lands exactly
+                // on the 256B allocation granularity, e.g. GQA=4: 18688B).
+                float s_val = (lane < BM) ? s_smem[g * BM + lane] : -INFINITY;
 
                 float m_row = s_val;
                 #pragma unroll

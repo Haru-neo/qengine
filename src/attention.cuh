@@ -1620,7 +1620,10 @@ __global__ void __launch_bounds__(BLOCK, 4) flash_attn_chunk_fused_split(
 
             if (warp < GQA) {
                 int g = warp;
-                float s_val = s_smem[g * BM + lane];
+                // Lanes >= BM must not read past the BM-float row (phantom
+                // cross-head softmax mass; smem OOB fault for the last head
+                // when GQA*BM*4 lands on the 256B smem granularity, e.g. GQA=4).
+                float s_val = (lane < BM) ? s_smem[g * BM + lane] : -INFINITY;
 
                 float m_row = s_val;
                 #pragma unroll
@@ -2109,7 +2112,10 @@ __global__ void flash_attn_chunk_fused_split_tq3(
             // Softmax + O accumulation (identical to base split kernel).
             if (warp < GQA) {
                 int g = warp;
-                float s_val = s_smem[g * BM + lane];
+                // Lanes >= BM must not read past the BM-float row (phantom
+                // cross-head softmax mass; smem OOB fault for the last head
+                // when GQA*BM*4 lands on the 256B smem granularity, e.g. GQA=4).
+                float s_val = (lane < BM) ? s_smem[g * BM + lane] : -INFINITY;
                 float m_row = s_val;
                 #pragma unroll
                 for (int off = 16; off > 0; off >>= 1)
@@ -2361,7 +2367,10 @@ __global__ void flash_attn_chunk_block_sparse_split_tq3(
                 // ===== Softmax + O accumulation (identical) =====
                 if (warp < GQA) {
                     int g = warp;
-                    float s_val = s_smem[g * BM + lane];
+                    // Lanes >= BM must not read past the BM-float row (phantom
+                // cross-head softmax mass; smem OOB fault for the last head
+                // when GQA*BM*4 lands on the 256B smem granularity, e.g. GQA=4).
+                float s_val = (lane < BM) ? s_smem[g * BM + lane] : -INFINITY;
                     float m_row = s_val;
                     #pragma unroll
                     for (int off = 16; off > 0; off >>= 1)
@@ -2737,7 +2746,10 @@ __global__ void flash_attn_chunk_fused_split_q8(
             // ============ Softmax + value (identical to TQ kernel) ============
             if (warp < GQA) {
                 int g = warp;
-                float s_val = s_smem[g * BM + lane];
+                // Lanes >= BM must not read past the BM-float row (phantom
+                // cross-head softmax mass; smem OOB fault for the last head
+                // when GQA*BM*4 lands on the 256B smem granularity, e.g. GQA=4).
+                float s_val = (lane < BM) ? s_smem[g * BM + lane] : -INFINITY;
                 float m_row = s_val;
                 #pragma unroll
                 for (int off = 16; off > 0; off >>= 1)
