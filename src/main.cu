@@ -6272,21 +6272,33 @@ int serve_kvgen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
     std::vector<int> used_lv;
     for (int v : HD.taps) if (std::find(used_lv.begin(), used_lv.end(), v) == used_lv.end()) used_lv.push_back(v);
     std::vector<float*> ph0(PNB,nullptr), ph1(PNB,nullptr), pnorm1(PNB,nullptr);
-    std::vector<float*> phost(PNB,nullptr), ptaph(PNB,nullptr);
-    // per-buffer tap store on GPU0: ptap[level] is a [PNB*CH*H] slab
+    std::vector<float*> phost(PNB,nullptr);
+    // stage1 tap pack, transferred as fp16 (lossless for the heads, which
+    // quantize to fp16/Q8 anyway): GPU1 half, host half, GPU0 half, then one
+    // half->fp32 expand into ppk0 (fp32) the head reads.
+    std::vector<half*>  ppk1(PNB,nullptr), ppkh(PNB,nullptr), ppk0h(PNB,nullptr);
+    std::vector<float*> ppk0(PNB,nullptr);
+    // per-buffer tap store on GPU0: ptap[level] is a [PNB*CH*H] slab — STAGE-0
+    // levels only. Stage-1 levels live packed in ppk0[b] at offset st1_idx[L].
     std::vector<float*> ptap(n_layers + 1, nullptr);
+    std::vector<int> st1_idx(n_layers + 1, -1);
+    int n_st1 = 0;
     cudaStream_t pcs0=0, pcs1=0, pd0=0;
     if (kv_pipe) {
+        for (int L : used_lv) if (L > kv_mid) st1_idx[L] = n_st1++;   // stage-1 levels -> packed index
         cudaSetDevice(0); cudaStreamCreate(&pcs0); cudaStreamCreate(&pd0);
         cudaSetDevice(1); cudaStreamCreate(&pcs1);
         for (int b = 0; b < PNB; b++) {
-            cudaSetDevice(0); cudaMalloc(&ph0[b], (size_t)CH*H*sizeof(float)); cudaMallocHost(&phost[b], (size_t)CH*H*sizeof(float)); cudaMallocHost(&ptaph[b], (size_t)CH*H*sizeof(float));
+            cudaSetDevice(0); cudaMalloc(&ph0[b], (size_t)CH*H*sizeof(float)); cudaMallocHost(&phost[b], (size_t)CH*H*sizeof(float));
+            cudaMallocHost(&ppkh[b], (size_t)n_st1*CH*H*sizeof(half));
+            cudaMalloc(&ppk0h[b], (size_t)n_st1*CH*H*sizeof(half)); cudaMalloc(&ppk0[b], (size_t)n_st1*CH*H*sizeof(float));
             cudaSetDevice(1); cudaMalloc(&ph1[b], (size_t)CH*H*sizeof(float)); cudaMalloc(&pnorm1[b], (size_t)CH*H*sizeof(float));
+            cudaMalloc(&ppk1[b], (size_t)n_st1*CH*H*sizeof(half));
         }
         cudaSetDevice(0);
-        for (int L : used_lv) if (!ptap[L]) cudaMalloc(&ptap[L], (size_t)PNB*CH*H*sizeof(float));
-        printf("[kvgen] PIPELINE on: stage0=layers 0-%d (GPU0), stage1=layers %d-%d (GPU1), depth %d\n",
-               kv_mid-1, kv_mid, n_layers-1, PNB);
+        for (int L : used_lv) if (L <= kv_mid && !ptap[L]) cudaMalloc(&ptap[L], (size_t)PNB*CH*H*sizeof(float));
+        printf("[kvgen] PIPELINE on: stage0=layers 0-%d (GPU0), stage1=layers %d-%d (GPU1), depth %d, %d stage1 taps packed\n",
+               kv_mid-1, kv_mid, n_layers-1, PNB, n_st1);
     }
     cudaSetDevice(0);
     // Double-buffered staging for the int8 planes: the 32 (head, K/V-pass)
@@ -6459,22 +6471,36 @@ int serve_kvgen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
                         if (model.is_attn_layer(layer)) model.forward_attn_chunk(layer, ph1[b], pos, n, pcs1);
                         else                            model.forward_gdn_chunk(layer, ph1[b], n, pcs1, 0, pos);
                         model.forward_mlp_chunk(layer, ph1[b], n, pcs1);
-                        if (ptap[layer + 1] && layer + 1 < n_layers) {             // pull stage-1 tap to GPU0
-                            cudaStreamSynchronize(pcs1);
-                            cudaMemcpy(ptaph[b], ph1[b], (size_t)n*H*sizeof(float), cudaMemcpyDeviceToHost);
-                            cudaSetDevice(0); cudaMemcpy(ptap[layer+1]+(size_t)b*CH*H, ptaph[b], (size_t)n*H*sizeof(float), cudaMemcpyHostToDevice); cudaSetDevice(1);
-                        }
+                        // Capture stage-1 tap into the packed GPU1 buffer as fp16
+                        // (async, NO per-layer sync — stage-1 compute stays
+                        // pipelined). One batched cross-GPU transfer after the
+                        // whole stage. fp16 halves the PCIe-x1 traffic losslessly
+                        // (the heads run fp16/Q8 anyway).
+                        if (layer + 1 < n_layers && st1_idx[layer + 1] >= 0)
+                            float_to_half_kernel<<<((size_t)n*H+255)/256,256,0,pcs1>>>(
+                                ph1[b], ppk1[b] + (size_t)st1_idx[layer+1]*CH*H, n*H);
                     }
-                    if (ptap[n_layers]) {                                           // final norm on GPU1 -> GPU0
-                        cudaStreamSynchronize(pcs1);
+                    if (st1_idx[n_layers] >= 0) {                                   // final norm -> packed slot (half)
                         if (onorm_t->type == GGML_TYPE_F32)
                             rms_norm_f32in_f32w(norm_g[1], ph1[b], (float*)onorm_t->data, n, H, model.cfg.rms_norm_eps, pcs1);
                         else
                             rms_norm_f32in(norm_g[1], ph1[b], (half*)onorm_t->data, n, H, model.cfg.rms_norm_eps, pcs1);
-                        half_to_float_kernel<<<((size_t)n*H+255)/256,256,0,pcs1>>>(norm_g[1], pnorm1[b], n*H);
+                        cudaMemcpyAsync(ppk1[b] + (size_t)st1_idx[n_layers]*CH*H, norm_g[1],
+                                        (size_t)n*H*sizeof(half), cudaMemcpyDeviceToDevice, pcs1);
+                    }
+                    // ONE batched fp16 cross-GPU transfer, then expand half->fp32
+                    // on GPU0 (CH-strided; the head reads only the first n rows
+                    // per level, so a partial chunk's dead tail is moved/expanded
+                    // but never read).
+                    if (n_st1 > 0) {
                         cudaStreamSynchronize(pcs1);
-                        cudaMemcpy(ptaph[b], pnorm1[b], (size_t)n*H*sizeof(float), cudaMemcpyDeviceToHost);
-                        cudaSetDevice(0); cudaMemcpy(ptap[n_layers]+(size_t)b*CH*H, ptaph[b], (size_t)n*H*sizeof(float), cudaMemcpyHostToDevice); cudaSetDevice(1);
+                        size_t hbytes = (size_t)n_st1*CH*H*sizeof(half);
+                        cudaMemcpy(ppkh[b], ppk1[b], hbytes, cudaMemcpyDeviceToHost);
+                        cudaSetDevice(0);
+                        cudaMemcpy(ppk0h[b], ppkh[b], hbytes, cudaMemcpyHostToDevice);
+                        half_to_float_kernel<<<((size_t)n_st1*CH*H+255)/256,256>>>(ppk0h[b], ppk0[b], (int)((size_t)n_st1*CH*H));
+                        cudaStreamSynchronize(0);
+                        cudaSetDevice(1);
                     }
                     { std::lock_guard<std::mutex> lk(qmtx); qh.push_back(it); } qcv.notify_all();
                 }
@@ -6491,10 +6517,16 @@ int serve_kvgen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
                       it = qh.front(); qh.pop_front(); }
                     int ci = it.ci, b = it.b, n = cn(ci), pos = cpos(ci);
                     cudaSetDevice(0);
+                    // tap pointer: stage-0 levels from ptap[L][b], stage-1 levels
+                    // from the packed GPU0 buffer ppk0[b] at st1_idx[L].
+                    auto tapp = [&](int L) -> const float* {
+                        return st1_idx[L] >= 0 ? ppk0[b] + (size_t)st1_idx[L]*CH*H
+                                               : ptap[L] + (size_t)b*CH*H;
+                    };
                     for (int li = 0; li < HD.n; li++) {
-                        const float* t0 = ptap[HD.taps[li*3+0]] + (size_t)b*CH*H;
-                        const float* t1 = ptap[HD.taps[li*3+1]] + (size_t)b*CH*H;
-                        const float* t2 = ptap[HD.taps[li*3+2]] + (size_t)b*CH*H;
+                        const float* t0 = tapp(HD.taps[li*3+0]);
+                        const float* t1 = tapp(HD.taps[li*3+1]);
+                        const float* t2 = tapp(HD.taps[li*3+2]);
                         kvgen_gather_half<<<((size_t)n*HD.in_dim+255)/256,256,0,pcs0>>>(t0,t1,t2,Xbuf,n,H);
                         kvq.quantize_chunk(Xbuf, HD.in_dim, n, pcs0);
                         quant_gemv_chunk(HD.w_q8[li], GGML_TYPE_Q8_0, kvq.q8_buf, OUTb, HD.in_dim, HD.out_dim, n, pcs0);
