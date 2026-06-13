@@ -137,6 +137,7 @@ for _ in $(seq 1 60); do
 done
 CUDA_VISIBLE_DEVICES=3 \
 KVGEN_HEADS="$KVGEN_HEADS_FILE" KVGEN_MAX_SEQ=$KVGEN_MAX_SEQ \
+MINF_SPARSE_ATTN=1 MINF_BUDGET=0.10 MINF_UNIFORM_MS=1 \
 nohup "$BIN" "$KVGEN_MODEL" \
   --serve $KVGEN_PORT --mode kvgen \
   > /tmp/kvgen.log 2>&1 &
