@@ -116,3 +116,28 @@ The §4 tap-gather over PCIe-1.0-x1 is the make-or-break. If Q8+overlap hides it
 ~2x is real (53.8→~27s). If not, multi-GPU kvgen is a dead-end on this HW and
 the single-GPU levers (builder scoring hoist ~3-4s with per-query top_k for
 bit-exactness; FA NT-batch ~3s) are the path. Run Inc 0 FIRST.
+
+## MEASURED (2026-06-13, Inc 1 built + run)
+Inc 1 (multi-GPU body across 3 GPUs, sequential/blocking transfers) is DONE and
+CORRECT: 12K relerr bit-identical to single-GPU (L0K 0.0288 / L7K 0.1145 / L15K
+0.0874), 0 sparse errors; single-GPU path unchanged (100K 52.86s). Bug found +
+fixed: the 16 head Q8 weights loaded on GPU(N-1) because init_* leaves the
+device there — added cudaSetDevice(0) before load_kvgen_heads (heads run on
+GPU0; without it quant_gemv faulted cross-GPU → sticky illegal access → all-zero
+KV → relerr 1.0).
+- **§4 GATE VERDICT: tap-gather is real and large.** 100K Inc 1 = 132.5s vs
+  single-GPU 53.8s. Profile: p_cap (hbuf hops + tap-gather) = **62.1s** (fp32,
+  blocking, ~18MB/chunk × 385). Body compute unchanged. Naive multi-GPU ~2.5x
+  SLOWER.
+- **BOTH are required, neither alone suffices:** (a) the body must be PIPELINED
+  across GPUs (the ~40s serial body alone + any transfer > 53.8s); (b) the
+  tap-gather must shrink. Q8-taps or overlap alone still leave the serial body.
+- **Revised tap design (better than gather-all-to-GPU0):** capture each tap on
+  its PRODUCING GPU and run each head on the GPU where its 3 taps live — the
+  taps_for() 3-windows are narrow (map=[2,3,4,6,8,9,10,12,14,15,16,18,20,21,22,
+  24]) so MOST heads' taps are within one GPU's layer range; only boundary heads
+  gather. Replicate the small (~12.6MB) head weights per-GPU + per-GPU DFKI
+  plane staging. Removes most of the 62s.
+- Inc 2 = pipeline the body (reuse 27B pipeline v3 at main.cu:2460-2600) +
+  distribute-heads tap design. Multi-hour; pipelining is non-negotiable for any
+  speedup. Committed Inc 1 is the validated foundation.

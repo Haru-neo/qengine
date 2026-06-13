@@ -6208,15 +6208,23 @@ int serve_kvgen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
     const int H = model.cfg.hidden_size;          // 1024
     const int n_layers = model.cfg.num_layers;    // 24
     printf("[kvgen] model: H=%d layers=%d max_seq=%lld\n", H, n_layers, max_seq);
+    // Multi-GPU body: the 0.8B layers are distributed across kv_ngpu GPUs
+    // (CUDA_VISIBLE_DEVICES / PP_LAYER_BOUNDS via gpu_loader). The hidden state
+    // hops GPU->GPU at stage boundaries through a pinned host bridge; taps are
+    // pulled to GPU0 at capture time; embed + heads + DFKI write stay on GPU0.
+    int kv_ngpu = 1;
     for (int l = 0; l < n_layers; l++)
-        if (gpu_model.layer_gpu[l] != 0) {
-            fprintf(stderr, "[kvgen] needs single-GPU layout (layer %d on GPU %d)\n",
-                    l, gpu_model.layer_gpu[l]);
-            return 1;
-        }
+        kv_ngpu = std::max(kv_ngpu, gpu_model.layer_gpu[l] + 1);
+    printf("[kvgen] body across %d GPU(s); heads+DFKI on GPU0\n", kv_ngpu);
 
     const char* heads_path = getenv("KVGEN_HEADS");
     KVGenHeads HD;
+    // The 16 projection heads run on GPU0 (where the gathered taps live), so
+    // their Q8 weights+bias MUST load on GPU0. init_attention/init_gdn_states
+    // above leave the current device on the LAST GPU of a multi-GPU layout, so
+    // pin GPU0 before loading the heads — otherwise quant_gemv_chunk reads a
+    // GPU(N-1) weight pointer from GPU0 and faults (illegal access).
+    cudaSetDevice(0);
     if (!heads_path || !load_kvgen_heads(heads_path, HD)) return 1;
     const int KVD = HD.out_dim / 2;               // 1024 (27B kv_dim)
     const int NG = KVD / 128;                     // 8 scale groups
@@ -6232,8 +6240,22 @@ int serve_kvgen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
         if (v < 0 || v > n_layers) { fprintf(stderr, "[kvgen] bad tap %d\n", v); return 1; }
         if (!lvl[v]) cudaMalloc(&lvl[v], (size_t)CH * H * sizeof(float));
     }
-    float* hbuf;       cudaMalloc(&hbuf, (size_t)CH * H * sizeof(float));
-    half*  norm_h;     cudaMalloc(&norm_h, (size_t)CH * H * sizeof(half));
+    // Per-GPU hidden buffer (the chunk's hidden state lives on the current
+    // stage's GPU) + per-GPU norm scratch (embed on GPU0, final-norm on the
+    // last GPU). lvl[] tap buffers, heads and DFKI staging stay on GPU0.
+    std::vector<float*> hbuf_g(kv_ngpu, nullptr);
+    std::vector<half*>  norm_g(kv_ngpu, nullptr);
+    for (int g = 0; g < kv_ngpu; g++) {
+        cudaSetDevice(g);
+        cudaMalloc(&hbuf_g[g], (size_t)CH * H * sizeof(float));
+        cudaMalloc(&norm_g[g], (size_t)CH * H * sizeof(half));
+    }
+    cudaSetDevice(0);
+    float* hbuf   = hbuf_g[0];   // GPU0 alias (embed writes here)
+    half*  norm_h = norm_g[0];   // GPU0 alias (embed)
+    float* lvl_last = nullptr;   // final-norm fp32 output on the last GPU
+    if (kv_ngpu > 1) { cudaSetDevice(kv_ngpu - 1); cudaMalloc(&lvl_last, (size_t)CH * H * sizeof(float)); cudaSetDevice(0); }
+    float* hbridge; cudaMallocHost(&hbridge, (size_t)CH * H * sizeof(float)); // pinned cross-GPU bridge
     half*  Xbuf;       cudaMalloc(&Xbuf, (size_t)CH * HD.in_dim * sizeof(half));
     half*  OUTb;       cudaMalloc(&OUTb, (size_t)CH * HD.out_dim * sizeof(half));
     int*   ids_dev;    cudaMalloc(&ids_dev, (size_t)CH * sizeof(int));
@@ -6353,52 +6375,89 @@ int serve_kvgen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
             if (kvg_prof) p_write += std::chrono::duration<double>(pnow() - tw).count();
         };
 
+        // Blocking cross-GPU hidden hop via the pinned bridge. Inc 1 =
+        // correctness/serial: the blocking D2H is host-coherent on return so no
+        // separate cudaEventSynchronize fence is needed. Same GPU -> D2D.
+        // Leaves the device set to dgpu. (Inc 2 will make this stream-async +
+        // pipelined.)
+        auto hop = [&](float* dst, int dgpu, const float* src, int sgpu, int ntok) {
+            size_t bytes = (size_t)ntok * H * sizeof(float);
+            if (sgpu == dgpu) {
+                cudaSetDevice(dgpu);
+                cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, 0); // async, stream-ordered (single-GPU perf preserved)
+            } else {
+                cudaSetDevice(sgpu);
+                cudaMemcpy(hbridge, src, bytes, cudaMemcpyDeviceToHost);       // blocking -> host coherent (no-P2P fence)
+                cudaSetDevice(dgpu);
+                cudaMemcpy(dst, hbridge, bytes, cudaMemcpyHostToDevice);
+            }
+        };
+
         for (int pos = 0; pos < L_inj; pos += CH) {
             int n = std::min(CH, L_inj - pos);
             // Device-side guard: this chunk's quant kernels rewrite
             // dq_all[bcur]; the xfer stream may still be reading it for the
             // chunk launched two iterations ago. No-op if never recorded.
+            cudaSetDevice(0);   // ev_d2h + DFKI staging are GPU0 (multi-GPU body ends elsewhere)
             cudaStreamWaitEvent(0, ev_d2h[bcur], 0);
             auto tp = pnow();
+            cudaSetDevice(0);
             cudaMemcpyAsync(ids_dev, ids.data() + pos, (size_t)n * sizeof(int),
                             cudaMemcpyHostToDevice, 0);
             {
                 dim3 eg((H + 255) / 256, n);
-                dequant_embd_q8_0_rows<<<eg, 256>>>(embd_t->data, norm_h, ids_dev, H);
+                dequant_embd_q8_0_rows<<<eg, 256>>>(embd_t->data, norm_g[0], ids_dev, H);
                 half_to_float_kernel<<<(((size_t)n * H) + 255) / 256, 256>>>(
-                    norm_h, hbuf, (int)((size_t)n * H));
+                    norm_g[0], hbuf_g[0], (int)((size_t)n * H));
             }
             if (kvg_prof) { p_embed += psync(tp); }
+            int cur_gpu = 0;
             for (int layer = 0; layer < n_layers; layer++) {
+                int g = gpu_model.layer_gpu[layer];
+                if (g != cur_gpu) {                 // stage boundary: move hidden
+                    if (kvg_prof) tp = pnow();
+                    hop(hbuf_g[g], g, hbuf_g[cur_gpu], cur_gpu, n);
+                    cur_gpu = g;
+                    if (kvg_prof) p_cap += std::chrono::duration<double>(pnow() - tp).count();
+                }
+                cudaSetDevice(g);
                 if (kvg_prof) tp = pnow();
                 if (model.is_attn_layer(layer)) {
-                    model.forward_attn_chunk(layer, hbuf, pos, n, 0);
+                    model.forward_attn_chunk(layer, hbuf_g[g], pos, n, 0);
                     if (kvg_prof) p_attn += psync(tp);
                 } else {
-                    model.forward_gdn_chunk(layer, hbuf, n, 0, 0, pos);
+                    model.forward_gdn_chunk(layer, hbuf_g[g], n, 0, 0, pos);
                     if (kvg_prof) p_gdn += psync(tp);
                 }
                 if (kvg_prof) tp = pnow();
-                model.forward_mlp_chunk(layer, hbuf, n, 0);
+                model.forward_mlp_chunk(layer, hbuf_g[g], n, 0);
                 if (kvg_prof) p_mlp += psync(tp);
-                if (kvg_prof) tp = pnow();
-                if (lvl[layer + 1] && layer + 1 < n_layers)
-                    cudaMemcpyAsync(lvl[layer + 1], hbuf,
-                                    (size_t)n * H * sizeof(float),
-                                    cudaMemcpyDeviceToDevice, 0);
-                if (kvg_prof) p_cap += psync(tp);
+                // Tap capture -> GPU0 (D2D if g==0, else cross-GPU pull). This
+                // is the §4 tap-gather; p_cap measures its exposed cost.
+                if (lvl[layer + 1] && layer + 1 < n_layers) {
+                    if (kvg_prof) tp = pnow();
+                    hop(lvl[layer + 1], 0, hbuf_g[g], g, n);
+                    cudaSetDevice(g);   // restore for the next layer's forward
+                    if (kvg_prof) p_cap += std::chrono::duration<double>(pnow() - tp).count();
+                }
             }
-            // level n_layers = final RMSNorm output (hs[24] in HF indexing)
+            // level n_layers = final RMSNorm output (hs[24]). output_norm lives
+            // on the last GPU (gpu_loader), where the hidden already is.
             if (lvl[n_layers]) {
+                cudaSetDevice(cur_gpu);
+                half*  nrm = norm_g[cur_gpu];
+                float* dst = (cur_gpu == 0) ? lvl[n_layers] : lvl_last;
                 if (onorm_t->type == GGML_TYPE_F32)
-                    rms_norm_f32in_f32w(norm_h, hbuf, (float*)onorm_t->data,
+                    rms_norm_f32in_f32w(nrm, hbuf_g[cur_gpu], (float*)onorm_t->data,
                                         n, H, model.cfg.rms_norm_eps, 0);
                 else
-                    rms_norm_f32in(norm_h, hbuf, (half*)onorm_t->data,
+                    rms_norm_f32in(nrm, hbuf_g[cur_gpu], (half*)onorm_t->data,
                                    n, H, model.cfg.rms_norm_eps, 0);
                 half_to_float_kernel<<<((size_t)n * H + 255) / 256, 256>>>(
-                    norm_h, lvl[n_layers], n * H);
+                    nrm, dst, n * H);
+                if (cur_gpu != 0) hop(lvl[n_layers], 0, lvl_last, cur_gpu, n);
             }
+            cudaSetDevice(0);   // heads + DFKI run on GPU0
             for (int li = 0; li < HD.n; li++) {
                 auto th = pnow();
                 const float* t0p = lvl[HD.taps[li * 3 + 0]];
