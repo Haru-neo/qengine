@@ -6259,6 +6259,36 @@ int serve_kvgen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
     half*  Xbuf;       cudaMalloc(&Xbuf, (size_t)CH * HD.in_dim * sizeof(half));
     half*  OUTb;       cudaMalloc(&OUTb, (size_t)CH * HD.out_dim * sizeof(half));
     int*   ids_dev;    cudaMalloc(&ids_dev, (size_t)CH * sizeof(int));
+
+    // ── Pipelined multi-GPU path (KVGEN_PIPELINE=1, exactly 2 GPUs) ──────────
+    // 2 stages overlap: producer runs stage-0 (GPU0) layers + the per-chunk
+    // heads/DFKI write; a worker thread runs stage-1 (GPU1) layers and pulls
+    // its taps to GPU0. NB chunks in flight, so the taps are per-buffer.
+    const bool kv_pipe = (kv_ngpu == 2) && getenv("KVGEN_PIPELINE")
+                         && getenv("KVGEN_PIPELINE")[0] == '1';
+    constexpr int PNB = 3;                 // pipeline depth (buffers in flight)
+    int kv_mid = 0; for (int l = 0; l < n_layers; l++) if (gpu_model.layer_gpu[l] == 0) kv_mid = l + 1;
+    // used tap levels (sorted unique), and which stage/GPU produces each
+    std::vector<int> used_lv;
+    for (int v : HD.taps) if (std::find(used_lv.begin(), used_lv.end(), v) == used_lv.end()) used_lv.push_back(v);
+    std::vector<float*> ph0(PNB,nullptr), ph1(PNB,nullptr), pnorm1(PNB,nullptr);
+    std::vector<float*> phost(PNB,nullptr), ptaph(PNB,nullptr);
+    // per-buffer tap store on GPU0: ptap[level] is a [PNB*CH*H] slab
+    std::vector<float*> ptap(n_layers + 1, nullptr);
+    cudaStream_t pcs0=0, pcs1=0, pd0=0;
+    if (kv_pipe) {
+        cudaSetDevice(0); cudaStreamCreate(&pcs0); cudaStreamCreate(&pd0);
+        cudaSetDevice(1); cudaStreamCreate(&pcs1);
+        for (int b = 0; b < PNB; b++) {
+            cudaSetDevice(0); cudaMalloc(&ph0[b], (size_t)CH*H*sizeof(float)); cudaMallocHost(&phost[b], (size_t)CH*H*sizeof(float)); cudaMallocHost(&ptaph[b], (size_t)CH*H*sizeof(float));
+            cudaSetDevice(1); cudaMalloc(&ph1[b], (size_t)CH*H*sizeof(float)); cudaMalloc(&pnorm1[b], (size_t)CH*H*sizeof(float));
+        }
+        cudaSetDevice(0);
+        for (int L : used_lv) if (!ptap[L]) cudaMalloc(&ptap[L], (size_t)PNB*CH*H*sizeof(float));
+        printf("[kvgen] PIPELINE on: stage0=layers 0-%d (GPU0), stage1=layers %d-%d (GPU1), depth %d\n",
+               kv_mid-1, kv_mid, n_layers-1, PNB);
+    }
+    cudaSetDevice(0);
     // Double-buffered staging for the int8 planes: the 32 (head, K/V-pass)
     // outputs of a chunk land in per-slot regions of one device buffer, go
     // host-side with a single batch of async copies, and the pinned half is
@@ -6392,6 +6422,139 @@ int serve_kvgen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
                 cudaMemcpy(dst, hbridge, bytes, cudaMemcpyHostToDevice);
             }
         };
+
+        // ── PIPELINED 2-stage path (KVGEN_PIPELINE=1, kv_ngpu==2) ────────────
+        // producer thread = stage-0 (GPU0) + admit; worker thread = stage-1
+        // (GPU1) + pull its taps to GPU0; head thread = heads + DFKI write.
+        // PNB chunks in flight; GDN state per stage advances in chunk order.
+        if (kv_pipe) {
+            int nchunks = (L_inj + CH - 1) / CH;
+            std::vector<cudaEvent_t> es0(PNB), ed0(PNB);
+            cudaSetDevice(0);
+            for (int b = 0; b < PNB; b++) {
+                cudaEventCreateWithFlags(&es0[b], cudaEventDisableTiming);
+                cudaEventCreateWithFlags(&ed0[b], cudaEventDisableTiming);
+            }
+            std::mutex qmtx; std::condition_variable qcv;
+            std::deque<int> freeb; for (int b = 0; b < PNB; b++) freeb.push_back(b);
+            struct Item { int ci, b; };
+            std::deque<Item> q1, qh;
+            bool prod_done = false, st1_done = false;
+            auto cpos = [&](int ci){ return ci * CH; };
+            auto cn   = [&](int ci){ return std::min(CH, L_inj - ci * CH); };
+
+            std::thread worker([&]{
+                cudaSetDevice(1);
+                for (;;) {
+                    Item it;
+                    { std::unique_lock<std::mutex> lk(qmtx);
+                      qcv.wait(lk, [&]{ return !q1.empty() || prod_done; });
+                      if (q1.empty()) { if (prod_done) break; else continue; }
+                      it = q1.front(); q1.pop_front(); }
+                    int ci = it.ci, b = it.b, n = cn(ci), pos = cpos(ci);
+                    cudaSetDevice(1);
+                    cudaEventSynchronize(ed0[b]);                                   // prev D2H host-coherent
+                    cudaMemcpyAsync(ph1[b], phost[b], (size_t)n*H*sizeof(float), cudaMemcpyHostToDevice, pcs1);
+                    for (int layer = kv_mid; layer < n_layers; layer++) {
+                        if (model.is_attn_layer(layer)) model.forward_attn_chunk(layer, ph1[b], pos, n, pcs1);
+                        else                            model.forward_gdn_chunk(layer, ph1[b], n, pcs1, 0, pos);
+                        model.forward_mlp_chunk(layer, ph1[b], n, pcs1);
+                        if (ptap[layer + 1] && layer + 1 < n_layers) {             // pull stage-1 tap to GPU0
+                            cudaStreamSynchronize(pcs1);
+                            cudaMemcpy(ptaph[b], ph1[b], (size_t)n*H*sizeof(float), cudaMemcpyDeviceToHost);
+                            cudaSetDevice(0); cudaMemcpy(ptap[layer+1]+(size_t)b*CH*H, ptaph[b], (size_t)n*H*sizeof(float), cudaMemcpyHostToDevice); cudaSetDevice(1);
+                        }
+                    }
+                    if (ptap[n_layers]) {                                           // final norm on GPU1 -> GPU0
+                        cudaStreamSynchronize(pcs1);
+                        if (onorm_t->type == GGML_TYPE_F32)
+                            rms_norm_f32in_f32w(norm_g[1], ph1[b], (float*)onorm_t->data, n, H, model.cfg.rms_norm_eps, pcs1);
+                        else
+                            rms_norm_f32in(norm_g[1], ph1[b], (half*)onorm_t->data, n, H, model.cfg.rms_norm_eps, pcs1);
+                        half_to_float_kernel<<<((size_t)n*H+255)/256,256,0,pcs1>>>(norm_g[1], pnorm1[b], n*H);
+                        cudaStreamSynchronize(pcs1);
+                        cudaMemcpy(ptaph[b], pnorm1[b], (size_t)n*H*sizeof(float), cudaMemcpyDeviceToHost);
+                        cudaSetDevice(0); cudaMemcpy(ptap[n_layers]+(size_t)b*CH*H, ptaph[b], (size_t)n*H*sizeof(float), cudaMemcpyHostToDevice); cudaSetDevice(1);
+                    }
+                    { std::lock_guard<std::mutex> lk(qmtx); qh.push_back(it); } qcv.notify_all();
+                }
+                { std::lock_guard<std::mutex> lk(qmtx); st1_done = true; } qcv.notify_all();
+            });
+
+            std::thread headth([&]{
+                cudaSetDevice(0);
+                for (;;) {
+                    Item it;
+                    { std::unique_lock<std::mutex> lk(qmtx);
+                      qcv.wait(lk, [&]{ return !qh.empty() || st1_done; });
+                      if (qh.empty()) { if (st1_done) break; else continue; }
+                      it = qh.front(); qh.pop_front(); }
+                    int ci = it.ci, b = it.b, n = cn(ci), pos = cpos(ci);
+                    cudaSetDevice(0);
+                    for (int li = 0; li < HD.n; li++) {
+                        const float* t0 = ptap[HD.taps[li*3+0]] + (size_t)b*CH*H;
+                        const float* t1 = ptap[HD.taps[li*3+1]] + (size_t)b*CH*H;
+                        const float* t2 = ptap[HD.taps[li*3+2]] + (size_t)b*CH*H;
+                        kvgen_gather_half<<<((size_t)n*HD.in_dim+255)/256,256,0,pcs0>>>(t0,t1,t2,Xbuf,n,H);
+                        kvq.quantize_chunk(Xbuf, HD.in_dim, n, pcs0);
+                        quant_gemv_chunk(HD.w_q8[li], GGML_TYPE_Q8_0, kvq.q8_buf, OUTb, HD.in_dim, HD.out_dim, n, pcs0);
+                        kvgen_bias_add<<<((size_t)n*HD.out_dim+255)/256,256,0,pcs0>>>(OUTb, HD.bias[li], n, HD.out_dim);
+                        for (int pass = 0; pass < 2; pass++) {
+                            int slot = li*2 + pass; dim3 grid(n, NG);
+                            kvgen_quant_group<<<grid,128,0,pcs0>>>(OUTb, HD.out_dim, pass*KVD,
+                                dq_all[0]+(size_t)slot*CH*KVD, dsc_all[0]+(size_t)slot*CH*NG, n);
+                        }
+                    }
+                    cudaMemcpyAsync(hq_all[0], dq_all[0], (size_t)NSLOT*CH*KVD, cudaMemcpyDeviceToHost, pcs0);
+                    cudaMemcpyAsync(hsc_all[0], dsc_all[0], (size_t)NSLOT*CH*NG*sizeof(half), cudaMemcpyDeviceToHost, pcs0);
+                    cudaStreamSynchronize(pcs0);
+                    for (int li = 0; li < HD.n; li++) for (int pass = 0; pass < 2; pass++) {
+                        int slot = li*2 + pass; size_t pi = (size_t)(pass*HD.n + li);
+                        if (fseek(fo, 16 + pi*plane + (size_t)pos*KVD, SEEK_SET) != 0) write_err = true;
+                        if (fwrite(hq_all[0]+(size_t)slot*CH*KVD, 1, (size_t)n*KVD, fo) != (size_t)n*KVD) write_err = true;
+                        if (fseek(fo, 16 + pi*plane + s_off + (size_t)pos*NG*2, SEEK_SET) != 0) write_err = true;
+                        if (fwrite(hsc_all[0]+(size_t)slot*CH*NG, 2, (size_t)n*NG, fo) != (size_t)n*NG) write_err = true;
+                    }
+                    { std::lock_guard<std::mutex> lk(qmtx); freeb.push_back(b); } qcv.notify_all();
+                }
+            });
+
+            cudaSetDevice(0);
+            for (int ci = 0; ci < nchunks; ci++) {
+                int b;
+                { std::unique_lock<std::mutex> lk(qmtx); qcv.wait(lk, [&]{ return !freeb.empty(); }); b = freeb.front(); freeb.pop_front(); }
+                int n = cn(ci), pos = cpos(ci);
+                cudaSetDevice(0);
+                cudaMemcpyAsync(ids_dev, ids.data()+pos, (size_t)n*sizeof(int), cudaMemcpyHostToDevice, pcs0);
+                { dim3 eg((H+255)/256, n);
+                  dequant_embd_q8_0_rows<<<eg,256,0,pcs0>>>(embd_t->data, norm_g[0], ids_dev, H);
+                  half_to_float_kernel<<<(((size_t)n*H)+255)/256,256,0,pcs0>>>(norm_g[0], ph0[b], (int)((size_t)n*H)); }
+                for (int layer = 0; layer < kv_mid; layer++) {
+                    if (model.is_attn_layer(layer)) model.forward_attn_chunk(layer, ph0[b], pos, n, pcs0);
+                    else                            model.forward_gdn_chunk(layer, ph0[b], n, pcs0, 0, pos);
+                    model.forward_mlp_chunk(layer, ph0[b], n, pcs0);
+                    if (ptap[layer + 1] && layer + 1 < n_layers)
+                        cudaMemcpyAsync(ptap[layer+1]+(size_t)b*CH*H, ph0[b], (size_t)n*H*sizeof(float), cudaMemcpyDeviceToDevice, pcs0);
+                }
+                cudaEventRecord(es0[b], pcs0);
+                cudaStreamWaitEvent(pd0, es0[b], 0);
+                cudaMemcpyAsync(phost[b], ph0[b], (size_t)n*H*sizeof(float), cudaMemcpyDeviceToHost, pd0);
+                cudaEventRecord(ed0[b], pd0);
+                { std::lock_guard<std::mutex> lk(qmtx); q1.push_back({ci,b}); } qcv.notify_all();
+            }
+            { std::lock_guard<std::mutex> lk(qmtx); prod_done = true; } qcv.notify_all();
+            worker.join(); headth.join();
+            cudaSetDevice(0);
+            if (fflush(fo) != 0) write_err = true;
+            fclose(fo);
+            if (write_err) { unlink(tmp.c_str()); return "{\"error\":\"write failed (pipeline)\"}"; }
+            rename(tmp.c_str(), out_path.c_str());
+            double secs = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
+            printf("[kvgen] %d tok -> %s (%.1fs, %.0f tok/s) [pipeline]\n", L_inj, out_path.c_str(), secs, L_inj / secs);
+            fflush(stdout);
+            char resp[256]; snprintf(resp, sizeof(resp), "{\"l_inj\":%d,\"seconds\":%.2f}", L_inj, secs);
+            return std::string(resp);
+        }
 
         for (int pos = 0; pos < L_inj; pos += CH) {
             int n = std::min(CH, L_inj - pos);
