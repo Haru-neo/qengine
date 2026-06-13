@@ -4943,6 +4943,12 @@ struct QwenModel {
         //      accumulator stays bounded (see ATTN_NB / acc[16][8]).
         //      `kv` already aliased above for the bulk K/V append.
         int sub_processed = 0;
+        // Sparse K-pool (mean + max-abs signatures) is identical for every
+        // 16-token sub-chunk of this chunk — the chunk's full K is already in
+        // cache before the sub-chunk loop. Build it ONCE per (layer, chunk)
+        // instead of rebuilding per sub-chunk (was O(L^2/16), 73% of kvgen
+        // 100K attention). Reset per forward_attn_chunk call.
+        int sparse_pool_built = 0;
         auto pa_now = [](){ return std::chrono::high_resolution_clock::now(); };
         auto pa_sync_ms = [&](std::chrono::high_resolution_clock::time_point tb) {
             cudaStreamSynchronize(stream);
@@ -5081,6 +5087,12 @@ struct QwenModel {
                          || layer_pattern == SPARSE_BLOCK_MS
                          || layer_pattern == SPARSE_VERTICAL_SLASH);
                     if (layer_sparse_ok) {
+                        // Profile split: g_attn_score_ms = index-builder stages
+                        // (k_pool/k_pool_max/scoring/top-k), g_attn_fused_ms =
+                        // whole sparse section (builders + FA + merge). The
+                        // legacy score/softmax/value counters are unused on the
+                        // fused path, so score is repurposed here.
+                        auto tb0 = pa_now();
                         constexpr int BLOCK_N    = 64;
                         constexpr int BLOCK_THR  = 256;
                         int n_blocks = (sub_seq_total + BLOCK_N - 1) / BLOCK_N;
@@ -5149,35 +5161,56 @@ struct QwenModel {
                                 fflush(stderr);
                             }
                         };
+                        // Pool covers the whole chunk (KV for the full chunk is
+                        // already in cache before the sub-chunk loop), so it is
+                        // built ONCE per (layer, chunk) instead of every 16-token
+                        // sub-chunk — the per-sub-chunk full-K rescan was O(L²/16)
+                        // and 73% of kvgen 100K attention (29.1s of 39.5s).
+                        // Stride/loop bound for everything this chunk is
+                        // n_blocks_pool; scorer causal-masks future blocks, and
+                        // FA masks per-token exactly, so attention math is
+                        // unchanged. The newest <=4 block signatures now include
+                        // future-in-chunk tokens; the self-block force-select in
+                        // the scorer kernels guards the only failure mode that
+                        // could matter (query's own block dropping out of top-k).
+                        int chunk_end_total = start_pos + n_tokens;
+                        int n_blocks_pool = (chunk_end_total + BLOCK_N - 1) / BLOCK_N;
                         if (layer_pattern == SPARSE_BLOCK || layer_pattern == SPARSE_BLOCK_MS) {
-                            // 1. K_pool[num_kv, n_blocks, HD]
-                            dim3 kp_grid(num_kv, n_blocks, (HD + BLOCK_THR - 1) / BLOCK_THR);
-                            build_k_pool_kern<HD, BLOCK_N, BLOCK_THR>
-                                <<<kp_grid, BLOCK_THR, 0, stream>>>(
-                                    k_cache_ptr, ab.sparse_k_pool, num_kv, sub_seq_total);
-                            check_launch("build_k_pool");
-                            // 1b. K_pool_max — only built when this layer asked for
-                            // mBSA. Lazy-alloced on first MS layer encountered. The
-                            // grid layout matches mean-pool, just a different output.
-                            if (layer_pattern == SPARSE_BLOCK_MS) {
-                                if (!ab.sparse_k_pool_max) {
-                                    cudaMalloc(&ab.sparse_k_pool_max,
-                                               (size_t)num_kv * n_blocks_max * HD * sizeof(half));
-                                }
-                                build_k_pool_max_kern<HD, BLOCK_N, BLOCK_THR>
+                            if (!sparse_pool_built) {
+                                // 1. K_pool[num_kv, n_blocks_pool, HD]
+                                dim3 kp_grid(num_kv, n_blocks_pool, (HD + BLOCK_THR - 1) / BLOCK_THR);
+                                build_k_pool_kern<HD, BLOCK_N, BLOCK_THR>
                                     <<<kp_grid, BLOCK_THR, 0, stream>>>(
-                                        k_cache_ptr, ab.sparse_k_pool_max, num_kv, sub_seq_total);
-                                check_launch("build_k_pool_max");
+                                        k_cache_ptr, ab.sparse_k_pool, num_kv, chunk_end_total);
+                                check_launch("build_k_pool");
+                                // 1b. K_pool_max — only built when this layer asked for
+                                // mBSA. Lazy-alloced on first MS layer encountered. The
+                                // grid layout matches mean-pool, just a different output.
+                                if (layer_pattern == SPARSE_BLOCK_MS) {
+                                    if (!ab.sparse_k_pool_max) {
+                                        cudaMalloc(&ab.sparse_k_pool_max,
+                                                   (size_t)num_kv * n_blocks_max * HD * sizeof(half));
+                                    }
+                                    build_k_pool_max_kern<HD, BLOCK_N, BLOCK_THR>
+                                        <<<kp_grid, BLOCK_THR, 0, stream>>>(
+                                            k_cache_ptr, ab.sparse_k_pool_max, num_kv, chunk_end_total);
+                                    check_launch("build_k_pool_max");
+                                }
+                                sparse_pool_built = 1;
                             }
                             // 2. block_index[num_kv, sub_n_max, top_k]
                             dim3 bi_grid(num_kv, sub_n);
-                            size_t bi_smem = HD * sizeof(half) + (size_t)n_blocks * sizeof(float);
+                            size_t bi_smem = HD * sizeof(half) + (size_t)n_blocks_pool * sizeof(float);
                             // β default 0.5: max-sig contributes at half the weight
                             // of mean-sig. Tunable via MINF_MS_BETA env if needed.
                             static const float ms_beta = []{
                                 const char* e = getenv("MINF_MS_BETA");
                                 return e ? atof(e) : 0.5f;
                             }();
+                            // Scorers scan/stride over the whole-chunk pool
+                            // (n_blocks_pool); future blocks are causal-masked
+                            // inside the kernel, top_k stays the per-sub-chunk
+                            // budget so only causally-valid blocks are selected.
                             if (layer_pattern == SPARSE_BLOCK_MS) {
                                 if (num_q == 24) {
                                     build_block_index_ms_kern<HD, 6, BLOCK_THR>
@@ -5185,14 +5218,14 @@ struct QwenModel {
                                             q_post_sub, ab.sparse_k_pool, ab.sparse_k_pool_max,
                                             ab.sparse_block_index,
                                             num_q, num_kv, sub_n, ATTN_NB, sub_start_pos,
-                                            top_k, BLOCK_N, n_blocks, n_blocks, ms_beta);
+                                            top_k, BLOCK_N, n_blocks_pool, n_blocks_pool, ms_beta);
                                 } else {
                                     build_block_index_ms_kern<HD, 4, BLOCK_THR>
                                         <<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
                                             q_post_sub, ab.sparse_k_pool, ab.sparse_k_pool_max,
                                             ab.sparse_block_index,
                                             num_q, num_kv, sub_n, ATTN_NB, sub_start_pos,
-                                            top_k, BLOCK_N, n_blocks, n_blocks, ms_beta);
+                                            top_k, BLOCK_N, n_blocks_pool, n_blocks_pool, ms_beta);
                                 }
                                 check_launch("build_block_index_ms");
                             } else if (num_q == 24) {
@@ -5200,14 +5233,14 @@ struct QwenModel {
                                     <<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
                                         q_post_sub, ab.sparse_k_pool, ab.sparse_block_index,
                                         num_q, num_kv, sub_n, ATTN_NB, sub_start_pos,
-                                        top_k, BLOCK_N, n_blocks);
+                                        top_k, BLOCK_N, n_blocks_pool);
                                 check_launch("build_block_index<6>");
                             } else {
                                 build_block_index_kern<HD, 4, BLOCK_THR>
                                     <<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
                                         q_post_sub, ab.sparse_k_pool, ab.sparse_block_index,
                                         num_q, num_kv, sub_n, ATTN_NB, sub_start_pos,
-                                        top_k, BLOCK_N, n_blocks);
+                                        top_k, BLOCK_N, n_blocks_pool);
                                 check_launch("build_block_index<4>");
                             }
                         } else if (layer_pattern == SPARSE_VERTICAL_SLASH) {
@@ -5289,6 +5322,7 @@ struct QwenModel {
                                 BLOCK_N, sink_blocks, window_blocks);
                             check_launch("build_a_shape_index");
                         }
+                        if (g_profile_attn) g_attn_score_ms += pa_sync_ms(tb0);
                         auto launch_sp = [&](auto gqa_const, auto k_const) {
                             constexpr int GQA = decltype(gqa_const)::value;
                             constexpr int K   = decltype(k_const)::value;

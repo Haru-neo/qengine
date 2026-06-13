@@ -6189,6 +6189,10 @@ static bool load_kvgen_heads(const char* path, KVGenHeads& H) {
 }
 
 int serve_kvgen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
+    // 0.8B has num_kv=2 so the split-FA grid is (2, 16, K): K=4 fills only
+    // 128 blocks on 80 SMs. K=8 measured -7% on 100K attention (42.5->39.5s).
+    // Env still wins if the caller sets it explicitly.
+    setenv("FA_SK", "8", 0);
     QwenModel model;
     model.gpu = &gpu_model;
     model.init_config(gguf);
@@ -6229,14 +6233,34 @@ int serve_kvgen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
         if (!lvl[v]) cudaMalloc(&lvl[v], (size_t)CH * H * sizeof(float));
     }
     float* hbuf;       cudaMalloc(&hbuf, (size_t)CH * H * sizeof(float));
-    half*  emb_h;      cudaMalloc(&emb_h, H * sizeof(half));
     half*  norm_h;     cudaMalloc(&norm_h, (size_t)CH * H * sizeof(half));
     half*  Xbuf;       cudaMalloc(&Xbuf, (size_t)CH * HD.in_dim * sizeof(half));
     half*  OUTb;       cudaMalloc(&OUTb, (size_t)CH * HD.out_dim * sizeof(half));
-    int8_t* dq;        cudaMalloc(&dq, (size_t)CH * KVD);
-    half*  dsc;        cudaMalloc(&dsc, (size_t)CH * NG * sizeof(half));
-    int8_t* hq;        cudaMallocHost(&hq, (size_t)CH * KVD);
-    half*  hsc;        cudaMallocHost(&hsc, (size_t)CH * NG * sizeof(half));
+    int*   ids_dev;    cudaMalloc(&ids_dev, (size_t)CH * sizeof(int));
+    // Double-buffered staging for the int8 planes: the 32 (head, K/V-pass)
+    // outputs of a chunk land in per-slot regions of one device buffer, go
+    // host-side with a single batch of async copies, and the pinned half is
+    // drained (fwrite) one chunk later — D2H rides under the next chunk's
+    // compute instead of 32 sync round-trips per chunk (was 18% of 100K).
+    constexpr int NSLOT = 32;  // = 16 heads x 2 passes (K cols / V cols)
+    int8_t* dq_all[2];  half* dsc_all[2];
+    int8_t* hq_all[2];  half* hsc_all[2];
+    cudaEvent_t ev_d2h[2], ev_ready[2];
+    // Copies ride a dedicated stream so the copy engine overlaps stream-0
+    // compute — in-stream cudaMemcpyAsync just serializes after the kernels
+    // (measured: the 13s PCIe-x1 transfer reappeared under the next chunk's
+    // first sync). Same-GPU event ordering, so cudaStreamWaitEvent suffices
+    // (the cross-device host-fence rule doesn't apply here).
+    cudaStream_t xfs;
+    cudaStreamCreateWithFlags(&xfs, cudaStreamNonBlocking);
+    for (int b = 0; b < 2; b++) {
+        cudaMalloc(&dq_all[b],  (size_t)NSLOT * CH * KVD);
+        cudaMalloc(&dsc_all[b], (size_t)NSLOT * CH * NG * sizeof(half));
+        cudaMallocHost(&hq_all[b],  (size_t)NSLOT * CH * KVD);
+        cudaMallocHost(&hsc_all[b], (size_t)NSLOT * CH * NG * sizeof(half));
+        cudaEventCreateWithFlags(&ev_d2h[b],   cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&ev_ready[b], cudaEventDisableTiming);
+    }
     QuantInput kvq;
 
     std::mutex mu;
@@ -6278,29 +6302,91 @@ int serve_kvgen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
         FILE* fo = fopen(tmp.c_str(), "wb");
         if (!fo) return "{\"error\":\"cannot open out\"}";
         int32_t hdr[4] = {0x44464B32, L_inj, HD.n, KVD};
-        fwrite(hdr, 4, 4, fo);
+        // Write-failure tracking: ftruncate sparse-allocates the full file, so
+        // a later fwrite that hits ENOSPC (e.g. /dev/shm full) returns short
+        // WITHOUT extending — silently leaving a zero region. Unchecked, the
+        // engine reported success and the 27B injected an all-zero KV plane
+        // (garbage output, undetected). Track every fwrite/fseek and refuse to
+        // promote a partial file.
+        bool write_err = false;
+        if (fwrite(hdr, 4, 4, fo) != 4) write_err = true;
         if (ftruncate(fileno(fo), 16 + 2 * (long long)HD.n * plane) != 0) {
-            fclose(fo); return "{\"error\":\"ftruncate failed\"}";
+            fclose(fo); unlink(tmp.c_str()); return "{\"error\":\"ftruncate failed\"}";
         }
+
+        // KVGEN_PROFILE=1: per-phase sync+timer (adds sync overhead — for
+        // bottleneck hunting only, keep off in production).
+        static const bool kvg_prof = []{
+            const char* e = getenv("KVGEN_PROFILE");
+            return e && e[0] == '1';
+        }();
+        g_profile_attn = kvg_prof;  // attn sub-split: builder vs FA
+        g_attn_score_ms = g_attn_fused_ms = 0.0;
+        double p_embed = 0, p_attn = 0, p_gdn = 0, p_mlp = 0,
+               p_cap = 0, p_heads = 0, p_d2h = 0, p_write = 0;
+        auto pnow = [](){ return std::chrono::high_resolution_clock::now(); };
+        auto psync = [&](std::chrono::high_resolution_clock::time_point tb) {
+            cudaDeviceSynchronize();
+            return std::chrono::duration<double>(pnow() - tb).count();
+        };
+
+        // pending[b]: chunk whose D2H into pinned half b is in flight; its
+        // fwrite happens right before half b is reused (or at final flush).
+        struct PendingChunk { int pos = -1, n = 0; } pending[2];
+        int bcur = 0;
+        auto drain_half = [&](int b) {
+            if (pending[b].pos < 0) return;
+            auto tw = pnow();
+            cudaEventSynchronize(ev_d2h[b]);
+            int dpos = pending[b].pos, dn = pending[b].n;
+            for (int li = 0; li < HD.n; li++) {
+                for (int pass = 0; pass < 2; pass++) {
+                    int slot = li * 2 + pass;
+                    size_t pi = (size_t)(pass * HD.n + li);
+                    if (fseek(fo, 16 + pi * plane + (size_t)dpos * KVD, SEEK_SET) != 0) write_err = true;
+                    if (fwrite(hq_all[b] + (size_t)slot * CH * KVD, 1, (size_t)dn * KVD, fo) != (size_t)dn * KVD) write_err = true;
+                    if (fseek(fo, 16 + pi * plane + s_off + (size_t)dpos * NG * 2, SEEK_SET) != 0) write_err = true;
+                    if (fwrite(hsc_all[b] + (size_t)slot * CH * NG, 2, (size_t)dn * NG, fo) != (size_t)dn * NG) write_err = true;
+                }
+            }
+            pending[b].pos = -1;
+            if (kvg_prof) p_write += std::chrono::duration<double>(pnow() - tw).count();
+        };
 
         for (int pos = 0; pos < L_inj; pos += CH) {
             int n = std::min(CH, L_inj - pos);
-            for (int t = 0; t < n; t++) {
-                dequant_embd_q8_0_row<<<(H + 255) / 256, 256>>>(
-                    embd_t->data, emb_h, ids[pos + t], H);
-                half_to_float_kernel<<<(H + 255) / 256, 256>>>(
-                    emb_h, hbuf + (size_t)t * H, H);
+            // Device-side guard: this chunk's quant kernels rewrite
+            // dq_all[bcur]; the xfer stream may still be reading it for the
+            // chunk launched two iterations ago. No-op if never recorded.
+            cudaStreamWaitEvent(0, ev_d2h[bcur], 0);
+            auto tp = pnow();
+            cudaMemcpyAsync(ids_dev, ids.data() + pos, (size_t)n * sizeof(int),
+                            cudaMemcpyHostToDevice, 0);
+            {
+                dim3 eg((H + 255) / 256, n);
+                dequant_embd_q8_0_rows<<<eg, 256>>>(embd_t->data, norm_h, ids_dev, H);
+                half_to_float_kernel<<<(((size_t)n * H) + 255) / 256, 256>>>(
+                    norm_h, hbuf, (int)((size_t)n * H));
             }
+            if (kvg_prof) { p_embed += psync(tp); }
             for (int layer = 0; layer < n_layers; layer++) {
-                if (model.is_attn_layer(layer))
+                if (kvg_prof) tp = pnow();
+                if (model.is_attn_layer(layer)) {
                     model.forward_attn_chunk(layer, hbuf, pos, n, 0);
-                else
+                    if (kvg_prof) p_attn += psync(tp);
+                } else {
                     model.forward_gdn_chunk(layer, hbuf, n, 0, 0, pos);
+                    if (kvg_prof) p_gdn += psync(tp);
+                }
+                if (kvg_prof) tp = pnow();
                 model.forward_mlp_chunk(layer, hbuf, n, 0);
+                if (kvg_prof) p_mlp += psync(tp);
+                if (kvg_prof) tp = pnow();
                 if (lvl[layer + 1] && layer + 1 < n_layers)
                     cudaMemcpyAsync(lvl[layer + 1], hbuf,
                                     (size_t)n * H * sizeof(float),
                                     cudaMemcpyDeviceToDevice, 0);
+                if (kvg_prof) p_cap += psync(tp);
             }
             // level n_layers = final RMSNorm output (hs[24] in HF indexing)
             if (lvl[n_layers]) {
@@ -6314,6 +6400,7 @@ int serve_kvgen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
                     norm_h, lvl[n_layers], n * H);
             }
             for (int li = 0; li < HD.n; li++) {
+                auto th = pnow();
                 const float* t0p = lvl[HD.taps[li * 3 + 0]];
                 const float* t1p = lvl[HD.taps[li * 3 + 1]];
                 const float* t2p = lvl[HD.taps[li * 3 + 2]];
@@ -6324,21 +6411,53 @@ int serve_kvgen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
                                  OUTb, HD.in_dim, HD.out_dim, n, 0);
                 kvgen_bias_add<<<((size_t)n * HD.out_dim + 255) / 256, 256>>>(
                     OUTb, HD.bias[li], n, HD.out_dim);
+                if (kvg_prof) { p_heads += psync(th); }
                 for (int pass = 0; pass < 2; pass++) {  // 0=K cols, 1=V cols
+                    int slot = li * 2 + pass;
                     dim3 grid(n, NG);
-                    kvgen_quant_group<<<grid, 128>>>(OUTb, HD.out_dim,
-                                                     pass * KVD, dq, dsc, n);
-                    cudaMemcpy(hq, dq, (size_t)n * KVD, cudaMemcpyDeviceToHost);
-                    cudaMemcpy(hsc, dsc, (size_t)n * NG * 2, cudaMemcpyDeviceToHost);
-                    size_t pi = (size_t)(pass * HD.n + li);
-                    fseek(fo, 16 + pi * plane + (size_t)pos * KVD, SEEK_SET);
-                    fwrite(hq, 1, (size_t)n * KVD, fo);
-                    fseek(fo, 16 + pi * plane + s_off + (size_t)pos * NG * 2, SEEK_SET);
-                    fwrite(hsc, 1, (size_t)n * NG * 2, fo);
+                    kvgen_quant_group<<<grid, 128>>>(
+                        OUTb, HD.out_dim, pass * KVD,
+                        dq_all[bcur]  + (size_t)slot * CH * KVD,
+                        dsc_all[bcur] + (size_t)slot * CH * NG, n);
                 }
             }
+            // Drain the pinned half we are about to overwrite (chunk N-2),
+            // then enqueue this chunk's D2H. Stream order guarantees the
+            // quant kernels above complete before the copies read dq_all;
+            // the event only guards host-side reuse of the pinned buffers.
+            auto td = pnow();
+            drain_half(bcur);
+            cudaEventRecord(ev_ready[bcur], 0);
+            cudaStreamWaitEvent(xfs, ev_ready[bcur], 0);
+            cudaMemcpyAsync(hq_all[bcur], dq_all[bcur],
+                            (size_t)NSLOT * CH * KVD,
+                            cudaMemcpyDeviceToHost, xfs);
+            cudaMemcpyAsync(hsc_all[bcur], dsc_all[bcur],
+                            (size_t)NSLOT * CH * NG * sizeof(half),
+                            cudaMemcpyDeviceToHost, xfs);
+            cudaEventRecord(ev_d2h[bcur], xfs);
+            pending[bcur] = {pos, n};
+            bcur ^= 1;
+            if (kvg_prof) p_d2h += std::chrono::duration<double>(pnow() - td).count();
         }
+        drain_half(0);
+        drain_half(1);
+        if (kvg_prof)
+            printf("[kvgen-prof] embed %.1f attn %.1f gdn %.1f mlp %.1f cap %.1f "
+                   "heads %.1f d2h %.1f write %.1f (s) | attn-sparse: builder %.1f "
+                   "fa+merge %.1f (s)\n",
+                   p_embed, p_attn, p_gdn, p_mlp, p_cap, p_heads, p_d2h, p_write,
+                   g_attn_score_ms / 1000.0,
+                   (g_attn_fused_ms - g_attn_score_ms) / 1000.0);
+        if (fflush(fo) != 0) write_err = true;   // surface buffered ENOSPC
         fclose(fo);
+        if (write_err) {
+            unlink(tmp.c_str());   // never promote a partial/zero file
+            fprintf(stderr, "[kvgen] WRITE FAILED (disk full?) for %s — refusing "
+                            "to emit partial KV\n", out_path.c_str());
+            fflush(stderr);
+            return "{\"error\":\"write failed (disk full?) — partial KV discarded\"}";
+        }
         rename(tmp.c_str(), out_path.c_str());
         double secs = std::chrono::duration<double>(
             std::chrono::high_resolution_clock::now() - t0).count();
