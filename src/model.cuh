@@ -5095,8 +5095,17 @@ struct QwenModel {
                         auto tb0 = pa_now();
                         constexpr int BLOCK_N    = 64;
                         constexpr int BLOCK_THR  = 256;
-                        int n_blocks = (sub_seq_total + BLOCK_N - 1) / BLOCK_N;
-                        int top_k = max(1, (int)(n_blocks * sparse_rt.flops_budget));
+                        // Whole-chunk block count + chunk-max top_k. The sparse
+                        // index is now built ONCE per chunk for all n_tokens
+                        // queries (hoisted out of the 16-token sub-chunk loop:
+                        // 16x fewer launches + 512-block grid fills SMs + K_pool
+                        // read once). Early queries get the chunk-max budget but
+                        // are causal-masked to their own extent (rest -1 padded),
+                        // so each query attends >= its per-sub-chunk block set.
+                        int chunk_end_total = start_pos + n_tokens;
+                        int n_blocks_pool = (chunk_end_total + BLOCK_N - 1) / BLOCK_N;
+                        int n_blocks = n_blocks_pool;
+                        int top_k = max(1, (int)(n_blocks_pool * sparse_rt.flops_budget));
                         // Research knob: lift the top-k block cap (default 64).
                         // At long ctx the needle block must rank in the top-k of
                         // many distractors; more room helps recall. Buffer below
@@ -5115,8 +5124,11 @@ struct QwenModel {
                                        (size_t)num_kv * n_blocks_max * HD * sizeof(half));
                         }
                         if (!ab.sparse_block_index) {
+                            // CHUNK_SIZE rows (was ATTN_NB): the hoisted builder
+                            // writes all n_tokens query rows once per chunk. Also
+                            // >= any decode batch that shares this buffer.
                             cudaMalloc(&ab.sparse_block_index,
-                                       (size_t)num_kv * ATTN_NB * topk_cap * sizeof(int));
+                                       (size_t)num_kv * CHUNK_SIZE * topk_cap * sizeof(int));
                         }
                         // Launch-error tripwire. After every sparse kernel we
                         // peek at the last error so a fault that surfaces on
@@ -5173,75 +5185,57 @@ struct QwenModel {
                         // future-in-chunk tokens; the self-block force-select in
                         // the scorer kernels guards the only failure mode that
                         // could matter (query's own block dropping out of top-k).
-                        int chunk_end_total = start_pos + n_tokens;
-                        int n_blocks_pool = (chunk_end_total + BLOCK_N - 1) / BLOCK_N;
                         if (layer_pattern == SPARSE_BLOCK || layer_pattern == SPARSE_BLOCK_MS) {
+                            // HOISTED: build K_pool (+max) AND the whole-chunk
+                            // block_index ONCE per (layer, chunk), for all
+                            // n_tokens queries — not per 16-token sub-chunk.
+                            static const float ms_beta = []{
+                                const char* e = getenv("MINF_MS_BETA");
+                                return e ? atof(e) : 0.5f;
+                            }();
                             if (!sparse_pool_built) {
-                                // 1. K_pool[num_kv, n_blocks_pool, HD]
                                 dim3 kp_grid(num_kv, n_blocks_pool, (HD + BLOCK_THR - 1) / BLOCK_THR);
                                 build_k_pool_kern<HD, BLOCK_N, BLOCK_THR>
                                     <<<kp_grid, BLOCK_THR, 0, stream>>>(
                                         k_cache_ptr, ab.sparse_k_pool, num_kv, chunk_end_total);
                                 check_launch("build_k_pool");
-                                // 1b. K_pool_max — only built when this layer asked for
-                                // mBSA. Lazy-alloced on first MS layer encountered. The
-                                // grid layout matches mean-pool, just a different output.
                                 if (layer_pattern == SPARSE_BLOCK_MS) {
-                                    if (!ab.sparse_k_pool_max) {
+                                    if (!ab.sparse_k_pool_max)
                                         cudaMalloc(&ab.sparse_k_pool_max,
                                                    (size_t)num_kv * n_blocks_max * HD * sizeof(half));
-                                    }
                                     build_k_pool_max_kern<HD, BLOCK_N, BLOCK_THR>
                                         <<<kp_grid, BLOCK_THR, 0, stream>>>(
                                             k_cache_ptr, ab.sparse_k_pool_max, num_kv, chunk_end_total);
                                     check_launch("build_k_pool_max");
                                 }
-                                sparse_pool_built = 1;
-                            }
-                            // 2. block_index[num_kv, sub_n_max, top_k]
-                            dim3 bi_grid(num_kv, sub_n);
-                            size_t bi_smem = HD * sizeof(half) + (size_t)n_blocks_pool * sizeof(float);
-                            // β default 0.5: max-sig contributes at half the weight
-                            // of mean-sig. Tunable via MINF_MS_BETA env if needed.
-                            static const float ms_beta = []{
-                                const char* e = getenv("MINF_MS_BETA");
-                                return e ? atof(e) : 0.5f;
-                            }();
-                            // Scorers scan/stride over the whole-chunk pool
-                            // (n_blocks_pool); future blocks are causal-masked
-                            // inside the kernel, top_k stays the per-sub-chunk
-                            // budget so only causally-valid blocks are selected.
-                            if (layer_pattern == SPARSE_BLOCK_MS) {
-                                if (num_q == 24) {
-                                    build_block_index_ms_kern<HD, 6, BLOCK_THR>
-                                        <<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
-                                            q_post_sub, ab.sparse_k_pool, ab.sparse_k_pool_max,
-                                            ab.sparse_block_index,
-                                            num_q, num_kv, sub_n, ATTN_NB, sub_start_pos,
-                                            top_k, BLOCK_N, n_blocks_pool, n_blocks_pool, ms_beta);
+                                // block_index for ALL n_tokens queries; grid
+                                // (num_kv, n_tokens), row stride = CHUNK_SIZE,
+                                // start_pos = chunk start. ab.attn_chunk_q_post
+                                // holds the whole chunk's post-RoPE queries.
+                                dim3 bi_grid(num_kv, n_tokens);
+                                size_t bi_smem = HD * sizeof(half) + (size_t)n_blocks_pool * sizeof(float);
+                                if (layer_pattern == SPARSE_BLOCK_MS) {
+                                    if (num_q == 24)
+                                        build_block_index_ms_kern<HD, 6, BLOCK_THR><<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
+                                            ab.attn_chunk_q_post, ab.sparse_k_pool, ab.sparse_k_pool_max, ab.sparse_block_index,
+                                            num_q, num_kv, n_tokens, CHUNK_SIZE, start_pos, top_k, BLOCK_N, n_blocks_pool, n_blocks_pool, ms_beta);
+                                    else
+                                        build_block_index_ms_kern<HD, 4, BLOCK_THR><<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
+                                            ab.attn_chunk_q_post, ab.sparse_k_pool, ab.sparse_k_pool_max, ab.sparse_block_index,
+                                            num_q, num_kv, n_tokens, CHUNK_SIZE, start_pos, top_k, BLOCK_N, n_blocks_pool, n_blocks_pool, ms_beta);
+                                    check_launch("build_block_index_ms[hoist]");
+                                } else if (num_q == 24) {
+                                    build_block_index_kern<HD, 6, BLOCK_THR><<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
+                                        ab.attn_chunk_q_post, ab.sparse_k_pool, ab.sparse_block_index,
+                                        num_q, num_kv, n_tokens, CHUNK_SIZE, start_pos, top_k, BLOCK_N, n_blocks_pool);
+                                    check_launch("build_block_index<6>[hoist]");
                                 } else {
-                                    build_block_index_ms_kern<HD, 4, BLOCK_THR>
-                                        <<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
-                                            q_post_sub, ab.sparse_k_pool, ab.sparse_k_pool_max,
-                                            ab.sparse_block_index,
-                                            num_q, num_kv, sub_n, ATTN_NB, sub_start_pos,
-                                            top_k, BLOCK_N, n_blocks_pool, n_blocks_pool, ms_beta);
+                                    build_block_index_kern<HD, 4, BLOCK_THR><<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
+                                        ab.attn_chunk_q_post, ab.sparse_k_pool, ab.sparse_block_index,
+                                        num_q, num_kv, n_tokens, CHUNK_SIZE, start_pos, top_k, BLOCK_N, n_blocks_pool);
+                                    check_launch("build_block_index<4>[hoist]");
                                 }
-                                check_launch("build_block_index_ms");
-                            } else if (num_q == 24) {
-                                build_block_index_kern<HD, 6, BLOCK_THR>
-                                    <<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
-                                        q_post_sub, ab.sparse_k_pool, ab.sparse_block_index,
-                                        num_q, num_kv, sub_n, ATTN_NB, sub_start_pos,
-                                        top_k, BLOCK_N, n_blocks_pool);
-                                check_launch("build_block_index<6>");
-                            } else {
-                                build_block_index_kern<HD, 4, BLOCK_THR>
-                                    <<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
-                                        q_post_sub, ab.sparse_k_pool, ab.sparse_block_index,
-                                        num_q, num_kv, sub_n, ATTN_NB, sub_start_pos,
-                                        top_k, BLOCK_N, n_blocks_pool);
-                                check_launch("build_block_index<4>");
+                                sparse_pool_built = 1;
                             }
                         } else if (layer_pattern == SPARSE_VERTICAL_SLASH) {
                             // SPARSE_VERTICAL_SLASH: build K_pool, then aggregate
@@ -5323,6 +5317,11 @@ struct QwenModel {
                             check_launch("build_a_shape_index");
                         }
                         if (g_profile_attn) g_attn_score_ms += pa_sync_ms(tb0);
+                        // block_index layout: BLOCK/BLOCK_MS build it whole-chunk
+                        // (stride CHUNK_SIZE, this sub-chunk's rows at sub_processed);
+                        // VS/A_SHAPE still build per-sub-chunk (stride ATTN_NB, rows 0..).
+                        int fa_bi_base   = (layer_pattern == SPARSE_BLOCK || layer_pattern == SPARSE_BLOCK_MS) ? sub_processed : 0;
+                        int fa_bi_stride = (layer_pattern == SPARSE_BLOCK || layer_pattern == SPARSE_BLOCK_MS) ? CHUNK_SIZE : ATTN_NB;
                         auto launch_sp = [&](auto gqa_const, auto k_const) {
                             constexpr int GQA = decltype(gqa_const)::value;
                             constexpr int K   = decltype(k_const)::value;
@@ -5332,7 +5331,8 @@ struct QwenModel {
                                     ab.sparse_block_index,
                                     ab.attn_split_m, ab.attn_split_l, ab.attn_split_o,
                                     num_q, num_kv, sub_start_pos, sub_n, ATTN_NB,
-                                    active_end_max, scale, top_k, BLOCK_N);
+                                    active_end_max, scale, top_k, BLOCK_N,
+                                    fa_bi_base, fa_bi_stride);
                             check_launch("flash_attn_block_sparse_split");
                             dim3 mg(num_kv, sub_n);
                             flash_attn_split_merge<HD, GQA, BLOCK, K>

@@ -65,7 +65,11 @@ __global__ void __launch_bounds__(BLOCK, 4) flash_attn_chunk_block_sparse_split(
     int  num_q, int num_kv,
     int  start_pos, int sub_n, int sub_n_max,
     int  /*active_end_max*/, float scale,
-    int  top_k, int block_size_n)
+    int  top_k, int block_size_n,
+    int  bi_base, int bi_stride)   // block_index row = (kv_head*bi_stride + bi_base + t_idx);
+                                   // lets the FA read a whole-chunk index built once
+                                   // (bi_stride=CHUNK_SIZE, bi_base=sub_processed) while
+                                   // part_* keep their sub_n_max stride.
 {
     constexpr int N_WARPS = BLOCK / 32;
     constexpr int LANE_D  = HD / 32;
@@ -112,7 +116,7 @@ __global__ void __launch_bounds__(BLOCK, 4) flash_attn_chunk_block_sparse_split(
     // (build_block_index*_kern: (kv_head*sub_n_max + t_idx)*top_k) and the
     // tq3 variant. With sub_n stride, a partial sub-chunk (sub_n < sub_n_max)
     // made kv_head>=1 read rows the builder never wrote this launch.
-    const int* bi_row = block_index + ((size_t)kv_head * sub_n_max + t_idx) * top_k;
+    const int* bi_row = block_index + ((size_t)kv_head * bi_stride + bi_base + t_idx) * top_k;
     int inner_per_block = block_size_n / BM;  // tiles per index entry
 
     for (int tk = tk_lo; tk < tk_hi; tk++) {
