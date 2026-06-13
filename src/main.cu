@@ -6569,7 +6569,15 @@ int serve_kvgen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
         model.reset_slot_states(0);
         size_t plane = (size_t)L_inj * (KVD + NG * 2);   // [q][scales]
         size_t s_off = (size_t)L_inj * KVD;
+        // Free the PREVIOUS output first. At 256K a DFKI2 file is ~8GB and the
+        // .tmp we're about to write is another ~8GB; on a 16GB /dev/shm both at
+        // once is ENOSPC, which made back-to-back 256K requests fail with
+        // "kvgen unavailable" (the engine then fell back to full prefill). The
+        // caller re-reads out_path only after this call returns, so unlinking
+        // the stale copy now is safe.
         std::string tmp = out_path + ".tmp";
+        unlink(out_path.c_str());
+        unlink(tmp.c_str());
         FILE* fo = fopen(tmp.c_str(), "wb");
         if (!fo) return "{\"error\":\"cannot open out\"}";
         int32_t hdr[4] = {0x44464B32, L_inj, HD.n, KVD};

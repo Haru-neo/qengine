@@ -2983,80 +2983,126 @@ struct QwenModel {
         // RoPE/quant kernels chain in-stream after their plane's H2D (single
         // device scratch per GPU is safe — in-stream FIFO orders next H2D
         // after the previous plane's kernels).
+        // CHUNKED staging: scratch is sized for CK tokens, NOT the full L. At
+        // 256K a full-plane fp16 dscratch (~0.5GB) + int8 draw (~0.25GB) per GPU
+        // is too big for the tight 27B GPUs once a prior request retains prefill
+        // scratch (GPU0 dropped 945->449MB after one 256K request) — that left
+        // dscratch=null on the unchecked cudaMalloc and the kernels wrote to
+        // addr 0 = Xid MMU fault that corrupted the whole context (the
+        // back-to-back-256K crash). Per-CK-token chunks keep per-GPU scratch to
+        // tens of MB, fitting any GPU regardless of retained scratch.
+        const int CK = (int)std::min<long long>(L, 16384);
+        const size_t chunk_dscratch_bytes = (size_t)CK * kv_dim * sizeof(half);
+        const size_t chunk_file_bytes = is_int8 ? (size_t)CK * kv_dim + (size_t)CK * ng * 2
+                                                : chunk_dscratch_bytes;
         half* dscratch[8] = {};
         uint8_t* draw[8] = {};   // raw int8+scales staging (DFKI2 only)
-        half* pinbuf[8][2] = {};
+        uint8_t* pinbuf[8][2] = {};
         cudaEvent_t pinev[8][2] = {};
         cudaStream_t istream[8] = {};
         int pin_rr[8] = {};
         bool fail = false;
-        auto ensure_gpu = [&](int g) {
-            if (istream[g]) return;
+        auto ensure_gpu = [&](int g) -> bool {
+            if (istream[g]) return true;
             cudaSetDevice(g);
             cudaStreamCreate(&istream[g]);
-            cudaMalloc(&dscratch[g], plane_bytes);
-            if (is_int8) cudaMalloc(&draw[g], file_plane_bytes);
+            cudaError_t e1 = cudaMalloc(&dscratch[g], chunk_dscratch_bytes);
+            cudaError_t e2 = is_int8 ? cudaMalloc(&draw[g], chunk_file_bytes) : cudaSuccess;
+            if (e1 != cudaSuccess || !dscratch[g] || e2 != cudaSuccess || (is_int8 && !draw[g])) {
+                size_t mfree = 0, mtot = 0; cudaMemGetInfo(&mfree, &mtot);
+                fprintf(stderr, "[kv-inject] GPU%d chunk scratch alloc FAILED (dscratch=%zuMB draw=%zuMB "
+                        "free=%zuMB/%zuMB): %s / %s\n", g, chunk_dscratch_bytes>>20,
+                        chunk_file_bytes>>20, mfree>>20, mtot>>20,
+                        cudaGetErrorString(e1), cudaGetErrorString(e2));
+                cudaGetLastError();  // clear sticky error so fallback prefill is clean
+                return false;
+            }
             for (int b = 0; b < 2; b++) {
-                cudaMallocHost(&pinbuf[g][b], file_plane_bytes);
+                if (cudaMallocHost(&pinbuf[g][b], chunk_file_bytes) != cudaSuccess || !pinbuf[g][b]) {
+                    fprintf(stderr, "[kv-inject] GPU%d pinned chunk staging FAILED\n", g);
+                    cudaGetLastError();
+                    return false;
+                }
                 cudaEventCreate(&pinev[g][b]);
                 cudaEventRecord(pinev[g][b], istream[g]);
             }
+            return true;
         };
-        // Pass 1 = K planes (RoPE applied), pass 2 = V planes (raw).
+        // Pass 0 = K planes (RoPE applied), pass 1 = V planes (raw). Each plane
+        // is processed in CK-token chunks; dscratch[g] is reused per chunk and
+        // is safe because all of a chunk's H2D->dequant->RoPE->quantize stay in
+        // istream[g] (in-stream FIFO orders the next chunk's H2D after this
+        // chunk's quantize). pinbuf double-buffers so the next fread overlaps the
+        // current H2D.
         for (int pass = 0; pass < 2 && !fail; pass++) {
             for (int layer = 0; layer < cfg.num_layers && !fail; layer++) {
                 if (!is_attn_layer(layer)) continue;
                 int g = gpu->layer_gpu[layer];
-                ensure_gpu(g);
+                if (!ensure_gpu(g)) { fail = true; break; }
                 cudaSetDevice(g);
-                int b = (pin_rr[g]++) & 1;
-                cudaEventSynchronize(pinev[g][b]);  // staging buffer free again
-                if (fread(pinbuf[g][b], 1, file_plane_bytes, f) != file_plane_bytes) {
-                    fprintf(stderr, "[kv-inject] short read (pass %d layer %d)\n", pass, layer);
-                    fail = true; break;
+                long long plane_base = ftell(f);   // file offset of this plane's start
+                for (int c0 = 0; c0 < L && !fail; c0 += CK) {
+                    int cn = (int)std::min<long long>(CK, (long long)L - c0);
+                    size_t cn_elems = (size_t)cn * kv_dim;
+                    int b = (pin_rr[g]++) & 1;
+                    cudaEventSynchronize(pinev[g][b]);  // staging buffer free again
+                    if (is_int8) {
+                        // file plane = [int8 L*kv_dim][fp16 scales L*ng]; the two
+                        // chunk slices are non-contiguous, so seek to each.
+                        size_t q_bytes = cn_elems;
+                        size_t s_bytes = (size_t)cn * ng * 2;
+                        fseek(f, plane_base + (long long)c0 * kv_dim, SEEK_SET);
+                        bool rok = fread(pinbuf[g][b], 1, q_bytes, f) == q_bytes;
+                        fseek(f, plane_base + (long long)L * kv_dim + (long long)c0 * ng * 2, SEEK_SET);
+                        rok = rok && fread(pinbuf[g][b] + q_bytes, 1, s_bytes, f) == s_bytes;
+                        if (!rok) { fprintf(stderr, "[kv-inject] short read (pass %d layer %d c0 %d)\n", pass, layer, c0); fail = true; break; }
+                        cudaMemcpyAsync(draw[g], pinbuf[g][b], q_bytes + s_bytes,
+                                        cudaMemcpyHostToDevice, istream[g]);
+                        cudaEventRecord(pinev[g][b], istream[g]);
+                        dfki2_dequant_kernel<<<(unsigned)((cn_elems + 255) / 256), 256,
+                                               0, istream[g]>>>(
+                            (const int8_t*)draw[g], (const half*)(draw[g] + q_bytes),
+                            dscratch[g], (long long)cn_elems, kv_dim);
+                    } else {
+                        size_t bytes = cn_elems * sizeof(half);
+                        fseek(f, plane_base + (long long)c0 * kv_dim * (long long)sizeof(half), SEEK_SET);
+                        if (fread(pinbuf[g][b], 1, bytes, f) != bytes) {
+                            fprintf(stderr, "[kv-inject] short read (pass %d layer %d c0 %d)\n", pass, layer, c0); fail = true; break;
+                        }
+                        cudaMemcpyAsync(dscratch[g], pinbuf[g][b], bytes,
+                                        cudaMemcpyHostToDevice, istream[g]);
+                        cudaEventRecord(pinev[g][b], istream[g]);
+                    }
+                    if (pass == 0) {
+                        dim3 rgrid((num_kv * half_rope + 255) / 256, cn);
+                        apply_rope_kernel_chunk<<<rgrid, 256, 0, istream[g]>>>(
+                            dscratch[g], rope.sin_table(g), rope.cos_table(g),
+                            /*start_pos=*/c0, num_kv, hd, rope_dim, cn);
+                    }
+                    if (use_turboquant) {
+                        auto& tq = tq_kv_caches[layer];
+                        int bpt = tq.blocks_per_token;
+                        size_t blk_off = (kv_slot_offset(slot) + (size_t)c0) * bpt;
+                        block_tq3* dst = (pass == 0 ? tq.k : tq.v) + blk_off;
+                        int blocks = cn * bpt;
+                        tq3_quantize_kernel<<<(blocks + 31) / 32, 32, 0, istream[g]>>>(
+                            dscratch[g], dst, blocks);
+                    } else if (use_q8_kv) {
+                        auto& q8 = q8_kv_caches[layer];
+                        int bpt = q8.blocks_per_token;
+                        size_t blk_off = (kv_slot_offset(slot) + (size_t)c0) * bpt;
+                        block_q8_0_aligned* dst = (pass == 0 ? q8.k : q8.v) + blk_off;
+                        int blocks = cn * bpt;
+                        quantize_kv_q8_0_kern<<<blocks, 32, 0, istream[g]>>>(
+                            dscratch[g], dst, blocks);
+                    } else {
+                        auto& kv = kv_caches[layer];
+                        half* dst = (pass == 0 ? kv.k : kv.v) + slot_kv_elem_off + (size_t)c0 * kv_dim;
+                        cudaMemcpyAsync(dst, dscratch[g], cn_elems * sizeof(half),
+                                        cudaMemcpyDeviceToDevice, istream[g]);
+                    }
                 }
-                if (is_int8) {
-                    cudaMemcpyAsync(draw[g], pinbuf[g][b], file_plane_bytes,
-                                    cudaMemcpyHostToDevice, istream[g]);
-                    cudaEventRecord(pinev[g][b], istream[g]);
-                    dfki2_dequant_kernel<<<(unsigned)((plane_elems + 255) / 256), 256,
-                                           0, istream[g]>>>(
-                        (const int8_t*)draw[g],
-                        (const half*)(draw[g] + plane_elems),
-                        dscratch[g], (long long)plane_elems, kv_dim);
-                } else {
-                    cudaMemcpyAsync(dscratch[g], pinbuf[g][b], plane_bytes,
-                                    cudaMemcpyHostToDevice, istream[g]);
-                    cudaEventRecord(pinev[g][b], istream[g]);
-                }
-                if (pass == 0) {
-                    dim3 rgrid((num_kv * half_rope + 255) / 256, L);
-                    apply_rope_kernel_chunk<<<rgrid, 256, 0, istream[g]>>>(
-                        dscratch[g], rope.sin_table(g), rope.cos_table(g),
-                        /*start_pos=*/0, num_kv, hd, rope_dim, L);
-                }
-                if (use_turboquant) {
-                    auto& tq = tq_kv_caches[layer];
-                    int bpt = tq.blocks_per_token;
-                    size_t slot_blk_off = kv_slot_offset(slot) * bpt;
-                    block_tq3* dst = (pass == 0 ? tq.k : tq.v) + slot_blk_off;
-                    int blocks = L * bpt;
-                    tq3_quantize_kernel<<<(blocks + 31) / 32, 32, 0, istream[g]>>>(
-                        dscratch[g], dst, blocks);
-                } else if (use_q8_kv) {
-                    auto& q8 = q8_kv_caches[layer];
-                    int bpt = q8.blocks_per_token;
-                    size_t slot_blk_off = kv_slot_offset(slot) * bpt;
-                    block_q8_0_aligned* dst = (pass == 0 ? q8.k : q8.v) + slot_blk_off;
-                    int blocks = L * bpt;
-                    quantize_kv_q8_0_kern<<<blocks, 32, 0, istream[g]>>>(
-                        dscratch[g], dst, blocks);
-                } else {
-                    auto& kv = kv_caches[layer];
-                    half* dst = (pass == 0 ? kv.k : kv.v) + slot_kv_elem_off;
-                    cudaMemcpyAsync(dst, dscratch[g], plane_bytes,
-                                    cudaMemcpyDeviceToDevice, istream[g]);
-                }
+                fseek(f, plane_base + (long long)file_plane_bytes, SEEK_SET);  // to next plane
             }
         }
         fclose(f);
