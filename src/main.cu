@@ -6283,10 +6283,10 @@ int serve_kvgen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
     std::vector<float*> ptap(n_layers + 1, nullptr);
     std::vector<int> st1_idx(n_layers + 1, -1);
     int n_st1 = 0;
-    cudaStream_t pcs0=0, pcs1=0, pd0=0;
+    cudaStream_t pcs0=0, pcs1=0, pd0=0, phs=0;
     if (kv_pipe) {
         for (int L : used_lv) if (L > kv_mid) st1_idx[L] = n_st1++;   // stage-1 levels -> packed index
-        cudaSetDevice(0); cudaStreamCreate(&pcs0); cudaStreamCreate(&pd0);
+        cudaSetDevice(0); cudaStreamCreate(&pcs0); cudaStreamCreate(&pd0); cudaStreamCreate(&phs);
         cudaSetDevice(1); cudaStreamCreate(&pcs1);
         for (int b = 0; b < PNB; b++) {
             cudaSetDevice(0); cudaMalloc(&ph0[b], (size_t)CH*H*sizeof(float)); cudaMallocHost(&phost[b], (size_t)CH*H*sizeof(float));
@@ -6450,8 +6450,8 @@ int serve_kvgen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
             std::mutex qmtx; std::condition_variable qcv;
             std::deque<int> freeb; for (int b = 0; b < PNB; b++) freeb.push_back(b);
             struct Item { int ci, b; };
-            std::deque<Item> q1, qh;
-            bool prod_done = false, st1_done = false;
+            std::deque<Item> q1, qx, qh;
+            bool prod_done = false, st1_done = false, xfer_done = false;
             auto cpos = [&](int ci){ return ci * CH; };
             auto cn   = [&](int ci){ return std::min(CH, L_inj - ci * CH); };
 
@@ -6488,23 +6488,35 @@ int serve_kvgen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
                         cudaMemcpyAsync(ppk1[b] + (size_t)st1_idx[n_layers]*CH*H, norm_g[1],
                                         (size_t)n*H*sizeof(half), cudaMemcpyDeviceToDevice, pcs1);
                     }
-                    // ONE batched fp16 cross-GPU transfer, then expand half->fp32
-                    // on GPU0 (CH-strided; the head reads only the first n rows
-                    // per level, so a partial chunk's dead tail is moved/expanded
-                    // but never read).
+                    // Stage-1 + fp16 tap capture done; hand off to the transfer
+                    // thread so the cross-GPU tap copy overlaps the NEXT chunk's
+                    // stage-1 compute (different thread + GPU copy engine).
+                    cudaStreamSynchronize(pcs1);
+                    { std::lock_guard<std::mutex> lk(qmtx); qx.push_back(it); } qcv.notify_all();
+                }
+                { std::lock_guard<std::mutex> lk(qmtx); st1_done = true; } qcv.notify_all();
+            });
+
+            // Transfer thread: batched fp16 D2H+H2D of the stage-1 tap pack, then
+            // expand half->fp32 on GPU0. Overlaps the worker's next-chunk compute.
+            std::thread xferth([&]{
+                for (;;) {
+                    Item it;
+                    { std::unique_lock<std::mutex> lk(qmtx);
+                      qcv.wait(lk, [&]{ return !qx.empty() || st1_done; });
+                      if (qx.empty()) { if (st1_done) break; else continue; }
+                      it = qx.front(); qx.pop_front(); }
+                    int b = it.b, n = cn(it.ci);
                     if (n_st1 > 0) {
-                        cudaStreamSynchronize(pcs1);
                         size_t hbytes = (size_t)n_st1*CH*H*sizeof(half);
-                        cudaMemcpy(ppkh[b], ppk1[b], hbytes, cudaMemcpyDeviceToHost);
-                        cudaSetDevice(0);
-                        cudaMemcpy(ppk0h[b], ppkh[b], hbytes, cudaMemcpyHostToDevice);
+                        cudaSetDevice(1); cudaMemcpy(ppkh[b], ppk1[b], hbytes, cudaMemcpyDeviceToHost);
+                        cudaSetDevice(0); cudaMemcpy(ppk0h[b], ppkh[b], hbytes, cudaMemcpyHostToDevice);
                         half_to_float_kernel<<<((size_t)n_st1*CH*H+255)/256,256>>>(ppk0h[b], ppk0[b], (int)((size_t)n_st1*CH*H));
                         cudaStreamSynchronize(0);
-                        cudaSetDevice(1);
                     }
                     { std::lock_guard<std::mutex> lk(qmtx); qh.push_back(it); } qcv.notify_all();
                 }
-                { std::lock_guard<std::mutex> lk(qmtx); st1_done = true; } qcv.notify_all();
+                { std::lock_guard<std::mutex> lk(qmtx); xfer_done = true; } qcv.notify_all();
             });
 
             std::thread headth([&]{
@@ -6512,8 +6524,8 @@ int serve_kvgen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
                 for (;;) {
                     Item it;
                     { std::unique_lock<std::mutex> lk(qmtx);
-                      qcv.wait(lk, [&]{ return !qh.empty() || st1_done; });
-                      if (qh.empty()) { if (st1_done) break; else continue; }
+                      qcv.wait(lk, [&]{ return !qh.empty() || xfer_done; });
+                      if (qh.empty()) { if (xfer_done) break; else continue; }
                       it = qh.front(); qh.pop_front(); }
                     int ci = it.ci, b = it.b, n = cn(ci), pos = cpos(ci);
                     cudaSetDevice(0);
@@ -6527,19 +6539,19 @@ int serve_kvgen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
                         const float* t0 = tapp(HD.taps[li*3+0]);
                         const float* t1 = tapp(HD.taps[li*3+1]);
                         const float* t2 = tapp(HD.taps[li*3+2]);
-                        kvgen_gather_half<<<((size_t)n*HD.in_dim+255)/256,256,0,pcs0>>>(t0,t1,t2,Xbuf,n,H);
-                        kvq.quantize_chunk(Xbuf, HD.in_dim, n, pcs0);
-                        quant_gemv_chunk(HD.w_q8[li], GGML_TYPE_Q8_0, kvq.q8_buf, OUTb, HD.in_dim, HD.out_dim, n, pcs0);
-                        kvgen_bias_add<<<((size_t)n*HD.out_dim+255)/256,256,0,pcs0>>>(OUTb, HD.bias[li], n, HD.out_dim);
+                        kvgen_gather_half<<<((size_t)n*HD.in_dim+255)/256,256,0,phs>>>(t0,t1,t2,Xbuf,n,H);
+                        kvq.quantize_chunk(Xbuf, HD.in_dim, n, phs);
+                        quant_gemv_chunk(HD.w_q8[li], GGML_TYPE_Q8_0, kvq.q8_buf, OUTb, HD.in_dim, HD.out_dim, n, phs);
+                        kvgen_bias_add<<<((size_t)n*HD.out_dim+255)/256,256,0,phs>>>(OUTb, HD.bias[li], n, HD.out_dim);
                         for (int pass = 0; pass < 2; pass++) {
                             int slot = li*2 + pass; dim3 grid(n, NG);
-                            kvgen_quant_group<<<grid,128,0,pcs0>>>(OUTb, HD.out_dim, pass*KVD,
+                            kvgen_quant_group<<<grid,128,0,phs>>>(OUTb, HD.out_dim, pass*KVD,
                                 dq_all[0]+(size_t)slot*CH*KVD, dsc_all[0]+(size_t)slot*CH*NG, n);
                         }
                     }
-                    cudaMemcpyAsync(hq_all[0], dq_all[0], (size_t)NSLOT*CH*KVD, cudaMemcpyDeviceToHost, pcs0);
-                    cudaMemcpyAsync(hsc_all[0], dsc_all[0], (size_t)NSLOT*CH*NG*sizeof(half), cudaMemcpyDeviceToHost, pcs0);
-                    cudaStreamSynchronize(pcs0);
+                    cudaMemcpyAsync(hq_all[0], dq_all[0], (size_t)NSLOT*CH*KVD, cudaMemcpyDeviceToHost, phs);
+                    cudaMemcpyAsync(hsc_all[0], dsc_all[0], (size_t)NSLOT*CH*NG*sizeof(half), cudaMemcpyDeviceToHost, phs);
+                    cudaStreamSynchronize(phs);
                     for (int li = 0; li < HD.n; li++) for (int pass = 0; pass < 2; pass++) {
                         int slot = li*2 + pass; size_t pi = (size_t)(pass*HD.n + li);
                         if (fseek(fo, 16 + pi*plane + (size_t)pos*KVD, SEEK_SET) != 0) write_err = true;
@@ -6575,7 +6587,7 @@ int serve_kvgen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
                 { std::lock_guard<std::mutex> lk(qmtx); q1.push_back({ci,b}); } qcv.notify_all();
             }
             { std::lock_guard<std::mutex> lk(qmtx); prod_done = true; } qcv.notify_all();
-            worker.join(); headth.join();
+            worker.join(); xferth.join(); headth.join();
             cudaSetDevice(0);
             if (fflush(fo) != 0) write_err = true;
             fclose(fo);
