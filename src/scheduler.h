@@ -194,6 +194,22 @@ public:
         return (int)queue_.size();
     }
 
+    // Speculative-prefill prefetch (P3): return a COPY of the next pending
+    // sequence's prompt_ids IF it is at least `min_len` tokens and not already
+    // cancelled, else empty. Used to kick off the kvgen sidecar for the next
+    // long prompt while the current one decodes. Non-destructive (does not pop)
+    // — the sequence is still run normally; the prefetched KV is matched back by
+    // exact prompt hash, so a peek that never gets used is harmless.
+    std::vector<int> peek_next_prompt(int min_len) {
+        std::lock_guard<std::mutex> lk(queue_mu_);
+        for (const auto& s : queue_) {
+            if (s->cancelled.load(std::memory_order_acquire)) continue;
+            if ((int)s->prompt_ids.size() >= min_len) return s->prompt_ids;
+            return {};  // only consider the head; deeper entries may reorder
+        }
+        return {};
+    }
+
     // Mutex held by run_fn around GPU forward execution. Phase A serializes
     // every forward call; Phase B replaces this with a batched scheduler so
     // forward is naturally batched, not mutex-protected.

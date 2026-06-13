@@ -1284,6 +1284,34 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
     return 0;
 }
 
+// FNV-1a over a token-id vector. Used to bind a prefetched spec-prefill KV
+// file to the exact prompt it was computed for (collision-safe identity guard).
+static uint64_t fnv1a_ids(const std::vector<int>& ids) {
+    uint64_t h = 1469598103934665603ULL;
+    for (int v : ids) {
+        uint32_t u = (uint32_t)v;
+        for (int b = 0; b < 4; ++b) { h ^= (u >> (b*8)) & 0xFF; h *= 1099511628211ULL; }
+    }
+    return h;
+}
+
+// Speculative-prefill prefetch cache (P3, SPEC_PREFILL_PREFETCH=1, default off).
+// Filled by a detached thread that runs the kvgen sidecar for the NEXT queued
+// long prompt while the CURRENT request decodes (kvgen is on GPU3, idle during
+// the 27B's GPU0-2 decode — pure overlap, no GPU race). Consumed at the top of
+// the spec block: if (hash,plen,keep) match the incoming prompt exactly, inject
+// straight from the staged file and skip the inline ~17s kvgen wait. A miss
+// (not ready / mismatch / in-flight) falls back to inline kvgen — no harm.
+struct PrefetchKV {
+    std::mutex mu;
+    std::atomic<bool> ready{false};
+    std::atomic<bool> inflight{false};
+    uint64_t hash = 0;
+    int plen = 0, keep = -1, l_inj = 0;
+    std::string path;
+};
+static PrefetchKV g_prefetch;
+
 // Synchronously ask the kvgen sidecar (--mode kvgen) to predict the attn KV for
 // `prompt_ids` and write a DFKI2 inject file to `out_path`. Returns L_inj (the
 // number of injected tokens, > 0) on success, or -1 on any transport/parse
@@ -2212,6 +2240,12 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     // the per-token loop. The caller picks up where this left off and drives
     // subsequent tokens via the batched gen-step path. *first_tok is the
     // sampled token, *slot_pos is the next position to write (= prompt_len).
+    // P3 prefetch fire hook: set after `sched` exists (it needs to peek the
+    // queue). generate_impl calls it once per request, right after the current
+    // request's own kvgen/inject is resolved, so the kvgen sidecar is free to
+    // start predicting the NEXT queued long prompt during this request's decode.
+    // Captured by reference; stays empty (no-op) unless SPEC_PREFILL_PREFETCH=1.
+    std::function<void()> fire_prefetch_hook;
     auto generate_impl = [&](const std::vector<int>& prompt_ids, int max_tokens,
                              int cached_prompt_tokens,
                              int* out_completion_tokens,
@@ -2298,7 +2332,26 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 std::string ids_p = "/dev/shm/spec_ids_slot" + std::to_string(slot) + ".bin";
                 std::string out_p = "/dev/shm/spec_kv_slot"  + std::to_string(slot) + ".bin";
                 auto ts = std::chrono::high_resolution_clock::now();
-                int L_inj = spec_prefill_request_kvgen(spec_kvep, prompt_ids, spec_keep, ids_p, out_p);
+                // P3: consume a matching prefetched KV (computed during the
+                // previous request's decode) if one is ready. Exact
+                // (hash,plen,keep) guard — never injects KV for a different
+                // prompt. Miss -> fall back to inline kvgen below.
+                bool from_prefetch = false;
+                int L_inj = -1;
+                if (g_prefetch.ready.load(std::memory_order_acquire)) {
+                    uint64_t h = fnv1a_ids(prompt_ids);
+                    std::lock_guard<std::mutex> lk(g_prefetch.mu);
+                    if (g_prefetch.ready.load() && g_prefetch.hash == h
+                        && g_prefetch.plen == (int)prompt_ids.size()
+                        && g_prefetch.keep == spec_keep) {
+                        out_p = g_prefetch.path;
+                        L_inj = g_prefetch.l_inj;
+                        from_prefetch = true;
+                        g_prefetch.ready.store(false, std::memory_order_release);
+                    }
+                }
+                if (L_inj <= 0)
+                    L_inj = spec_prefill_request_kvgen(spec_kvep, prompt_ids, spec_keep, ids_p, out_p);
                 if (L_inj > 0) {
                     int got = model.kv_inject_from_file(out_p.c_str(), slot);
                     if (got > 0 && got < (int)prompt_ids.size() - 1) {
@@ -2307,9 +2360,10 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         model.sparse_rt.enabled = false;   // off for this request
                         double ms = std::chrono::duration<double,std::milli>(
                             std::chrono::high_resolution_clock::now() - ts).count();
-                        printf("[SPEC-PREFILL slot=%d] kvgen injected %d/%d tok in %.0fms; "
+                        printf("[SPEC-PREFILL slot=%d] kvgen injected %d/%d tok in %.0fms (%s); "
                                "real-prefill tail from %d (MINF off)\n",
-                               slot, got, (int)prompt_ids.size(), ms, got);
+                               slot, got, (int)prompt_ids.size(), ms,
+                               from_prefetch ? "prefetched" : "inline", got);
                         fflush(stdout);
                     } else {
                         fprintf(stderr, "[SPEC-PREFILL slot=%d] inject rejected (got=%d) — full prefill\n", slot, got);
@@ -2335,6 +2389,9 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                 }
             }
         }
+        // P3: now that this request's own kvgen is done, kick off prefetch of
+        // the next queued long prompt (runs on GPU3 during this decode).
+        if (fire_prefetch_hook) fire_prefetch_hook();
         // ── Salient-segment recompute list (multi-segment speculative prefill).
         // KV_INJECT_SEGS: text file, one "a b" pair per line — token ranges
         // [a, b) inside the injected prefix whose KV must be RECOMPUTED over
@@ -5249,6 +5306,42 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     if (const char* e = getenv("QWEN_MAX_QUEUE")) max_queue = std::max(0, atoi(e));
     sched.set_max_queue(max_queue);
     printf("[server] queue cap: %d (set QWEN_MAX_QUEUE=0 for unbounded)\n", max_queue);
+
+    // P3: speculative-prefill PREFETCH (SPEC_PREFILL_PREFETCH=1, default off).
+    // While a long-prompt request decodes, predict the NEXT queued long
+    // prompt's KV on the kvgen sidecar (GPU3, idle during the 27B's GPU0-2
+    // decode). generate_impl consumes a (hash,plen,keep)-matching staged file
+    // and skips the inline ~17s kvgen wait. Burst-only (needs a queued long
+    // prompt + enough decode to hide kvgen); isolated requests are unaffected.
+    if (const char* e = getenv("SPEC_PREFILL_PREFETCH"); e && e[0] == '1') {
+        const std::string pf_ep   = getenv("SPEC_PREFILL_KVGEN") ? getenv("SPEC_PREFILL_KVGEN") : "127.0.0.1:8011";
+        const int pf_min  = getenv("SPEC_PREFILL_MIN_LEN") ? atoi(getenv("SPEC_PREFILL_MIN_LEN")) : 32768;
+        const int pf_max  = getenv("SPEC_PREFILL_MAX_LEN") ? atoi(getenv("SPEC_PREFILL_MAX_LEN")) : 65536;
+        const int pf_keep = getenv("SPEC_PREFILL_KEEP")    ? atoi(getenv("SPEC_PREFILL_KEEP"))    : 4096;
+        fire_prefetch_hook = [&sched, pf_ep, pf_min, pf_max, pf_keep]() {
+            if (g_prefetch.inflight.load(std::memory_order_acquire)) return;
+            std::vector<int> next = sched.peek_next_prompt(pf_min);
+            if (next.empty() || (int)next.size() > pf_max) return;
+            if (g_prefetch.inflight.exchange(true)) return;   // someone else won
+            uint64_t h = fnv1a_ids(next);
+            int plen = (int)next.size();
+            std::thread([next = std::move(next), h, plen, pf_ep, pf_keep]() {
+                const std::string ids_p = "/dev/shm/spec_prefetch_ids.bin";
+                const std::string out_p = "/dev/shm/spec_prefetch_kv.bin";
+                int li = spec_prefill_request_kvgen(pf_ep, next, pf_keep, ids_p, out_p);
+                if (li > 0) {
+                    std::lock_guard<std::mutex> lk(g_prefetch.mu);
+                    g_prefetch.hash = h; g_prefetch.plen = plen;
+                    g_prefetch.keep = pf_keep; g_prefetch.l_inj = li; g_prefetch.path = out_p;
+                    g_prefetch.ready.store(true, std::memory_order_release);
+                    printf("[SPEC-PREFETCH] staged %d tok for next prompt (plen=%d)\n", li, plen);
+                    fflush(stdout);
+                }
+                g_prefetch.inflight.store(false, std::memory_order_release);
+            }).detach();
+        };
+        printf("[server] spec-prefill PREFETCH on: next long prompt's KV predicted during current decode\n");
+    }
 
     // Now that `sched` exists, spawn the batched gen-loop thread. It pulls
     // active slots from slot_gen_state and runs forward_step_batched under
