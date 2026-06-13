@@ -25,13 +25,17 @@ EMBED_PORT=${EMBED_PORT:-8001}
 RERANK_PORT=${RERANK_PORT:-8002}
 KVGEN_PORT=${KVGEN_PORT:-8011}
 # kvgen (0.8B speculative-prefill KV generator) shares GPU 3 with embed+rerank.
-# All three CUDA contexts + their KV caches must fit in GPU 3's 16 GB. At
-# KVGEN_MAX_SEQ=65536 kvgen's footprint is ~2.2 GB and GPU 3 holds ~1.7 GB free
-# even during a max-length request (measured 2026-06-13: zero runtime balloon —
-# everything is pre-allocated at init). 131072 fits by linear extrapolation but
-# erodes the margin to ~1 GB, so 65536 is the safe co-resident cap. Raising it
-# risks an OOM that corrupts the embed/rerank contexts on the same GPU.
-KVGEN_MAX_SEQ=${KVGEN_MAX_SEQ:-65536}
+# All three CUDA contexts + their KV caches must fit in GPU 3's 16 GB. The
+# kvgen KV cache is the size driver; with MTP_TQ=1 (3-bit TurboQuant KV, set in
+# the kvgen launch below) the cache is 4.9x smaller, so the FULL 256K context
+# fits alongside embed+rerank: at KVGEN_MAX_SEQ=262144 the kvgen footprint is
+# ~2.6 GB (KV 654 MB) and GPU 3 still holds ~1.4 GB free (measured 2026-06-13).
+# fp16 KV would need 3.2 GB and NOT fit (only ~0.3 GB margin). Everything is
+# pre-allocated at init (zero runtime balloon). SPEC_PREFILL_MAX_LEN tracks this,
+# so 256K prompts get speculative prefill (kvgen ~225s + tail ~56s = ~280s vs a
+# ~730s full prefill). The back-to-back-256K crash was fixed in 5dc13eb (chunked
+# kv-inject scratch + /dev/shm unlink), so consecutive 256K requests are safe.
+KVGEN_MAX_SEQ=${KVGEN_MAX_SEQ:-262144}
 
 # Kill any previous engine binaries. Match the executable path specifically
 # so the pkill doesn't also kill this script (whose own path contains
@@ -87,7 +91,6 @@ MINF_PROFILE_PATH=$ROOT/profiles/27B_block_sparse.bin \
 SPEC_LORA=$SPEC_LORA_FILE \
 SPEC_PREFILL_AUTO=1 SPEC_PREFILL_KVGEN=127.0.0.1:$KVGEN_PORT \
 SPEC_PREFILL_MIN_LEN=32768 SPEC_PREFILL_MAX_LEN=$KVGEN_MAX_SEQ SPEC_PREFILL_KEEP=3072 \
-SPEC_PREFILL_PREFETCH=1 \
 nohup "$BIN" "$CHAT_MODEL" \
   --serve $CHAT_PORT --slots 1 --max-seq 262144 \
   --vision-mmproj "$CHAT_MMPROJ" \
@@ -138,6 +141,7 @@ for _ in $(seq 1 60); do
 done
 CUDA_VISIBLE_DEVICES=3 \
 KVGEN_HEADS="$KVGEN_HEADS_FILE" KVGEN_MAX_SEQ=$KVGEN_MAX_SEQ \
+MTP_TQ=1 \
 MINF_SPARSE_ATTN=1 MINF_BUDGET=0.10 MINF_UNIFORM_MS=1 \
 nohup "$BIN" "$KVGEN_MODEL" \
   --serve $KVGEN_PORT --mode kvgen \
