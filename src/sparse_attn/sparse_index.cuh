@@ -278,24 +278,52 @@ __global__ void build_block_index_ms_kern(
     }
     __syncthreads();
 
-    // 3. Top-k by single-thread argmax (same as the mean-only kernel).
+    // 3. Block-parallel top-k. Each of the top_k picks is a 256-thread argmax
+    //    with lowest-index tie-break, then thread 0 masks the winner — the
+    //    SELECTION is bit-identical to the serial repeated-argmax (lowest block
+    //    index wins equal scores, exactly like the strict `>` ascending scan),
+    //    but the per-pick latency drops from O(n_blocks) to O(n_blocks/BLOCK +
+    //    log BLOCK). The single-thread scan over n_blocks (~1540 at 100K) per
+    //    pick was the dominant builder cost: capping top_k 64->8 moved the
+    //    builder 24.3->8.9s, i.e. the top-k loop is ~17s of it. Reduction
+    //    scratch lives just past scores[n_blocks]; the launch sizes smem for it.
     int* row = block_index + ((size_t)kv_head * sub_n_max + t_idx) * top_k;
-    if (tid == 0) {
-        for (int k = 0; k < top_k; k++) {
-            float best = -INFINITY;
-            int   bidx = -1;
-            for (int n = 0; n < n_blocks; n++) {
-                float v = scores[n];
-                if (v > best) { best = v; bidx = n; }
-            }
-            if (bidx < 0) {
-                for (int kk = k; kk < top_k; kk++) row[kk] = -1;
-                break;
-            }
-            row[k] = bidx;
-            scores[bidx] = -INFINITY;
+    // Reduction scratch in STATIC shared memory (BLOCK is a compile-time
+    // template param) — keeps the dynamic-smem contract unchanged so every
+    // existing launch site (prefill + the 27B block-sparse decode path) works
+    // without touching its bi_smem sizing.
+    __shared__ float rv[BLOCK];        // reduce values
+    __shared__ int   ri[BLOCK];        // reduce indices
+    for (int k = 0; k < top_k; k++) {
+        float lb = -INFINITY; int li = -1;
+        for (int n = tid; n < n_blocks; n += BLOCK) {
+            float v = scores[n];
+            if (v > lb) { lb = v; li = n; }   // strided local argmax, lowest n in subset
         }
-        // Sort ascending for HBM-friendly tile order.
+        rv[tid] = lb; ri[tid] = li;
+        __syncthreads();
+        for (int s = BLOCK >> 1; s > 0; s >>= 1) {
+            if (tid < s) {
+                float ov = rv[tid + s]; int oi = ri[tid + s];
+                float mv = rv[tid];     int mi = ri[tid];
+                // higher score wins; equal score -> lower block index
+                if (oi >= 0 && (ov > mv || (ov == mv && (mi < 0 || oi < mi)))) {
+                    rv[tid] = ov; ri[tid] = oi;
+                }
+            }
+            __syncthreads();
+        }
+        int best = ri[0];
+        if (best < 0) {                 // fewer real blocks than top_k -> pad
+            for (int kk = k + tid; kk < top_k; kk += BLOCK) row[kk] = -1;
+            __syncthreads();
+            break;
+        }
+        if (tid == 0) { row[k] = best; scores[best] = -INFINITY; }
+        __syncthreads();
+    }
+    // Sort ascending (single-thread, top_k<=64) for HBM-friendly tile order.
+    if (tid == 0) {
         for (int i = 1; i < top_k; i++) {
             int x = row[i];
             if (x < 0) break;
