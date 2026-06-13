@@ -1284,6 +1284,74 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
     return 0;
 }
 
+// Synchronously ask the kvgen sidecar (--mode kvgen) to predict the attn KV for
+// `prompt_ids` and write a DFKI2 inject file to `out_path`. Returns L_inj (the
+// number of injected tokens, > 0) on success, or -1 on any transport/parse
+// error so the caller can fall back to full prefill. `keep` = number of TAIL
+// tokens left UNpredicted (real-prefilled by the 27B); kvgen injects the rest.
+// Socket idiom mirrors Server::call_embed_backend (server.h). Single-slot only
+// (the fixed ids/out paths assume one in-flight request — DFlash forces slots=1).
+static int spec_prefill_request_kvgen(const std::string& endpoint,
+                                      const std::vector<int>& prompt_ids,
+                                      int keep,
+                                      const std::string& ids_path,
+                                      const std::string& out_path) {
+    // 1. Write prompt ids as raw int32 for the kvgen server to read.
+    {
+        FILE* f = fopen(ids_path.c_str(), "wb");
+        if (!f) { fprintf(stderr, "[spec-prefill] cannot write ids %s\n", ids_path.c_str()); return -1; }
+        std::vector<int32_t> ids32(prompt_ids.begin(), prompt_ids.end());
+        size_t w = fwrite(ids32.data(), sizeof(int32_t), ids32.size(), f);
+        fclose(f);
+        if (w != ids32.size()) { fprintf(stderr, "[spec-prefill] short ids write\n"); return -1; }
+    }
+    // 2. POST /kvgen {"ids_file","keep","out"} over a blocking TCP connection.
+    size_t colon = endpoint.find(':');
+    std::string host = colon == std::string::npos ? endpoint : endpoint.substr(0, colon);
+    int port = colon == std::string::npos ? 80 : atoi(endpoint.c_str() + colon + 1);
+    int bfd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (bfd < 0) return -1;
+    struct sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (host == "localhost" || host == "127.0.0.1")
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    else
+        inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+    if (::connect(bfd, (sockaddr*)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "[spec-prefill] connect %s failed\n", endpoint.c_str());
+        ::close(bfd); return -1;
+    }
+    std::ostringstream bodys;
+    bodys << "{\"ids_file\":\"" << ids_path << "\",\"keep\":" << keep
+          << ",\"out\":\"" << out_path << "\"}";
+    std::string body = bodys.str();
+    std::ostringstream req;
+    req << "POST /kvgen HTTP/1.1\r\n"
+        << "Host: " << host << "\r\n"
+        << "Content-Type: application/json\r\n"
+        << "Content-Length: " << body.size() << "\r\n"
+        << "Connection: close\r\n\r\n"
+        << body;
+    std::string raw_req = req.str();
+    ::send(bfd, raw_req.data(), raw_req.size(), MSG_NOSIGNAL);
+    std::string resp;
+    char buf[2048];
+    while (true) {
+        ssize_t n = ::recv(bfd, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        resp.append(buf, n);
+    }
+    ::close(bfd);
+    // 3. Parse {"l_inj":N,...} out of the JSON body.
+    size_t bo = resp.find("\r\n\r\n");
+    if (bo == std::string::npos) return -1;
+    std::string json = resp.substr(bo + 4);
+    size_t lp = json.find("\"l_inj\":");
+    if (lp == std::string::npos) return -1;
+    return atoi(json.c_str() + lp + 8);
+}
+
 // ============ Qwen generation loop (original) ============
 
 int run_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, const SamplingParams& sp, const std::vector<int>& prompt_ids_in, const Tokenizer* tok = nullptr) {
@@ -2175,6 +2243,13 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                              std::vector<int>* dyn_yield_gen = nullptr,
                              int* dyn_yield_output_tokens = nullptr,
                              bool* dyn_yield_in_think = nullptr) -> std::string {
+        // Auto spec-prefill force-disables MINF block-sparse for the request
+        // (sparse recompute over a noisy predicted prefix degrades quality —
+        // spec gates ran with MINF off). RAII so any exit path restores it.
+        struct SparseRestore {
+            QwenModel& m; bool saved; bool active = false;
+            ~SparseRestore() { if (active) m.sparse_rt.enabled = saved; }
+        } sparse_restore{model, model.sparse_rt.enabled};
         // Prefix cache: if caller asked for caching AND a snapshot matches
         // the requested prefix, restore state instead of resetting. Otherwise
         // do a normal full reset.
@@ -2204,6 +2279,45 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
             // Reset only this slot's state. For slot 0 with num_slots=1
             // this is equivalent to reset_all_states (the previous default).
             model.reset_slot_states(slot);
+            // ── Automatic speculative prefill via the kvgen sidecar ─────────
+            // SPEC_PREFILL_AUTO=1: for prompts in [MIN_LEN, MAX_LEN], ask the
+            // 0.8B kvgen server to predict the head's attn KV, inject it, and
+            // real-prefill only the recent tail (SPEC_PREFILL_KEEP tokens). The
+            // tail carries the user's actual query/recent turns so it stays
+            // exact; the injected head is approximate (load SPEC_LORA for inject
+            // fidelity). MAX_LEN caps at the sidecar's KVGEN_MAX_SEQ. Skipped
+            // when the manual KV_INJECT_FILE eval path is set.
+            static const bool spec_auto = []{ const char* e=getenv("SPEC_PREFILL_AUTO"); return e && e[0]=='1'; }();
+            static const std::string spec_kvep = []{ const char* e=getenv("SPEC_PREFILL_KVGEN"); return std::string(e?e:"127.0.0.1:8011"); }();
+            static const int spec_min  = []{ const char* e=getenv("SPEC_PREFILL_MIN_LEN"); return e?atoi(e):32768; }();
+            static const int spec_max  = []{ const char* e=getenv("SPEC_PREFILL_MAX_LEN"); return e?atoi(e):65536; }();
+            static const int spec_keep = []{ const char* e=getenv("SPEC_PREFILL_KEEP"); return e?atoi(e):4096; }();
+            if (spec_auto && !getenv("KV_INJECT_FILE")
+                && (int)prompt_ids.size() >= spec_min
+                && (int)prompt_ids.size() <= spec_max) {
+                std::string ids_p = "/dev/shm/spec_ids_slot" + std::to_string(slot) + ".bin";
+                std::string out_p = "/dev/shm/spec_kv_slot"  + std::to_string(slot) + ".bin";
+                auto ts = std::chrono::high_resolution_clock::now();
+                int L_inj = spec_prefill_request_kvgen(spec_kvep, prompt_ids, spec_keep, ids_p, out_p);
+                if (L_inj > 0) {
+                    int got = model.kv_inject_from_file(out_p.c_str(), slot);
+                    if (got > 0 && got < (int)prompt_ids.size() - 1) {
+                        prefix_skip = got;
+                        sparse_restore.active = true;      // restore MINF on exit
+                        model.sparse_rt.enabled = false;   // off for this request
+                        double ms = std::chrono::duration<double,std::milli>(
+                            std::chrono::high_resolution_clock::now() - ts).count();
+                        printf("[SPEC-PREFILL slot=%d] kvgen injected %d/%d tok in %.0fms; "
+                               "real-prefill tail from %d (MINF off)\n",
+                               slot, got, (int)prompt_ids.size(), ms, got);
+                        fflush(stdout);
+                    } else {
+                        fprintf(stderr, "[SPEC-PREFILL slot=%d] inject rejected (got=%d) — full prefill\n", slot, got);
+                    }
+                } else {
+                    fprintf(stderr, "[SPEC-PREFILL slot=%d] kvgen unavailable — full prefill\n", slot);
+                }
+            }
             // ── Speculative-prefill KV injection (research, env-gated) ──────
             // KV_INJECT_FILE: fill attn KV for [0, L_inj) from offline-
             // projected pre-RoPE K/V, leave GDN state zeroed (validated by

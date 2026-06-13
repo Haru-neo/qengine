@@ -18,6 +18,7 @@ EMBED_MODEL=${EMBED_MODEL:-$GGUF_DIR/Qwen3-Embedding-4B-Q8_0.gguf}
 RERANK_MODEL=${RERANK_MODEL:-$GGUF_DIR/Qwen3-Reranker-4B-Q8_0.gguf}
 KVGEN_MODEL=${KVGEN_MODEL:-$GGUF_DIR/Qwen3.5-0.8B-kvgen-Q8_0.gguf}
 KVGEN_HEADS_FILE=${KVGEN_HEADS_FILE:-/home/paru/models/kvgen_heads_v1.bin}
+SPEC_LORA_FILE=${SPEC_LORA_FILE:-/home/paru/models/spec_lora_v2.bin}
 
 CHAT_PORT=${CHAT_PORT:-8000}
 EMBED_PORT=${EMBED_PORT:-8001}
@@ -69,6 +70,13 @@ rm -f "$LOG_DIR/main_27b.log"
 #  becomes an assignment-only statement and NONE of the env reaches the
 #  server. That exact bug shipped the chat onto 4 GPUs / fp16 KV / no DFLASH
 #  on 2026-06-10, twice.)
+# Auto spec-prefill: for prompts in [32768, KVGEN_MAX_SEQ] the chat server calls
+# the kvgen sidecar (:8011) to predict the head's KV, injects it, and real-
+# prefills only the recent tail — big TTFT win on long prompts. SPEC_LORA is
+# merged at load for inject-region fidelity (per-request MINF auto-off inside
+# the engine). Shorter prompts are untouched (normal full prefill). The server
+# falls back to full prefill if kvgen is down. (Env knobs must stay INSIDE the
+# backslash block below — no comments between continuations, see the note there.)
 CUDA_VISIBLE_DEVICES=0,1,2 \
 MTP_TQ=1 MLP_GATEUP_FUSED=1 MLP_GATEUP_FUSED_KERNEL=1 \
 DFLASH=1 DFLASH_DRAFT_PATH="$CHAT_DRAFTER" \
@@ -76,6 +84,9 @@ DFLASH_VERIFY_BLOCKSPARSE=1 DFLASH_BUDGET=8 \
 PP_LAYER_BOUNDS=17,40 \
 MINF_SPARSE_ATTN=1 MINF_BUDGET=0.10 \
 MINF_PROFILE_PATH=$ROOT/profiles/27B_block_sparse.bin \
+SPEC_LORA=$SPEC_LORA_FILE \
+SPEC_PREFILL_AUTO=1 SPEC_PREFILL_KVGEN=127.0.0.1:$KVGEN_PORT \
+SPEC_PREFILL_MIN_LEN=32768 SPEC_PREFILL_MAX_LEN=$KVGEN_MAX_SEQ \
 nohup "$BIN" "$CHAT_MODEL" \
   --serve $CHAT_PORT --slots 1 --max-seq 262144 \
   --vision-mmproj "$CHAT_MMPROJ" \
