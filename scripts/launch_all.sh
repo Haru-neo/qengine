@@ -25,16 +25,18 @@ EMBED_PORT=${EMBED_PORT:-8001}
 RERANK_PORT=${RERANK_PORT:-8002}
 KVGEN_PORT=${KVGEN_PORT:-8011}
 # kvgen (0.8B speculative-prefill KV generator) shares GPU 3 with embed+rerank.
-# All three CUDA contexts + their KV caches must fit in GPU 3's 16 GB. The
-# kvgen KV cache is the size driver; with MTP_TQ=1 (3-bit TurboQuant KV, set in
-# the kvgen launch below) the cache is 4.9x smaller, so the FULL 256K context
-# fits alongside embed+rerank: at KVGEN_MAX_SEQ=262144 the kvgen footprint is
-# ~2.6 GB (KV 654 MB) and GPU 3 still holds ~1.4 GB free (measured 2026-06-13).
-# fp16 KV would need 3.2 GB and NOT fit (only ~0.3 GB margin). Everything is
-# pre-allocated at init (zero runtime balloon). SPEC_PREFILL_MAX_LEN tracks this,
-# so 256K prompts get speculative prefill (kvgen ~225s + tail ~56s = ~280s vs a
-# ~730s full prefill). The back-to-back-256K crash was fixed in 5dc13eb (chunked
-# kv-inject scratch + /dev/shm unlink), so consecutive 256K requests are safe.
+# All three CUDA contexts + their KV caches must fit in GPU 3's 16 GB. The kvgen
+# KV cache is the size driver. Q8KV=1 (8-bit KV, set in the kvgen launch below)
+# fits the FULL 256K context alongside embed+rerank AND avoids the 3-bit TurboQuant
+# dequant tax: at KVGEN_MAX_SEQ=262144, Q8 kvgen 256K = ~160s standalone vs ~205s
+# for TQ3 (the 3-bit dequant in the predictor's own attention costs ~45s); the
+# end-to-end 256K TTFT is ~257s vs ~290s for TQ3. fp16 (the ~150s floor) would be
+# faster still but needs 3.2GB KV and does NOT fit. Safety: Q8's GPU3 margin is
+# tighter (~130-220MB free) but PROVEN safe — a stress test (57 rounds of
+# embed+rerank hammering DURING a 256K kvgen request, 2026-06-13) bottomed at 67MB
+# free with NO OOM and all 4 services alive (footprint is pre-allocated + chunked,
+# no runtime balloon). The back-to-back-256K crash was fixed in 5dc13eb (chunked
+# kv-inject scratch + /dev/shm unlink). SPEC_PREFILL_MAX_LEN tracks KVGEN_MAX_SEQ.
 KVGEN_MAX_SEQ=${KVGEN_MAX_SEQ:-262144}
 
 # Kill any previous engine binaries. Match the executable path specifically
@@ -141,7 +143,7 @@ for _ in $(seq 1 60); do
 done
 CUDA_VISIBLE_DEVICES=3 \
 KVGEN_HEADS="$KVGEN_HEADS_FILE" KVGEN_MAX_SEQ=$KVGEN_MAX_SEQ \
-MTP_TQ=1 \
+Q8KV=1 \
 MINF_SPARSE_ATTN=1 MINF_BUDGET=0.10 MINF_UNIFORM_MS=1 \
 nohup "$BIN" "$KVGEN_MODEL" \
   --serve $KVGEN_PORT --mode kvgen \
