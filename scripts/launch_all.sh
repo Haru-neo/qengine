@@ -16,10 +16,21 @@ CHAT_MODEL=${CHAT_MODEL:-$GGUF_DIR/Qwopus3.6-27B-v2-MTP-Q8_0.gguf}
 CHAT_MMPROJ=${CHAT_MMPROJ:-$GGUF_DIR/Qwopus3.6-27B-v2-mmproj.gguf}
 EMBED_MODEL=${EMBED_MODEL:-$GGUF_DIR/Qwen3-Embedding-4B-Q8_0.gguf}
 RERANK_MODEL=${RERANK_MODEL:-$GGUF_DIR/Qwen3-Reranker-4B-Q8_0.gguf}
+KVGEN_MODEL=${KVGEN_MODEL:-$GGUF_DIR/Qwen3.5-0.8B-kvgen-Q8_0.gguf}
+KVGEN_HEADS_FILE=${KVGEN_HEADS_FILE:-/home/paru/models/kvgen_heads_v1.bin}
 
 CHAT_PORT=${CHAT_PORT:-8000}
 EMBED_PORT=${EMBED_PORT:-8001}
 RERANK_PORT=${RERANK_PORT:-8002}
+KVGEN_PORT=${KVGEN_PORT:-8011}
+# kvgen (0.8B speculative-prefill KV generator) shares GPU 3 with embed+rerank.
+# All three CUDA contexts + their KV caches must fit in GPU 3's 16 GB. At
+# KVGEN_MAX_SEQ=65536 kvgen's footprint is ~2.2 GB and GPU 3 holds ~1.7 GB free
+# even during a max-length request (measured 2026-06-13: zero runtime balloon —
+# everything is pre-allocated at init). 131072 fits by linear extrapolation but
+# erodes the margin to ~1 GB, so 65536 is the safe co-resident cap. Raising it
+# risks an OOM that corrupts the embed/rerank contexts on the same GPU.
+KVGEN_MAX_SEQ=${KVGEN_MAX_SEQ:-65536}
 
 # Kill any previous engine binaries. Match the executable path specifically
 # so the pkill doesn't also kill this script (whose own path contains
@@ -30,15 +41,10 @@ sleep 2
 # Drop page cache before loading the 28 GB chat GGUF.
 echo 9717 | sudo -S sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || true
 
-# Lock all 4 GPUs to the 1380 MHz BIOS-max clock + persistence mode.
-# The CMP 100-210 defaults to its 1147 MHz application clock and does NOT
-# auto-boost under load, leaving ~15-20% on the table for clock-bound paths
-# (Q8_0 DP4A / HFMA2 GEMM — exactly what inference uses). Locking to 1380 is a
-# free, consistent gain (verified 2026-06-06: FFMA 7.3->8.4, HFMA2 15.5->17.7,
-# steady). The tensor/FP64 throttle is fixed-cycle and unaffected, but we don't
-# use those paths. Reversible with: sudo nvidia-smi -rgc
-echo 9717 | sudo -S nvidia-smi -pm 1 >/dev/null 2>&1 || true
-echo 9717 | sudo -S nvidia-smi -lgc 1380,1380 >/dev/null 2>&1 || true
+# NOTE: GPU clock lock (nvidia-smi -lgc 1380,1380) was intentionally REMOVED
+# per the user's decision. Do NOT re-add it here. (The 140W power limit is
+# applied separately and permanently via the gpu-power-limit.service systemd
+# unit, so nothing clock/power related needs to run from this script.)
 
 cd "$ROOT"
 
@@ -105,10 +111,32 @@ CUDA_VISIBLE_DEVICES=3 nohup "$BIN" "$RERANK_MODEL" \
   > /tmp/rerank.log 2>&1 &
 RERANK_PID=$!
 
+# Speculative-prefill KV generator (GPU 3, shared). Stagger again: wait for
+# rerank to finish initialising its CUDA context before bringing kvgen's up, for
+# the same context-corruption reason embed→rerank is staggered. kvgen produces
+# predicted KV for the 27B (POST :8011/kvgen); it is NOT auto-wired into the chat
+# server — clients that want spec-prefill call it explicitly.
+echo "Waiting for rerank (:$RERANK_PORT) to come up before launching kvgen..."
+for _ in $(seq 1 60); do
+  if grep -q "listening on :$RERANK_PORT" /tmp/rerank.log 2>/dev/null; then break; fi
+  if ! kill -0 "$RERANK_PID" 2>/dev/null; then
+    echo "WARNING: rerank died during load — see /tmp/rerank.log"; break
+  fi
+  sleep 2
+done
+CUDA_VISIBLE_DEVICES=3 \
+KVGEN_HEADS="$KVGEN_HEADS_FILE" KVGEN_MAX_SEQ=$KVGEN_MAX_SEQ \
+nohup "$BIN" "$KVGEN_MODEL" \
+  --serve $KVGEN_PORT --mode kvgen \
+  > /tmp/kvgen.log 2>&1 &
+KVGEN_PID=$!
+
 echo "chat   PID=$CHAT_PID  port=$CHAT_PORT  (GPUs 0,1,2)"
 echo "embed  PID=$EMBED_PID port=$EMBED_PORT (GPU 3)"
 echo "rerank PID=$RERANK_PID port=$RERANK_PORT (GPU 3)"
+echo "kvgen  PID=$KVGEN_PID port=$KVGEN_PORT (GPU 3, max_seq=$KVGEN_MAX_SEQ)"
 echo
 echo "Clients hit only :$CHAT_PORT — /v1/embeddings → :$EMBED_PORT,"
 echo "/v1/rerank → :$RERANK_PORT, both auto-proxied by the chat server."
-echo "Chat ~110 s to load; embed + rerank sidecars ~30 s each."
+echo "kvgen spec-prefill is a direct endpoint: POST :$KVGEN_PORT/kvgen."
+echo "Chat ~110 s to load; embed + rerank + kvgen sidecars ~10-30 s each."
