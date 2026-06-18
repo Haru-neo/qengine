@@ -7589,7 +7589,24 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    int n_gpus; cudaGetDeviceCount(&n_gpus);
+    // n_gpus MUST be initialized + the return checked: cudaGetDeviceCount only
+    // writes the out-param on cudaSuccess. If it fails (e.g. WSL2 where the
+    // Windows driver / CUDA runtime can't enumerate the device), n_gpus would
+    // keep its uninitialized stack garbage and GPUModel::load's
+    // (num_layers + n_gpus - 1) / n_gpus would divide by zero (SIGFPE / exit 136
+    // mid-load, which is exactly what a single-GPU 4090 extract hit).
+    int n_gpus = 0;
+    cudaError_t gdc_err = cudaGetDeviceCount(&n_gpus);
+    if (gdc_err != cudaSuccess || n_gpus < 1) {
+        fprintf(stderr,
+            "FATAL: no usable CUDA GPU — cudaGetDeviceCount returned %d device(s), err=%s\n"
+            "  WSL2: make sure the Windows NVIDIA driver is installed and `nvidia-smi`\n"
+            "  works inside WSL, and that the CUDA toolkit used to build is <= the\n"
+            "  driver's supported CUDA version (a too-new runtime -> insufficient driver).\n",
+            n_gpus, cudaGetErrorString(gdc_err));
+        return 1;
+    }
+    printf("CUDA devices visible: %d\n", n_gpus);
     GGUFFile gguf;
     if (!gguf.open(argv[1])) return 1;
 

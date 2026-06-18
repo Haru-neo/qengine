@@ -55,6 +55,13 @@ struct GPUModel {
     std::unordered_map<std::string, GPUTensor> tensors;
     
     bool load(GGUFFile& gguf, int n_gpus) {
+        if (n_gpus < 1) {
+            // Guard the layers_per_gpu = (num_layers + n_gpus - 1) / n_gpus
+            // divide below: a 0 here (e.g. an unchecked cudaGetDeviceCount that
+            // failed) would otherwise SIGFPE mid-load instead of erroring.
+            fprintf(stderr, "GPUModel::load: n_gpus=%d (need >=1) — no usable CUDA device\n", n_gpus);
+            return false;
+        }
         num_gpus = n_gpus;
         auto arch = gguf.get_str("general.architecture");
         num_layers = gguf.get_u32(arch + ".block_count");
