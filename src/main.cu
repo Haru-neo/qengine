@@ -568,6 +568,15 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
     const int last_gpu = gpu_model.layer_gpu[n_layers - 1];
     constexpr int CHUNK = QwenModel::CHUNK_SIZE;
 
+    // Flash attention: the other run modes (serve/eval) default this ON, but
+    // run_dflash_extract never set it — so extraction silently used the slow
+    // attn_score_kernel_h + separate softmax/value path. For long context that
+    // is O(L^2) at the throttled HMMA rate (~20 h for a single 256K sequence
+    // vs ~12 min for the production FA prefill). Match production: FA on unless
+    // FLASH_ATTN=0. Capture (pre-RoPE K/V) is upstream of attention, so the
+    // chosen attention kernel does not change the staged target values.
+    { const char* fa = getenv("FLASH_ATTN"); g_use_flash_attn = (fa == nullptr) ? true : (fa[0] == '1'); }
+
     // DFLASH_EXTRACT_PIPELINE (default ON): cross-sequence pipelined prefill.
     // Each in-flight pipeline buffer is bound to its own KV/GDN slot + its own
     // capture region, so independent corpus sequences prefill concurrently
@@ -620,10 +629,16 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
         std::vector<int> caps(NB, per_slot_cap);
         model.init_attention_caps(caps);
     }
+    // KV-extract mode (DFLASH_EXTRACT_KV=1) writes DFKV records from the kvext
+    // staging and NEVER uses the C-record capture buffer (gpu0_buf). Allocating
+    // it wastes ~12.8 GB of GPU VRAM (forcing Q8 KV / OOM) and the per-layer
+    // dflash_capture_chunk below burns extra D2H work — so skip both for KV mode.
+    const bool extract_kv = (getenv("DFLASH_EXTRACT_KV") != nullptr);
     // Capture buffer holds NB independent regions of max_L tokens each, so the
     // NB in-flight sequences write to disjoint ranges of gpu0_buf. The single-
     // stream path (NB=1) is unchanged (one region of max_L).
-    model.init_dflash_capture((int)(NB * max_L), dflash::kTargetLayerIds, N_TGT);
+    if (!extract_kv)
+        model.init_dflash_capture((int)(NB * max_L), dflash::kTargetLayerIds, N_TGT);
 
     // ── Output dir + chunk-stream bookkeeping ──
     {
@@ -657,7 +672,7 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
     // (the trainer only needs token ids + 27B KV). Single-stream only.
     //   record: [i32 magic 0x44464B56 "DFKV"][i32 L][i32 n_attn][i32 kv_dim]
     //           [i32 ids[L]][f16 K[n_attn][L][kv_dim]][f16 V[n_attn][L][kv_dim]]
-    const bool extract_kv = (getenv("DFLASH_EXTRACT_KV") != nullptr);
+    // (extract_kv declared above, before init_dflash_capture)
     if (extract_kv && use_pipeline) {
         fprintf(stderr, "[dflash-extract] DFLASH_EXTRACT_KV requires DFLASH_EXTRACT_PIPELINE=0 (single-stream)\n"); return 1;
     }
@@ -810,9 +825,9 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
         fwrite(&kd,    sizeof(int32_t), 1, kv_chunk_f);
         fwrite(ids_ptr, sizeof(int32_t), L, kv_chunk_f);
         for (int li = 0; li < n_attn; li++)
-            fwrite(model.kvext_k_host + (size_t)li * model.kvext_cap * kvd, sizeof(half), plane, kv_chunk_f);
+            fwrite(model.kvext_k_host[li], sizeof(half), plane, kv_chunk_f);
         for (int li = 0; li < n_attn; li++)
-            fwrite(model.kvext_v_host + (size_t)li * model.kvext_cap * kvd, sizeof(half), plane, kv_chunk_f);
+            fwrite(model.kvext_v_host[li], sizeof(half), plane, kv_chunk_f);
         kv_chunk_bytes_cur += rec_bytes;
         kv_chunk_records++;
     };
@@ -820,7 +835,158 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
     auto t_start = std::chrono::high_resolution_clock::now();
     size_t total_tokens = 0;
 
-    if (!use_pipeline) {
+    // Within-sequence chunk pipeline for KV extraction (default ON). The KV
+    // extract path must use a SINGLE KV/GDN slot (the kvext staging is indexed
+    // by [layer][position], not by slot), which rules out the cross-sequence
+    // pipeline (one slot per in-flight sequence). But a single sequence's
+    // CHUNKS can still be pipelined across the 3 GPU stages using NB hidden
+    // BUFFERS + per-buffer events — exactly the production serve
+    // PREFILL_PIPELINE_V3 design. forward_attn_chunk is identical; the kvext
+    // capture writes [pos, pos+n) so concurrent in-flight chunks never collide,
+    // and GDN recurrence stays correct because each stage runs its chunks FIFO
+    // on its own compute stream. ~3x over the sequential single-stream loop
+    // (which leaves 2 of 3 GPUs idle). Opt out with DFLASH_EXTRACT_KV_PIPELINE=0.
+    const bool kv_within_pipe = extract_kv &&
+        [](){ const char* e = getenv("DFLASH_EXTRACT_KV_PIPELINE"); return !e || e[0] != '0'; }();
+    if (kv_within_pipe) {
+        struct GpuSeg { int g, l_lo, l_hi; };
+        std::vector<GpuSeg> gpu_segs;
+        { int cur_g = gpu_model.layer_gpu[0], seg_start = 0;
+          for (int l = 1; l < n_layers; l++)
+              if (gpu_model.layer_gpu[l] != cur_g) {
+                  gpu_segs.push_back({cur_g, seg_start, l});
+                  cur_g = gpu_model.layer_gpu[l]; seg_start = l; }
+          gpu_segs.push_back({cur_g, seg_start, n_layers}); }
+        const int nseg = (int)gpu_segs.size();
+        const int last_seg = nseg - 1;
+        const int g0 = gpu_segs[0].g;
+        int NB = 8;  // hidden buffers in flight; events/bridges are per-buffer
+        if (const char* e = getenv("DFLASH_EXTRACT_NBUF")) { int v = atoi(e); if (v >= 2 && v <= 16) NB = v; }
+        printf("[dflash-extract] KV within-sequence pipeline: %d stages, NB=%d buffers, single slot\n", nseg, NB);
+
+        cudaStream_t comp_stream[4] = {}, d2h_stream[4] = {};
+        for (int g = 0; g < n_gpus; g++) { cudaSetDevice(g); cudaStreamCreate(&comp_stream[g]); cudaStreamCreate(&d2h_stream[g]); }
+        half* embed_half = nullptr; cudaSetDevice(g0); cudaMalloc(&embed_half, (size_t)H * sizeof(half));
+        float* gpu_hidden[4][16] = {};
+        for (int g = 0; g < n_gpus; g++) { cudaSetDevice(g); for (int b = 0; b < NB; b++) cudaMalloc(&gpu_hidden[g][b], (size_t)CHUNK * H * sizeof(float)); }
+        float* host_xfer[16] = {};
+        for (int b = 0; b < NB; b++) cudaMallocHost(&host_xfer[b], (size_t)CHUNK * H * sizeof(float));
+        cudaEvent_t ev_sd[4][16] = {}, ev_dh[4][16] = {};
+        for (int s = 0; s < nseg; s++) { cudaSetDevice(gpu_segs[s].g);
+            for (int b = 0; b < NB; b++) { cudaEventCreateWithFlags(&ev_sd[s][b], cudaEventDisableTiming);
+                                           cudaEventCreateWithFlags(&ev_dh[s][b], cudaEventDisableTiming); } }
+
+        struct W { int buf, pos, n; };
+        const int* cur_ids = nullptr;  // producer-set per sequence
+        auto pipe_embed = [&](int buf, int pos, int n){
+            cudaSetDevice(g0); cudaStream_t cs = comp_stream[g0];
+            float* h_in = gpu_hidden[g0][buf];
+            for (int t = 0; t < n; t++) {
+                int token_id = cur_ids[pos + t];
+                if (embd_t->type == GGML_TYPE_Q8_0)      dequant_embd_q8_0_row<<<(H+255)/256,256,0,cs>>>(embd_t->data, embed_half, token_id, H);
+                else if (embd_t->type == GGML_TYPE_Q5_K) dequant_embd_q5k_row_v2<<<(H+255)/256,256,0,cs>>>(embd_t->data, embed_half, token_id, H);
+                else if (embd_t->type == GGML_TYPE_Q6_K) dequant_embd_q6k_row_v2<<<(H+255)/256,256,0,cs>>>(embd_t->data, embed_half, token_id, H);
+                half_to_float_kernel<<<(H+255)/256,256,0,cs>>>(embed_half, h_in + (size_t)t * H, H);
+            }
+        };
+        auto pipe_seg = [&](int s, int buf, int pos, int n){
+            int g = gpu_segs[s].g; cudaSetDevice(g); cudaStream_t cs = comp_stream[g];
+            float* h_chunk = gpu_hidden[g][buf];
+            for (int layer = gpu_segs[s].l_lo; layer < gpu_segs[s].l_hi; layer++) {
+                if (model.is_attn_layer(layer)) model.forward_attn_chunk(layer, h_chunk, pos, n, cs, 0);
+                else                            model.forward_gdn_chunk (layer, h_chunk, n, cs, 0, pos);
+                if (model.layer_is_moe[layer])  model.forward_moe_chunk(layer, h_chunk, n, cs);
+                else                            model.forward_mlp_chunk(layer, h_chunk, n, cs);
+                // NB: no dflash_capture_chunk here — KV extract uses kvext (inside
+                // forward_attn_chunk), and gpu0_buf is not allocated in this mode.
+            }
+            cudaEventRecord(ev_sd[s][buf], cs);
+        };
+        auto pipe_d2h = [&](int s, int buf, int n){
+            int g = gpu_segs[s].g; cudaSetDevice(g);
+            cudaStreamWaitEvent(d2h_stream[g], ev_sd[s][buf], 0);
+            cudaMemcpyAsync(host_xfer[buf], gpu_hidden[g][buf], (size_t)n * H * sizeof(float), cudaMemcpyDeviceToHost, d2h_stream[g]);
+            cudaEventRecord(ev_dh[s][buf], d2h_stream[g]);
+        };
+
+        for (size_t si = 0; si < sequences.size(); si++) {
+            const std::vector<int>& ids = sequences[si];
+            int L = (int)ids.size(); if (L > (int)max_L) L = (int)max_L;
+            cur_ids = ids.data();
+            model.reset_slot_states(0);  // fresh KV/GDN for this sequence
+
+            std::mutex mtx; std::condition_variable cv;
+            std::vector<std::deque<W>> q(nseg);
+            std::vector<bool> q_done(nseg, false);
+            std::deque<int> free_bufs; for (int b = 0; b < NB; b++) free_bufs.push_back(b);
+
+            std::vector<std::thread> workers;
+            for (int s = 1; s < nseg; s++) {
+                workers.emplace_back([&, s]{
+                    cudaSetDevice(gpu_segs[s].g);
+                    for (;;) {
+                        W w;
+                        { std::unique_lock<std::mutex> lk(mtx);
+                          cv.wait(lk, [&]{ return !q[s].empty() || q_done[s]; });
+                          if (q[s].empty()) break;
+                          w = q[s].front(); q[s].pop_front(); }
+                        cudaEventSynchronize(ev_dh[s-1][w.buf]);   // prev stage D2H host-coherent
+                        cudaSetDevice(gpu_segs[s].g);
+                        cudaMemcpyAsync(gpu_hidden[gpu_segs[s].g][w.buf], host_xfer[w.buf],
+                            (size_t)w.n * H * sizeof(float), cudaMemcpyHostToDevice, comp_stream[gpu_segs[s].g]);
+                        pipe_seg(s, w.buf, w.pos, w.n);
+                        if (s < last_seg) {
+                            pipe_d2h(s, w.buf, w.n);
+                            { std::lock_guard<std::mutex> lk(mtx); q[s+1].push_back(w); } cv.notify_all();
+                        } else {
+                            cudaEventSynchronize(ev_sd[last_seg][w.buf]);  // chunk fully drained
+                            { std::lock_guard<std::mutex> lk(mtx); free_bufs.push_back(w.buf); } cv.notify_all();
+                        }
+                    }
+                    if (s < last_seg) { std::lock_guard<std::mutex> lk(mtx); q_done[s+1] = true; cv.notify_all(); }
+                });
+            }
+            // Producer = stage 0 (this thread).
+            int pos = 0;
+            while (pos < L) {
+                int n = std::min(CHUNK, L - pos);
+                int buf;
+                { std::unique_lock<std::mutex> lk(mtx); cv.wait(lk, [&]{ return !free_bufs.empty(); });
+                  buf = free_bufs.front(); free_bufs.pop_front(); }
+                pipe_embed(buf, pos, n);
+                pipe_seg(0, buf, pos, n);
+                pipe_d2h(0, buf, n);
+                { std::lock_guard<std::mutex> lk(mtx); q[1].push_back({buf, pos, n}); } cv.notify_all();
+                pos += n;
+            }
+            { std::lock_guard<std::mutex> lk(mtx); q_done[1] = true; cv.notify_all(); }
+            for (auto& t : workers) t.join();
+
+            // Sync all GPUs (kvext capture D2H runs on each stage's comp stream)
+            // and surface any fault rather than writing a garbage record.
+            cudaError_t kvext_sync_err = cudaSuccess;
+            for (int g = 0; g < n_gpus; g++) { cudaSetDevice(g); cudaError_t e = cudaDeviceSynchronize();
+                if (e != cudaSuccess && kvext_sync_err == cudaSuccess) kvext_sync_err = e; }
+            if (kvext_sync_err != cudaSuccess) {
+                fprintf(stderr, "[kvext] FATAL: CUDA error after seq %zu D2H capture: %s — aborting (no garbage write)\n",
+                        si, cudaGetErrorString(kvext_sync_err)); return 1; }
+            if (model.kvext_k_host.empty()) { fprintf(stderr, "[kvext] FATAL: staging unallocated — aborting\n"); return 1; }
+            write_kv_record(L, ids.data());
+            total_tokens += L;
+            { auto now = std::chrono::high_resolution_clock::now();
+              double s = std::chrono::duration<double>(now - t_start).count();
+              printf("[dflash-extract] %zu/%zu seqs, %zu tokens, %.1f tok/s, %.0fs elapsed\n",
+                     si + 1, sequences.size(), total_tokens, s > 0 ? total_tokens / s : 0.0, s);
+              fflush(stdout); }
+        }
+        for (int b = 0; b < NB; b++) cudaFreeHost(host_xfer[b]);
+        cudaSetDevice(g0); cudaFree(embed_half);
+        for (int g = 0; g < n_gpus; g++) { cudaSetDevice(g);
+            for (int b = 0; b < NB; b++) cudaFree(gpu_hidden[g][b]);
+            cudaStreamDestroy(comp_stream[g]); cudaStreamDestroy(d2h_stream[g]); }
+        for (int s = 0; s < nseg; s++) { cudaSetDevice(gpu_segs[s].g);
+            for (int b = 0; b < NB; b++) { cudaEventDestroy(ev_sd[s][b]); cudaEventDestroy(ev_dh[s][b]); } }
+    } else if (!use_pipeline) {
         // ───────────────────── Single-stream path (NB=1) ────────────────────
         // Original hand-rolled chunked prefill. Kept for the byte-identical
         // correctness diff (DFLASH_EXTRACT_PIPELINE=0).
@@ -868,9 +1034,11 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
 
             // Fresh KV/GDN state + zero the capture buffer region for this seq.
             model.reset_slot_states(0);
-            cudaSetDevice(0);
-            cudaMemset(model.dflash_cap.gpu0_buf, 0,
-                       (size_t)L * N_TGT * H * sizeof(half));
+            if (!extract_kv) {  // gpu0_buf not allocated in KV-extract mode
+                cudaSetDevice(0);
+                cudaMemset(model.dflash_cap.gpu0_buf, 0,
+                           (size_t)L * N_TGT * H * sizeof(half));
+            }
 
             int chunk_pos = 0;
             while (chunk_pos < L) {
@@ -907,7 +1075,8 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
                     else         model.forward_gdn_chunk (layer, h_chunk, chunk_n, 0, /*slot=*/0, chunk_pos);
                     if (model.layer_is_moe[layer]) model.forward_moe_chunk(layer, h_chunk, chunk_n, 0);
                     else                           model.forward_mlp_chunk(layer, h_chunk, chunk_n, 0);
-                    model.dflash_capture_chunk(layer, h_chunk, chunk_pos, chunk_n, g, 0);
+                    if (!extract_kv)  // C-record capture unused in KV-extract mode
+                        model.dflash_capture_chunk(layer, h_chunk, chunk_pos, chunk_n, g, 0);
                 }
                 cudaSetDevice(last_gpu); cudaDeviceSynchronize();
                 // KD: h_chunk now holds the post-final-layer hidden for these
@@ -917,13 +1086,36 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
                     compute_tgt_chunk(h_chunk, chunk_n, host_tgt.data() + chunk_pos);
                 }
                 chunk_pos += chunk_n;
+                if (extract_kv && (((chunk_pos / CHUNK) % 8 == 0) || chunk_pos >= L)) {
+                    auto cnow = std::chrono::high_resolution_clock::now();
+                    double cs = std::chrono::duration<double>(cnow - t_start).count();
+                    printf("[dflash-extract]   seq %zu: %d/%d tok (%.0f%%), %.0fs, %.0f tok/s cum\n",
+                           si, chunk_pos, L, 100.0 * chunk_pos / L, cs,
+                           cs > 0 ? (total_tokens + chunk_pos) / cs : 0.0);
+                    fflush(stdout);
+                }
             }
 
-            cudaSetDevice(0); cudaDeviceSynchronize();
+            cudaSetDevice(0); cudaError_t kvext_sync_err = cudaDeviceSynchronize();
             if (extract_kv) {
                 // kvext D2H copies ran on every GPU's stream 0 — sync them all
-                // before reading the pinned staging buffers.
-                for (int g = 1; g < n_gpus; g++) { cudaSetDevice(g); cudaDeviceSynchronize(); }
+                // before reading the pinned staging buffers. A faulted copy
+                // surfaces as a non-success return here; abort rather than
+                // silently writing a zero/garbage record (the 2026-06-16 bug).
+                for (int g = 1; g < n_gpus; g++) {
+                    cudaSetDevice(g);
+                    cudaError_t e = cudaDeviceSynchronize();
+                    if (e != cudaSuccess && kvext_sync_err == cudaSuccess) kvext_sync_err = e;
+                }
+                if (kvext_sync_err != cudaSuccess) {
+                    fprintf(stderr, "[kvext] FATAL: CUDA error after seq %zu D2H capture: %s — aborting (no garbage write)\n",
+                            si, cudaGetErrorString(kvext_sync_err));
+                    return 1;
+                }
+                if (model.kvext_k_host.empty()) {
+                    fprintf(stderr, "[kvext] FATAL: staging buffers unallocated — aborting\n");
+                    return 1;
+                }
                 write_kv_record(L, ids.data());
             } else {
                 size_t c_count = (size_t)L * N_TGT * H;
@@ -935,12 +1127,13 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
             }
             total_tokens += L;
 
-            if ((si + 1) % 64 == 0 || si + 1 == sequences.size()) {
+            {  // per-sequence progress (visibility against silent stalls)
                 auto now = std::chrono::high_resolution_clock::now();
                 double s = std::chrono::duration<double>(now - t_start).count();
-                printf("[dflash-extract] %zu/%zu seqs, %zu tokens, %.1f tok/s\n",
+                printf("[dflash-extract] %zu/%zu seqs, %zu tokens, %.1f tok/s, %.0fs elapsed\n",
                        si + 1, sequences.size(), total_tokens,
-                       s > 0 ? total_tokens / s : 0.0);
+                       s > 0 ? total_tokens / s : 0.0, s);
+                fflush(stdout);
             }
         }
         cudaFreeHost(host_chunk_transfer);
@@ -6822,6 +7015,7 @@ int serve_kvgen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port) {
             // chunk launched two iterations ago. No-op if never recorded.
             cudaSetDevice(0);   // ev_d2h + DFKI staging are GPU0 (multi-GPU body ends elsewhere)
             cudaStreamWaitEvent(0, ev_d2h[bcur], 0);
+            if (kvg_prof) cudaDeviceSynchronize();  // PROFILING ONLY: drain prev-chunk DFKI D2H so its PCIe wait isn't mis-charged to p_embed (disambiguates the embed phase)
             auto tp = pnow();
             cudaSetDevice(0);
             cudaMemcpyAsync(ids_dev, ids.data() + pos, (size_t)n * sizeof(int),

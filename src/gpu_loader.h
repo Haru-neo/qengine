@@ -10,6 +10,27 @@
 #include <algorithm>
 #include "gguf.h"
 #include "quant_gemv.cuh"  // for q8_0_repack_kernel and block_q8_0_aligned
+#include <cstdlib>
+
+// Optional unified-memory (managed) weight allocation, for running on a GPU whose
+// VRAM is smaller than the model (e.g. 24GB RTX 4090 with a 28GB Q8_0 model — used
+// for FAITHFUL fast KV extraction: the deployment engine itself on Ada, no llama drift).
+// Enable with env QENGINE_UM_OFFLOAD=1. cudaMallocManaged + PreferredLocation=device
+// oversubscribes: ~24GB stays resident, the excess pages in/out over PCIe on demand
+// (negligible vs the O(n^2) attention cost of a one-shot extract). Default (env unset)
+// uses plain cudaMalloc, so CMP / multi-GPU runs are completely unaffected.
+static inline cudaError_t qe_weight_alloc(void** p, size_t bytes) {
+    static int um = -1;
+    if (um < 0) um = getenv("QENGINE_UM_OFFLOAD") ? 1 : 0;
+    if (!um) return cudaMalloc(p, bytes);
+    cudaError_t e = cudaMallocManaged(p, bytes);
+    if (e == cudaSuccess) {
+        int dev = 0; cudaGetDevice(&dev);
+        cudaMemAdvise(*p, bytes, cudaMemAdviseSetPreferredLocation, dev);
+        cudaMemAdvise(*p, bytes, cudaMemAdviseSetAccessedBy, dev);
+    }
+    return e;
+}
 
 struct GPUTensor {
     void* data = nullptr;
@@ -178,7 +199,7 @@ struct GPUModel {
                 memcpy(gt.dims, ti->dims, sizeof(gt.dims));
                 gt.byte_size = ti->byte_size();
 
-                cudaError_t err = cudaMalloc(&gt.data, gt.byte_size);
+                cudaError_t err = qe_weight_alloc(&gt.data, gt.byte_size);
                 if (err != cudaSuccess) {
                     fprintf(stderr, "GPU %d: alloc failed for %s: %s\n",
                         gpu_id, name.c_str(), cudaGetErrorString(err));
@@ -217,7 +238,7 @@ struct GPUModel {
                     int n_blocks = (int)(gt.byte_size / 34);
                     size_t new_bytes = (size_t)n_blocks * 36;
                     void* repacked = nullptr;
-                    cudaError_t err2 = cudaMalloc(&repacked, new_bytes);
+                    cudaError_t err2 = qe_weight_alloc(&repacked, new_bytes);
                     if (err2 != cudaSuccess) {
                         fprintf(stderr, "GPU %d: q8_0 repack alloc failed for %s: %s\n",
                             gpu_id, name.c_str(), cudaGetErrorString(err2));

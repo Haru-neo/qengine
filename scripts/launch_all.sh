@@ -12,8 +12,8 @@ BIN=$ROOT/build/qwen-engine
 LOG_DIR=${LOG_DIR:-$ROOT}
 GGUF_DIR=${GGUF_DIR:-/home/paru/models/gguf}
 
-CHAT_MODEL=${CHAT_MODEL:-$GGUF_DIR/Qwopus3.6-27B-v2-MTP-Q8_0.gguf}
-CHAT_MMPROJ=${CHAT_MMPROJ:-$GGUF_DIR/Qwopus3.6-27B-v2-mmproj.gguf}
+CHAT_MODEL=${CHAT_MODEL:-/mnt/ssd/Coder-GGUF/Qwopus3.6-27B-Coder-Q8_0.gguf}
+CHAT_MMPROJ=${CHAT_MMPROJ:-$(ls /mnt/ssd/Coder-GGUF/*mmproj*.gguf 2>/dev/null | head -1)}
 EMBED_MODEL=${EMBED_MODEL:-$GGUF_DIR/Qwen3-Embedding-4B-Q8_0.gguf}
 RERANK_MODEL=${RERANK_MODEL:-$GGUF_DIR/Qwen3-Reranker-4B-Q8_0.gguf}
 KVGEN_MODEL=${KVGEN_MODEL:-$GGUF_DIR/Qwen3.5-0.8B-kvgen-Q8_0.gguf}
@@ -83,6 +83,8 @@ rm -f "$LOG_DIR/main_27b.log"
 # the engine). Shorter prompts are untouched (normal full prefill). The server
 # falls back to full prefill if kvgen is down. (Env knobs must stay INSIDE the
 # backslash block below — no comments between continuations, see the note there.)
+# vision auto-enables once a Coder mmproj exists at CHAT_MMPROJ; text-only until then
+VISION_ARG=""; [ -n "$CHAT_MMPROJ" ] && [ -f "$CHAT_MMPROJ" ] && VISION_ARG="--vision-mmproj $CHAT_MMPROJ"
 CUDA_VISIBLE_DEVICES=0,1,2 \
 MTP_TQ=1 MLP_GATEUP_FUSED=1 MLP_GATEUP_FUSED_KERNEL=1 \
 DFLASH=1 DFLASH_DRAFT_PATH="$CHAT_DRAFTER" \
@@ -90,12 +92,11 @@ DFLASH_VERIFY_BLOCKSPARSE=1 DFLASH_BUDGET=8 \
 PP_LAYER_BOUNDS=17,40 \
 MINF_SPARSE_ATTN=1 MINF_BUDGET=0.10 \
 MINF_PROFILE_PATH=$ROOT/profiles/27B_block_sparse.bin \
-SPEC_LORA=$SPEC_LORA_FILE \
-SPEC_PREFILL_AUTO=1 SPEC_PREFILL_KVGEN=127.0.0.1:$KVGEN_PORT \
+SPEC_PREFILL_AUTO=0 SPEC_PREFILL_KVGEN=127.0.0.1:$KVGEN_PORT \
 SPEC_PREFILL_MIN_LEN=32768 SPEC_PREFILL_MAX_LEN=$KVGEN_MAX_SEQ SPEC_PREFILL_KEEP=3072 \
 nohup "$BIN" "$CHAT_MODEL" \
   --serve $CHAT_PORT --slots 1 --max-seq 262144 \
-  --vision-mmproj "$CHAT_MMPROJ" \
+  $VISION_ARG \
   --proxy-embed 127.0.0.1:$EMBED_PORT \
   --proxy-rerank 127.0.0.1:$RERANK_PORT \
   >> "$LOG_DIR/main_27b.log" 2>&1 &

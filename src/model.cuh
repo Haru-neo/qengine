@@ -2631,8 +2631,14 @@ struct QwenModel {
     // Pre-RoPE K is the projection target (position-invariant); RoPE is
     // re-applied deterministically when the projected KV is written into the
     // 27B cache. Stream-ordered D2H on the layer's stream, single slot only.
-    half* kvext_k_host = nullptr;
-    half* kvext_v_host = nullptr;
+    // One pinned plane PER attn layer (not one giant buffer). A single
+    // cudaMallocHost spanning >2 GB is unreliable on this hardware: the
+    // GPU-side mapping of host offsets past 2^31 bytes faults ("illegal
+    // memory access" on the D2H copy). At 256K the old single buffer was
+    // 8.59 GB and copies to li>=4 (offset == 2^31) died. Per-layer planes
+    // cap out at cap*kv_dim*2 = 536 MB each (<2 GB), so every offset is safe.
+    std::vector<half*> kvext_k_host;  // [n_attn] pinned planes, each cap*kv_dim halfs
+    std::vector<half*> kvext_v_host;
     long long kvext_cap = 0;
     int kvext_n_attn = 0;
     std::vector<int> kvext_attn_idx;  // layer -> attn index, -1 for GDN
@@ -2644,11 +2650,26 @@ struct QwenModel {
         for (int l = 0; l < cfg.num_layers; l++)
             if (is_attn_layer(l)) kvext_attn_idx[l] = kvext_n_attn++;
         int kv_dim = cfg.num_kv_heads * cfg.head_dim;
-        size_t bytes = (size_t)kvext_n_attn * cap * kv_dim * sizeof(half);
-        cudaMallocHost(&kvext_k_host, bytes);
-        cudaMallocHost(&kvext_v_host, bytes);
-        printf("[kvext] staging %d attn layers x %lld tokens x kv_dim=%d (2 x %.1f MB pinned)\n",
-               kvext_n_attn, cap, kv_dim, bytes / 1048576.0);
+        size_t plane_bytes = (size_t)cap * kv_dim * sizeof(half);
+        kvext_k_host.assign(kvext_n_attn, nullptr);
+        kvext_v_host.assign(kvext_n_attn, nullptr);
+        for (int li = 0; li < kvext_n_attn; li++) {
+            cudaError_t e1 = cudaMallocHost(&kvext_k_host[li], plane_bytes);
+            cudaError_t e2 = cudaMallocHost(&kvext_v_host[li], plane_bytes);
+            if (e1 != cudaSuccess || e2 != cudaSuccess) {
+                fprintf(stderr, "[kvext] FATAL: pinned alloc failed at layer %d (%zu B/plane): %s / %s\n",
+                        li, plane_bytes, cudaGetErrorString(e1), cudaGetErrorString(e2));
+                for (int j = 0; j <= li; j++) {
+                    if (kvext_k_host[j]) cudaFreeHost(kvext_k_host[j]);
+                    if (kvext_v_host[j]) cudaFreeHost(kvext_v_host[j]);
+                }
+                kvext_k_host.clear(); kvext_v_host.clear();
+                return;
+            }
+        }
+        printf("[kvext] staging %d attn layers x %lld tokens x kv_dim=%d (per-layer %.1f MB, total %.1f MB pinned)\n",
+               kvext_n_attn, cap, kv_dim, plane_bytes / 1048576.0,
+               2.0 * kvext_n_attn * plane_bytes / 1048576.0);
     }
     int gdn_rec_per_slot = 0;       // num_v * k_dim * v_dim
 
@@ -4828,14 +4849,14 @@ struct QwenModel {
             // KV-extract: stage post-k_norm PRE-RoPE K + V (V is never RoPE'd)
             // for this chunk. Enqueued before the in-place RoPE below on the
             // same stream, so the D2H reads the pre-RoPE values.
-            if (kvext_k_host) {
+            if (!kvext_k_host.empty()) {
                 int li = kvext_attn_idx[layer];
                 if (li >= 0 && (long long)start_pos + n_tokens <= kvext_cap) {
-                    size_t off = ((size_t)li * kvext_cap + start_pos) * kv_dim;
+                    size_t off = (size_t)start_pos * kv_dim;  // into this layer's plane
                     size_t nb = (size_t)n_tokens * kv_dim * sizeof(half);
-                    cudaMemcpyAsync(kvext_k_host + off, ab.attn_chunk_k, nb,
+                    cudaMemcpyAsync(kvext_k_host[li] + off, ab.attn_chunk_k, nb,
                                     cudaMemcpyDeviceToHost, stream);
-                    cudaMemcpyAsync(kvext_v_host + off, ab.attn_chunk_v, nb,
+                    cudaMemcpyAsync(kvext_v_host[li] + off, ab.attn_chunk_v, nb,
                                     cudaMemcpyDeviceToHost, stream);
                 }
             }
