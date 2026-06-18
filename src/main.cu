@@ -846,7 +846,13 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
     // and GDN recurrence stays correct because each stage runs its chunks FIFO
     // on its own compute stream. ~3x over the sequential single-stream loop
     // (which leaves 2 of 3 GPUs idle). Opt out with DFLASH_EXTRACT_KV_PIPELINE=0.
-    const bool kv_within_pipe = extract_kv &&
+    // The within-sequence KV pipeline overlaps layer-segments across GPUs; with
+    // a single GPU there is exactly one segment (nseg==1) and the producer's
+    // q[1].push_back / q_done[1] hand-off indexes one past the size-1 queue
+    // vectors (OOB → heap corruption, observed as a SIGFPE during extract on a
+    // single-GPU 4090). A single GPU has nothing to pipeline across, so route it
+    // to the single-stream path below (the byte-identical correctness path).
+    const bool kv_within_pipe = extract_kv && n_gpus >= 2 &&
         [](){ const char* e = getenv("DFLASH_EXTRACT_KV_PIPELINE"); return !e || e[0] != '0'; }();
     if (kv_within_pipe) {
         struct GpuSeg { int g, l_lo, l_hi; };
