@@ -854,7 +854,14 @@ struct MTPHead {
             static float* d_topk_val = nullptr;
             if (!d_topk)     cudaMalloc(&d_topk,     4 * sizeof(int));
             if (!d_topk_val) cudaMalloc(&d_topk_val, 4 * sizeof(float));
-            argmax_topk_half_kernel<4><<<1, 1024, 0, stream>>>(
+            size_t shmem = (size_t)1024 * 4 * (sizeof(float) + sizeof(int));
+            static bool attr4 = false;
+            if (!attr4) {
+                cudaFuncSetAttribute(argmax_topk_half_kernel<4>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem);
+                attr4 = true;
+            }
+            argmax_topk_half_kernel<4><<<1, 1024, shmem, stream>>>(
                 logits_buf, V, d_topk, out_logits_host ? d_topk_val : nullptr);
             cudaMemcpy(out_ids_host, d_topk, 4 * sizeof(int), cudaMemcpyDeviceToHost);
             if (out_logits_host) {
@@ -867,7 +874,14 @@ struct MTPHead {
             static float* d_topk_val = nullptr;
             if (!d_topk)     cudaMalloc(&d_topk,     8 * sizeof(int));
             if (!d_topk_val) cudaMalloc(&d_topk_val, 8 * sizeof(float));
-            argmax_topk_half_kernel<8><<<1, 1024, 0, stream>>>(
+            size_t shmem = (size_t)1024 * 8 * (sizeof(float) + sizeof(int));
+            static bool attr8 = false;
+            if (!attr8) {
+                cudaFuncSetAttribute(argmax_topk_half_kernel<8>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem);
+                attr8 = true;
+            }
+            argmax_topk_half_kernel<8><<<1, 1024, shmem, stream>>>(
                 logits_buf, V, d_topk, out_logits_host ? d_topk_val : nullptr);
             cudaMemcpy(out_ids_host, d_topk, 8 * sizeof(int), cudaMemcpyDeviceToHost);
             if (out_logits_host) {

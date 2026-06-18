@@ -987,13 +987,19 @@ __global__ void argmax_topk_half_kernel(const half* __restrict__ logits,
         }
     }
 
-    // Block-wide tree reduction, merging top-K lists pair-wise.
-    __shared__ float s_v[1024][K];
-    __shared__ int   s_i[1024][K];
+    // Block-wide tree reduction, merging top-K lists pair-wise. Dynamic shared
+    // memory: blockDim.x*K floats (s_v) followed by blockDim.x*K ints (s_i).
+    // The K=8 / 1024-thread case needs 64KB, which exceeds sm_89's 48KB *static*
+    // shared cap — so we use dynamic shared + the caller's MaxDynamicSharedMemory
+    // opt-in. (Volta sm_70 allowed it statically; this keeps both archs working
+    // with identical behavior.) s_v[tid*K+k] / s_i[tid*K+k] index manually.
+    extern __shared__ float s_raw[];
+    float* s_v = s_raw;
+    int*   s_i = reinterpret_cast<int*>(s_raw + (size_t)blockDim.x * K);
     #pragma unroll
     for (int k = 0; k < K; k++) {
-        s_v[threadIdx.x][k] = my_v[k];
-        s_i[threadIdx.x][k] = my_i[k];
+        s_v[threadIdx.x * K + k] = my_v[k];
+        s_i[threadIdx.x * K + k] = my_i[k];
     }
     __syncthreads();
 
@@ -1003,8 +1009,8 @@ __global__ void argmax_topk_half_kernel(const half* __restrict__ logits,
             float b_v[K]; int b_i[K];
             #pragma unroll
             for (int k = 0; k < K; k++) {
-                a_v[k] = s_v[threadIdx.x][k];           a_i[k] = s_i[threadIdx.x][k];
-                b_v[k] = s_v[threadIdx.x + stride][k];  b_i[k] = s_i[threadIdx.x + stride][k];
+                a_v[k] = s_v[threadIdx.x * K + k];            a_i[k] = s_i[threadIdx.x * K + k];
+                b_v[k] = s_v[(threadIdx.x + stride) * K + k]; b_i[k] = s_i[(threadIdx.x + stride) * K + k];
             }
             float m_v[K]; int m_i[K];
             int ai = 0, bi = 0;
@@ -1018,8 +1024,8 @@ __global__ void argmax_topk_half_kernel(const half* __restrict__ logits,
             }
             #pragma unroll
             for (int k = 0; k < K; k++) {
-                s_v[threadIdx.x][k] = m_v[k];
-                s_i[threadIdx.x][k] = m_i[k];
+                s_v[threadIdx.x * K + k] = m_v[k];
+                s_i[threadIdx.x * K + k] = m_i[k];
             }
         }
         __syncthreads();
@@ -1028,8 +1034,8 @@ __global__ void argmax_topk_half_kernel(const half* __restrict__ logits,
     if (threadIdx.x == 0) {
         #pragma unroll
         for (int k = 0; k < K; k++) {
-            out_ids[k] = s_i[0][k];
-            if (out_logits) out_logits[k] = s_v[0][k];
+            out_ids[k] = s_i[k];
+            if (out_logits) out_logits[k] = s_v[k];
         }
     }
 }
