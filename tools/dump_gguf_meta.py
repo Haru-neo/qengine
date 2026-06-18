@@ -44,6 +44,31 @@ def main():
         s = str(v)
         print("%s = %s" % (k, s if len(s) <= 70 else s[:70] + "..."))
 
+    # Optional tensor-table dump: `dump_gguf_meta.py model.gguf tensors`.
+    # The tensor infos follow the KV section: name, n_dims(u32), dims[n_dims]
+    # (u64), type(u32), offset(u64). Lets us compare tensor shapes/types
+    # between two GGUFs (e.g. a metadata-light repack vs the deployed file)
+    # when the arch metadata matches but a load-time divide still trips.
+    want_tensors = len(sys.argv) > 2 and sys.argv[2] == "tensors"
+    if want_tensors:
+        print("\n==== tensor table (%d tensors) ====" % n_tensors)
+        GGML_TYPE = {0:"F32",1:"F16",8:"Q8_0",2:"Q4_0",12:"Q4_K",14:"Q6_K"}
+        rows = []
+        for _ in range(n_tensors):
+            tn = rd_str()
+            nd, = struct.unpack('<I', f.read(4))
+            dims = [struct.unpack('<Q', f.read(8))[0] for _ in range(nd)]
+            tt, = struct.unpack('<I', f.read(4))
+            off, = struct.unpack('<Q', f.read(8))
+            rows.append((tn, dims, tt))
+        # Print blk.0 + blk.64 (MTP) + non-blk tensors in full; summarize the rest.
+        def show(tn): return tn.startswith("blk.0.") or tn.startswith("blk.64.") or not tn.startswith("blk.")
+        for tn, dims, tt in rows:
+            if show(tn):
+                print("  %-44s %-5s %s" % (tn, GGML_TYPE.get(tt, "t%d"%tt), dims))
+        print("  ... (%d blk.1..63 tensors elided)" % sum(1 for tn,_,_ in rows if not show(tn)))
+        return 0
+
     arch = meta.get("general.architecture", "?")
     print("\n==== engine-critical arch keys (missing -> 0 -> SIGFPE) ====")
     crit = ["embedding_length", "block_count", "attention.head_count",
