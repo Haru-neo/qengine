@@ -12,17 +12,55 @@
 #include "quant_gemv.cuh"  // for q8_0_repack_kernel and block_q8_0_aligned
 #include <cstdlib>
 
-// Optional unified-memory (managed) weight allocation, for running on a GPU whose
-// VRAM is smaller than the model (e.g. 24GB RTX 4090 with a 28GB Q8_0 model — used
-// for FAITHFUL fast KV extraction: the deployment engine itself on Ada, no llama drift).
-// Enable with env QENGINE_UM_OFFLOAD=1. cudaMallocManaged + PreferredLocation=device
-// oversubscribes: ~24GB stays resident, the excess pages in/out over PCIe on demand
-// (negligible vs the O(n^2) attention cost of a one-shot extract). Default (env unset)
-// uses plain cudaMalloc, so CMP / multi-GPU runs are completely unaffected.
+// Optional weight offload for running on a GPU whose VRAM is smaller than the
+// model (e.g. 24GB RTX 4090 with a 28GB Q8_0 model — used for FAITHFUL fast KV
+// extraction: the deployment engine itself on Ada, no llama drift).
+// Enable with env QENGINE_UM_OFFLOAD=1.
+//
+// HYBRID DEVICE-FIRST PLACEMENT. We deliberately do NOT rely on unified-memory
+// demand paging to keep the hot set in VRAM: on WSL2 the GPU-PV path has no HMM
+// page migration and cudaMemAdvise(PreferredLocation=device) is a silent no-op,
+// so a pure-cudaMallocManaged scheme leaves the WHOLE model first-touched in
+// host RAM at load time (memcpy populates host pages) and never migrates — the
+// GPU then reads every weight over PCIe. Instead we place weights in real device
+// memory (cudaMalloc) up to a VRAM budget, and only spill the overflow to managed
+// memory (host-resident on WSL2, still device-accessible over PCIe). That makes
+// "fill VRAM, then spill to RAM" deterministic on both WSL2 and native Linux.
+//
+// Budget = (free VRAM at first alloc) - reserve, where reserve (default 4 GB,
+// override QENGINE_UM_RESERVE_MB) leaves headroom for the KV cache + activation
+// scratch allocated AFTER the weights. Default (env unset) uses plain cudaMalloc,
+// so CMP / multi-GPU runs are completely unaffected.
+static std::mutex qe_um_mtx;
+static size_t qe_dev_used = 0, qe_dev_budget = 0;
+static int qe_um_init = 0;
+static std::unordered_map<void*, size_t> qe_dev_map;  // device-resident alloc sizes
+
 static inline cudaError_t qe_weight_alloc(void** p, size_t bytes) {
     static int um = -1;
     if (um < 0) um = getenv("QENGINE_UM_OFFLOAD") ? 1 : 0;
     if (!um) return cudaMalloc(p, bytes);
+
+    std::lock_guard<std::mutex> lk(qe_um_mtx);
+    if (!qe_um_init) {
+        qe_um_init = 1;
+        size_t freeb = 0, totb = 0;
+        cudaMemGetInfo(&freeb, &totb);
+        size_t reserve = (size_t)4096 << 20;
+        if (const char* r = getenv("QENGINE_UM_RESERVE_MB")) reserve = (size_t)atoll(r) << 20;
+        qe_dev_budget = (freeb > reserve) ? (freeb - reserve) : 0;
+        fprintf(stderr,
+            "[UM offload] hybrid placement: VRAM free=%.2f GB, reserve=%.2f GB, "
+            "device weight budget=%.2f GB (overflow -> host RAM over PCIe)\n",
+            freeb / 1e9, reserve / 1e9, qe_dev_budget / 1e9);
+    }
+    // Device-resident while it fits; fall back to managed (host on WSL2) on
+    // budget exhaustion or a genuine cudaMalloc OOM near the edge.
+    if (qe_dev_used + bytes <= qe_dev_budget) {
+        cudaError_t e = cudaMalloc(p, bytes);
+        if (e == cudaSuccess) { qe_dev_used += bytes; qe_dev_map[*p] = bytes; return e; }
+        cudaGetLastError();  // clear sticky OOM, spill this one to managed
+    }
     cudaError_t e = cudaMallocManaged(p, bytes);
     if (e == cudaSuccess) {
         int dev = 0; cudaGetDevice(&dev);
@@ -30,6 +68,19 @@ static inline cudaError_t qe_weight_alloc(void** p, size_t bytes) {
         cudaMemAdvise(*p, bytes, cudaMemAdviseSetAccessedBy, dev);
     }
     return e;
+}
+
+// Free a buffer allocated by qe_weight_alloc, keeping the device budget exact.
+// Only the load-time Q8_0 repack frees during the budget-sensitive phase (it
+// drops the 34 B/block staging tensor after producing the 36 B/block one);
+// teardown frees happen at exit where accounting no longer matters.
+static inline void qe_weight_free(void* p) {
+    if (p) {
+        std::lock_guard<std::mutex> lk(qe_um_mtx);
+        auto it = qe_dev_map.find(p);
+        if (it != qe_dev_map.end()) { qe_dev_used -= it->second; qe_dev_map.erase(it); }
+    }
+    cudaFree(p);
 }
 
 struct GPUTensor {
@@ -256,7 +307,7 @@ struct GPUModel {
                     int rb = (n_blocks + rt - 1) / rt;
                     q8_0_repack_kernel<<<rb, rt, 0, stream>>>(gt.data, repacked, n_blocks);
                     cudaStreamSynchronize(stream);
-                    cudaFree(gt.data);
+                    qe_weight_free(gt.data);
                     gt.data = repacked;
                     gt.byte_size = new_bytes;
                 }
