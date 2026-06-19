@@ -3947,9 +3947,13 @@ struct QwenModel {
                 static bool fast_attr_set[16] = {false};
                 int cur_dev_f = 0; cudaGetDevice(&cur_dev_f);
                 if (cur_dev_f >= 0 && cur_dev_f < 16 && !fast_attr_set[cur_dev_f]) {
-                    cudaFuncSetAttribute(
+                    cudaError_t ae = cudaFuncSetAttribute(
                         (const void*)gdn_fast_recurrence,
                         cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
+                    if (ae != cudaSuccess) {
+                        fprintf(stderr, "[gdn-fast] FATAL cudaFuncSetAttribute(96KB) "
+                                "dev=%d L%d: %s\n", cur_dev_f, layer, cudaGetErrorString(ae));
+                    }
                     fast_attr_set[cur_dev_f] = true;
                 }
                 gdn_fast_recurrence<<<num_v, threads, fast_smem, stream>>>(
@@ -3957,6 +3961,22 @@ struct QwenModel {
                     gb.fast_attn, gb.fast_g, gb.fast_beta,
                     rec_state_slot, gb.chunk_core_out,
                     n_tokens, num_k, num_v, k_dim, v_dim);
+                // Opt-in immediate fault localization (GDN_FAST_CHECK=1): the
+                // three fast kernels run async on `stream`, so a fault (OOB,
+                // SMEM-too-large launch failure) otherwise only surfaces at the
+                // post-sequence cudaDeviceSynchronize with no kernel/layer
+                // attribution. Syncing here on first failure pinpoints it.
+                static const bool fast_check = getenv("GDN_FAST_CHECK") != nullptr;
+                if (fast_check) {
+                    cudaError_t se = cudaStreamSynchronize(stream);
+                    cudaError_t le = cudaGetLastError();
+                    if (se != cudaSuccess || le != cudaSuccess) {
+                        fprintf(stderr, "[gdn-fast] FAULT dev=%d L%d n_tokens=%d "
+                                "fast_smem=%d sync=%s last=%s\n",
+                                cur_dev_f, layer, n_tokens, fast_smem,
+                                cudaGetErrorString(se), cudaGetErrorString(le));
+                    }
+                }
             } else {
             static bool smem_attr_set[16] = {false};
             int cur_dev = 0; cudaGetDevice(&cur_dev);
