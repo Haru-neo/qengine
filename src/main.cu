@@ -1011,6 +1011,60 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
         cudaMallocHost(&host_chunk_transfer, (size_t)CHUNK * H * sizeof(float));
         std::vector<half> host_C;
 
+        // ── UM-offload weight prefetch arena ──────────────────────────────
+        // Under QENGINE_UM_OFFLOAD the model overflows VRAM into managed host
+        // RAM. The chunked GEMMs reuse each weight only across a 128-token tile,
+        // so a host-resident weight is re-fetched over PCIe once per 128 tokens
+        // — on WSL2 (~1 GB/s host) that caps prefill at ~11 tok/s regardless of
+        // chunk size. Stage each layer's host tensors into a VRAM arena ONCE per
+        // chunk (a single bulk H2D), then the GEMMs read VRAM and reuse across
+        // ALL chunk_n tokens. Sized to the largest per-layer host footprint.
+        const bool um_off = getenv("QENGINE_UM_OFFLOAD") != nullptr;
+        void*  wp_arena = nullptr;
+        size_t wp_arena_bytes = 0;
+        if (um_off) {
+            char pfx[32];
+            for (int l = 0; l < n_layers; l++) {
+                snprintf(pfx, sizeof(pfx), "blk.%d.", l);
+                size_t lb = 0;
+                for (auto& kv : gpu_model.tensors)
+                    if (kv.first.compare(0, strlen(pfx), pfx) == 0 && kv.second.on_host)
+                        lb += (kv.second.byte_size + 255) & ~255ull;
+                if (lb > wp_arena_bytes) wp_arena_bytes = lb;
+            }
+            if (wp_arena_bytes > 0) {
+                cudaSetDevice(0);
+                cudaError_t ae = cudaMalloc(&wp_arena, wp_arena_bytes);
+                if (ae != cudaSuccess) {
+                    fprintf(stderr, "[prefetch] arena %.0f MB alloc failed: %s — running without prefetch (slow)\n",
+                            wp_arena_bytes / 1e6, cudaGetErrorString(ae));
+                    wp_arena = nullptr;
+                } else {
+                    printf("[prefetch] UM weight arena: %.0f MB/layer staged host->VRAM per chunk\n",
+                           wp_arena_bytes / 1e6);
+                }
+            }
+        }
+        struct SavedWP { GPUTensor* t; void* orig; };
+        std::vector<SavedWP> wp_saved;
+        auto wp_prefetch = [&](int layer, cudaStream_t s) {
+            if (!wp_arena) return;
+            wp_saved.clear();
+            char pfx[32]; snprintf(pfx, sizeof(pfx), "blk.%d.", layer);
+            size_t off = 0; uint8_t* base = (uint8_t*)wp_arena;
+            for (auto& kv : gpu_model.tensors) {
+                if (kv.first.compare(0, strlen(pfx), pfx) != 0) continue;
+                GPUTensor& gt = kv.second;
+                if (!gt.on_host) continue;
+                off = (off + 255) & ~255ull;
+                cudaMemcpyAsync(base + off, gt.data, gt.byte_size, cudaMemcpyDefault, s);
+                wp_saved.push_back({&gt, gt.data});
+                gt.data = base + off;          // redirect GEMMs to the VRAM copy
+                off += gt.byte_size;
+            }
+        };
+        auto wp_restore = [&]() { for (auto& sp : wp_saved) sp.t->data = sp.orig; };
+
         // KD (DFLASH_EXTRACT_TGT): per-chunk scratch on last_gpu to compute the
         // 27B greedy argmax (same out_norm + lm_head + argmax the serve path uses)
         // from each chunk's post-final-layer hidden, plus a per-seq host buffer.
@@ -1080,6 +1134,9 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
                     } else {
                         cudaSetDevice(g);
                     }
+                    // Stage this layer's host-resident weights into VRAM (once
+                    // per chunk) on the default stream, ordered before the GEMMs.
+                    wp_prefetch(layer, 0);
                     bool is_attn = model.is_attn_layer(layer);
                     if (is_attn) model.forward_attn_chunk(layer, h_chunk, chunk_pos, chunk_n, 0);
                     else         model.forward_gdn_chunk (layer, h_chunk, chunk_n, 0, /*slot=*/0, chunk_pos);
@@ -1087,6 +1144,10 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
                     else                           model.forward_mlp_chunk(layer, h_chunk, chunk_n, 0);
                     if (!extract_kv)  // C-record capture unused in KV-extract mode
                         model.dflash_capture_chunk(layer, h_chunk, chunk_pos, chunk_n, g, 0);
+                    // Pointers restored on the host side; the GEMMs above already
+                    // captured the arena addresses, and the next layer's prefetch
+                    // is stream-ordered after them so the arena isn't clobbered early.
+                    wp_restore();
                 }
                 cudaSetDevice(last_gpu); cudaDeviceSynchronize();
                 // KD: h_chunk now holds the post-final-layer hidden for these

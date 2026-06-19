@@ -36,6 +36,14 @@ static size_t qe_dev_used = 0, qe_dev_budget = 0;
 static int qe_um_init = 0;
 static std::unordered_map<void*, size_t> qe_dev_map;  // device-resident alloc sizes
 
+// True if p was placed in real device VRAM (cudaMalloc), false if it landed in
+// managed host memory (the UM-offload overflow). Used by the extract path to
+// decide which weights need per-chunk prefetch into a VRAM arena.
+static inline bool qe_is_device_ptr(void* p) {
+    std::lock_guard<std::mutex> lk(qe_um_mtx);
+    return qe_dev_map.count(p) > 0;
+}
+
 static inline cudaError_t qe_weight_alloc(void** p, size_t bytes) {
     static int um = -1;
     if (um < 0) um = getenv("QENGINE_UM_OFFLOAD") ? 1 : 0;
@@ -85,6 +93,7 @@ static inline void qe_weight_free(void* p) {
 
 struct GPUTensor {
     void* data = nullptr;
+    bool on_host = false;   // UM-offload: data lives in managed host RAM, not VRAM
     int gpu_id = -1;
     ggml_type type;
     uint64_t dims[4];
@@ -312,6 +321,9 @@ struct GPUModel {
                     gt.byte_size = new_bytes;
                 }
 
+                // Tag final placement (post-repack) so the extract path knows
+                // which tensors to prefetch from host into a VRAM arena.
+                gt.on_host = !qe_is_device_ptr(gt.data);
                 per_gpu_tensors[gpu_id][name] = gt;
                 local_bytes += gt.byte_size;
             }
