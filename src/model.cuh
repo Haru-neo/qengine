@@ -96,12 +96,12 @@ struct LayerBuffers {
     half* mlp_down;      // [hidden_size]
     half* residual;      // [hidden_size]
 
-    // Chunked prefill MLP buffers (token-major, [CHUNK_SIZE * dim]).
+    // Chunked prefill MLP buffers (token-major, [chunk_cap * dim]).
     // Allocated lazily on first chunked prefill.
-    half* mlp_chunk_norm = nullptr;  // [CHUNK_SIZE * H]  RMSNorm output
-    half* mlp_chunk_gate = nullptr;  // [CHUNK_SIZE * I]  ffn_gate proj
-    half* mlp_chunk_up   = nullptr;  // [CHUNK_SIZE * I]  ffn_up proj
-    half* mlp_chunk_down = nullptr;  // [CHUNK_SIZE * H]  ffn_down proj
+    half* mlp_chunk_norm = nullptr;  // [chunk_cap * H]  RMSNorm output
+    half* mlp_chunk_gate = nullptr;  // [chunk_cap * I]  ffn_gate proj
+    half* mlp_chunk_up   = nullptr;  // [chunk_cap * I]  ffn_up proj
+    half* mlp_chunk_down = nullptr;  // [chunk_cap * H]  ffn_down proj
 };
 
 // ============ Spec-prefill LoRA merge (SPEC_LORA=<file>) ==================
@@ -392,14 +392,14 @@ struct QwenModel {
     int*   moe_ids_host[4] = {}; // pinned [topk]
     float* moe_w_host[4] = {};   // pinned [topk]
     QuantInput gpu_qi_moe_g[4];  // quantizer for [topk * moe_intermediate]
-    // Batched chunk-prefill MoE scratch (sized CHUNK_SIZE × topk × dims).
-    half*  moe_norm_c[4]  = {};  // [CHUNK_SIZE * H] batched norm output
-    float* moe_logits_c[4]= {};  // [CHUNK_SIZE * num_experts]
-    int*   moe_ids_c[4]   = {};  // [CHUNK_SIZE * topk]
-    float* moe_w_c[4]     = {};  // [CHUNK_SIZE * topk]
-    half*  moe_gate_cg[4] = {};  // [CHUNK_SIZE * topk * moe_intermediate]
-    half*  moe_up_cg[4]   = {};  // [CHUNK_SIZE * topk * moe_intermediate]
-    half*  moe_down_cg[4] = {};  // [CHUNK_SIZE * topk * hidden]
+    // Batched chunk-prefill MoE scratch (sized chunk_cap × topk × dims).
+    half*  moe_norm_c[4]  = {};  // [chunk_cap * H] batched norm output
+    float* moe_logits_c[4]= {};  // [chunk_cap * num_experts]
+    int*   moe_ids_c[4]   = {};  // [chunk_cap * topk]
+    float* moe_w_c[4]     = {};  // [chunk_cap * topk]
+    half*  moe_gate_cg[4] = {};  // [chunk_cap * topk * moe_intermediate]
+    half*  moe_up_cg[4]   = {};  // [chunk_cap * topk * moe_intermediate]
+    half*  moe_down_cg[4] = {};  // [chunk_cap * topk * hidden]
     QuantInput gpu_qi_c[4];      // chunk norm quantizer
     QuantInput gpu_qi_cg[4];     // chunk intermediate quantizer
     bool v2_separate_qkv = false;
@@ -828,6 +828,16 @@ struct QwenModel {
         auto arch = gguf.get_str("general.architecture");
         gguf_p = &gguf;
         gguf_arch = arch;
+        // Prefill chunk capacity (default chunk_cap). Set here so every later
+        // chunk-scratch allocation (alloc_buffers / init_attn_buffers / GDN /
+        // MoE) picks it up. Clamp to [chunk_cap, 8192].
+        if (const char* e = getenv("QENGINE_PREFILL_CHUNK")) {
+            int v = atoi(e);
+            if (v < CHUNK_SIZE) v = CHUNK_SIZE;
+            if (v > 8192) v = 8192;
+            chunk_cap = v;
+            printf("[prefill] chunk_cap=%d (env QENGINE_PREFILL_CHUNK)\n", chunk_cap);
+        }
         cfg.hidden_size = gguf.get_u32(arch + ".embedding_length");
         cfg.num_layers = gguf.get_u32(arch + ".block_count");
         cfg.num_q_heads = gguf.get_u32(arch + ".attention.head_count");
@@ -884,10 +894,18 @@ struct QwenModel {
     // 128 doubles the per-chunk batched-GEMM utilisation versus the
     // original 64 (each NB=16 GEMM tile gets 8 column blocks instead of
     // 4) and amortises chunk-loop launch overhead. The chunked attention
-    // compute path internally splits CHUNK_SIZE into ATTN_NB-token
+    // compute path internally splits chunk_cap into ATTN_NB-token
     // sub-chunks (see ATTN_NB) so the value kernel's register-resident
     // accumulator stays bounded.
     static constexpr int CHUNK_SIZE = 256;
+    // Runtime prefill chunk capacity. Defaults to CHUNK_SIZE (CMP / deployment
+    // unchanged). Override with env QENGINE_PREFILL_CHUNK (256..8192) — used by
+    // the 4090 KV-extract path: with weights offloaded to host (UM), every chunk
+    // re-reads the whole model, so on WSL2 (host weight access <1 GB/s) a small
+    // chunk makes the run weight-bandwidth-bound. A bigger chunk amortises the
+    // re-read N-fold. All chunk-scratch buffers are sized to this, so it must be
+    // set (init_config reads the env) before alloc_buffers / init_attn_buffers.
+    int chunk_cap = CHUNK_SIZE;
     // Sub-chunk size used by attn_score / softmax / attn_value chunked
     // kernels. Picked so attn_value's per-thread accumulator
     // (ATTN_NB × gqa_max=8 floats) fits in registers without spill on Volta.
@@ -906,15 +924,15 @@ struct QwenModel {
         half*  fused_proj_out = nullptr;
 
         // Chunk buffers (per-token data accumulated for chunked GDN)
-        float* chunk_qkv;     // [CHUNK_SIZE * qkv_dim] FP32 conv1d outputs
-        half*  chunk_qkv_half = nullptr;  // [CHUNK_SIZE * qkv_dim] fp16 staging for batched QKV proj
-        half*  chunk_a_proj;  // [CHUNK_SIZE * num_v]
-        half*  chunk_b_proj;  // [CHUNK_SIZE * num_v]
-        half*  chunk_z_out;   // [CHUNK_SIZE * num_v * v_dim]
-        half*  chunk_core_out;// [CHUNK_SIZE * num_v * v_dim]
-        half*  chunk_normed;  // [CHUNK_SIZE * num_v * v_dim]
-        half*  chunk_proj_out;// [CHUNK_SIZE * hidden_size]
-        half*  chunk_norm_out;// [CHUNK_SIZE * hidden_size]
+        float* chunk_qkv;     // [chunk_cap * qkv_dim] FP32 conv1d outputs
+        half*  chunk_qkv_half = nullptr;  // [chunk_cap * qkv_dim] fp16 staging for batched QKV proj
+        half*  chunk_a_proj;  // [chunk_cap * num_v]
+        half*  chunk_b_proj;  // [chunk_cap * num_v]
+        half*  chunk_z_out;   // [chunk_cap * num_v * v_dim]
+        half*  chunk_core_out;// [chunk_cap * num_v * v_dim]
+        half*  chunk_normed;  // [chunk_cap * num_v * v_dim]
+        half*  chunk_proj_out;// [chunk_cap * hidden_size]
+        half*  chunk_norm_out;// [chunk_cap * hidden_size]
     };
     GDNBuffers gdn_bufs[4];
 
@@ -954,11 +972,11 @@ struct QwenModel {
             cudaMalloc(&bufs[g].mlp_down, std::max(H, I_alloc) * sizeof(half));
             cudaMalloc(&bufs[g].residual, H * sizeof(half));
 
-            // Chunked prefill MLP buffers (token-major, [CHUNK_SIZE * dim]).
-            cudaMalloc(&bufs[g].mlp_chunk_norm, (size_t)CHUNK_SIZE * H * sizeof(half));
-            cudaMalloc(&bufs[g].mlp_chunk_gate, (size_t)CHUNK_SIZE * I_alloc * sizeof(half));
-            cudaMalloc(&bufs[g].mlp_chunk_up,   (size_t)CHUNK_SIZE * I_alloc * sizeof(half));
-            cudaMalloc(&bufs[g].mlp_chunk_down, (size_t)CHUNK_SIZE * H * sizeof(half));
+            // Chunked prefill MLP buffers (token-major, [chunk_cap * dim]).
+            cudaMalloc(&bufs[g].mlp_chunk_norm, (size_t)chunk_cap * H * sizeof(half));
+            cudaMalloc(&bufs[g].mlp_chunk_gate, (size_t)chunk_cap * I_alloc * sizeof(half));
+            cudaMalloc(&bufs[g].mlp_chunk_up,   (size_t)chunk_cap * I_alloc * sizeof(half));
+            cudaMalloc(&bufs[g].mlp_chunk_down, (size_t)chunk_cap * H * sizeof(half));
 
             // GDN buffers (over-allocate for 27B max)
             int qkv_dim = 2 * 16 * 128 + 48 * 128;  // 10240
@@ -972,14 +990,14 @@ struct QwenModel {
             cudaMalloc(&gdn_bufs[g].fused_proj_out, 16480 * sizeof(half));
 
             // Chunk buffers
-            cudaMalloc(&gdn_bufs[g].chunk_qkv,      CHUNK_SIZE * qkv_dim * sizeof(float));
-            cudaMalloc(&gdn_bufs[g].chunk_a_proj,   CHUNK_SIZE * num_v_max * sizeof(half));
-            cudaMalloc(&gdn_bufs[g].chunk_b_proj,   CHUNK_SIZE * num_v_max * sizeof(half));
-            cudaMalloc(&gdn_bufs[g].chunk_z_out,    CHUNK_SIZE * v_total * sizeof(half));
-            cudaMalloc(&gdn_bufs[g].chunk_core_out, CHUNK_SIZE * v_total * sizeof(half));
-            cudaMalloc(&gdn_bufs[g].chunk_normed,   CHUNK_SIZE * v_total * sizeof(half));
-            cudaMalloc(&gdn_bufs[g].chunk_proj_out, CHUNK_SIZE * H * sizeof(half));
-            cudaMalloc(&gdn_bufs[g].chunk_norm_out, CHUNK_SIZE * H * sizeof(half));
+            cudaMalloc(&gdn_bufs[g].chunk_qkv,      chunk_cap * qkv_dim * sizeof(float));
+            cudaMalloc(&gdn_bufs[g].chunk_a_proj,   chunk_cap * num_v_max * sizeof(half));
+            cudaMalloc(&gdn_bufs[g].chunk_b_proj,   chunk_cap * num_v_max * sizeof(half));
+            cudaMalloc(&gdn_bufs[g].chunk_z_out,    chunk_cap * v_total * sizeof(half));
+            cudaMalloc(&gdn_bufs[g].chunk_core_out, chunk_cap * v_total * sizeof(half));
+            cudaMalloc(&gdn_bufs[g].chunk_normed,   chunk_cap * v_total * sizeof(half));
+            cudaMalloc(&gdn_bufs[g].chunk_proj_out, chunk_cap * H * sizeof(half));
+            cudaMalloc(&gdn_bufs[g].chunk_norm_out, chunk_cap * H * sizeof(half));
         }
     }
 
@@ -1125,10 +1143,10 @@ struct QwenModel {
         cudaMalloc(&moe_w_dev[g],   (size_t)topk * sizeof(float));
         cudaMallocHost(&moe_ids_host[g], (size_t)topk * sizeof(int));
         cudaMallocHost(&moe_w_host[g],   (size_t)topk * sizeof(float));
-        // Batched chunk-prefill scratch (CHUNK_SIZE tokens × topk experts).
-        size_t A = (size_t)CHUNK_SIZE * topk;
-        cudaMalloc(&moe_norm_c[g],   (size_t)CHUNK_SIZE * H * sizeof(half));
-        cudaMalloc(&moe_logits_c[g], (size_t)CHUNK_SIZE * E * sizeof(float));
+        // Batched chunk-prefill scratch (chunk_cap tokens × topk experts).
+        size_t A = (size_t)chunk_cap * topk;
+        cudaMalloc(&moe_norm_c[g],   (size_t)chunk_cap * H * sizeof(half));
+        cudaMalloc(&moe_logits_c[g], (size_t)chunk_cap * E * sizeof(float));
         cudaMalloc(&moe_ids_c[g],    A * sizeof(int));
         cudaMalloc(&moe_w_c[g],      A * sizeof(float));
         cudaMalloc(&moe_gate_cg[g],  A * mI * sizeof(half));
@@ -1325,7 +1343,7 @@ struct QwenModel {
             || gate_exps->type != GGML_TYPE_Q8_0 || up_exps->type != GGML_TYPE_Q8_0
             || down_exps->type != GGML_TYPE_Q8_0)
             return false;
-        if (N > CHUNK_SIZE) return false;
+        if (N > chunk_cap) return false;
 
         // 1. Batched RMSNorm + quantize (token-major).
         auto* norm_w = t(blk(layer, "post_attention_norm.weight"));
@@ -1555,15 +1573,15 @@ struct QwenModel {
         half* attn_out;     // [num_q * head_dim]
         // Chunked-prefill staging: batched Q/K/V projection outputs.
         // Allocated lazily on first chunked attn forward.
-        half* attn_chunk_q = nullptr;   // [CHUNK_SIZE * q_out_dim]  raw QKV proj output
-        half* attn_chunk_k = nullptr;   // [CHUNK_SIZE * kv_dim]
-        half* attn_chunk_v = nullptr;   // [CHUNK_SIZE * kv_dim]
+        half* attn_chunk_q = nullptr;   // [chunk_cap * q_out_dim]  raw QKV proj output
+        half* attn_chunk_k = nullptr;   // [chunk_cap * kv_dim]
+        half* attn_chunk_v = nullptr;   // [chunk_cap * kv_dim]
         // Chunked-attention compute scratch:
-        half*  attn_chunk_q_post = nullptr;  // [CHUNK_SIZE * num_q * head_dim] post deinterleave + head_rms + RoPE
-        half*  attn_chunk_gate   = nullptr;  // [CHUNK_SIZE * num_q * head_dim] gate slice from QKV
+        half*  attn_chunk_q_post = nullptr;  // [chunk_cap * num_q * head_dim] post deinterleave + head_rms + RoPE
+        half*  attn_chunk_gate   = nullptr;  // [chunk_cap * num_q * head_dim] gate slice from QKV
         float* attn_chunk_scores = nullptr;  // [ATTN_NB * num_q * max_seq] softmax scratch (sub-chunk reuse)
-        half*  attn_chunk_out    = nullptr;  // [CHUNK_SIZE * num_q * head_dim] V-weighted output
-        half*  attn_chunk_oproj  = nullptr;  // [CHUNK_SIZE * H] o_proj output staging
+        half*  attn_chunk_out    = nullptr;  // [chunk_cap * num_q * head_dim] V-weighted output
+        half*  attn_chunk_oproj  = nullptr;  // [chunk_cap * H] o_proj output staging
         // Split-K FA scratch (lazy-alloc when FA_SK env opts in, sized for
         // K_SPLITS_MAX=8). Layouts: [num_q, ATTN_NB, K_SPLITS_MAX] for m/l,
         // [num_q, ATTN_NB, K_SPLITS_MAX, HD] for o (fp32 to keep merge bit-stable
@@ -3162,7 +3180,7 @@ struct QwenModel {
         std::lock_guard<std::mutex> lk(prefix_caches_mu);
         PrefixSnapshot& pc = prefix_caches[slot];
         if (requested_cached <= 0 || !pc.valid) return 0;
-        int N = (requested_cached / CHUNK_SIZE) * CHUNK_SIZE;
+        int N = (requested_cached / chunk_cap) * chunk_cap;
         if (N <= 0 || N != pc.n_pos) return 0;
         if (N > (int)prompt_tokens.size()) return 0;
         for (int i = 0; i < N; i++) {
@@ -3792,7 +3810,7 @@ struct QwenModel {
             //
             //    Allocate a dedicated fp16 staging if not already there.
             if (!gb.chunk_qkv_half) {
-                cudaMalloc(&gb.chunk_qkv_half, (size_t)CHUNK_SIZE * qkv_dim * sizeof(half));
+                cudaMalloc(&gb.chunk_qkv_half, (size_t)chunk_cap * qkv_dim * sizeof(half));
             }
 
             quant_gemv_chunk(qkv_w->data, qkv_w->type,
@@ -3855,7 +3873,7 @@ struct QwenModel {
         {
             int kw = 4;
             if (!gb.chunk_qkv_half) {
-                cudaMalloc(&gb.chunk_qkv_half, (size_t)CHUNK_SIZE * qkv_dim * sizeof(half));
+                cudaMalloc(&gb.chunk_qkv_half, (size_t)chunk_cap * qkv_dim * sizeof(half));
             }
             int n_elem = n_tokens * qkv_dim;
             float_to_half_kernel<<<(n_elem + 255) / 256, 256, 0, stream>>>(
@@ -4010,7 +4028,7 @@ struct QwenModel {
 
         // 3. Batched Q/K/V + Z + alpha + beta projections.
         if (!gb.chunk_qkv_half) {
-            cudaMalloc(&gb.chunk_qkv_half, (size_t)CHUNK_SIZE * qkv_dim * sizeof(half));
+            cudaMalloc(&gb.chunk_qkv_half, (size_t)chunk_cap * qkv_dim * sizeof(half));
         }
         quant_gemv_chunk(qkv_w->data, qkv_w->type, gpu_qi[g].q8_buf,
                          gb.chunk_qkv_half, H, qkv_dim, n_tokens, stream);
@@ -4281,14 +4299,14 @@ struct QwenModel {
 
         // Lazy alloc the chunk buffers if forward_attn_chunk hasn't yet.
         if (!ab.attn_chunk_q) {
-            cudaMalloc(&ab.attn_chunk_q,        (size_t)CHUNK_SIZE * q_out_dim * sizeof(half));
-            cudaMalloc(&ab.attn_chunk_k,        (size_t)CHUNK_SIZE * kv_dim    * sizeof(half));
-            cudaMalloc(&ab.attn_chunk_v,        (size_t)CHUNK_SIZE * kv_dim    * sizeof(half));
-            cudaMalloc(&ab.attn_chunk_q_post,   (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
-            cudaMalloc(&ab.attn_chunk_gate,     (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_q,        (size_t)chunk_cap * q_out_dim * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_k,        (size_t)chunk_cap * kv_dim    * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_v,        (size_t)chunk_cap * kv_dim    * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_q_post,   (size_t)chunk_cap * total_qg  * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_gate,     (size_t)chunk_cap * total_qg  * sizeof(half));
             cudaMalloc(&ab.attn_chunk_scores,   (size_t)ATTN_NB * num_q * kv_max_seq * sizeof(float));
-            cudaMalloc(&ab.attn_chunk_out,      (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
-            cudaMalloc(&ab.attn_chunk_oproj,    (size_t)CHUNK_SIZE * H         * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_out,      (size_t)chunk_cap * total_qg  * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_oproj,    (size_t)chunk_cap * H         * sizeof(half));
             constexpr int K_SPLITS_MAX = 16;
             cudaMalloc(&ab.attn_split_m, (size_t)num_q * ATTN_NB * K_SPLITS_MAX * sizeof(float));
             cudaMalloc(&ab.attn_split_l, (size_t)num_q * ATTN_NB * K_SPLITS_MAX * sizeof(float));
@@ -4612,7 +4630,7 @@ struct QwenModel {
 
         // 2. Batched projections — qkv (largest), gate, alpha, beta
         if (!gb.chunk_qkv_half) {
-            cudaMalloc(&gb.chunk_qkv_half, (size_t)CHUNK_SIZE * qkv_dim * sizeof(half));
+            cudaMalloc(&gb.chunk_qkv_half, (size_t)chunk_cap * qkv_dim * sizeof(half));
         }
         quant_gemv_chunk(qkv_w->data, qkv_w->type, gpu_qi[g].q8_buf,
                          gb.chunk_qkv_half, H, qkv_dim, N, stream);
@@ -4736,14 +4754,14 @@ struct QwenModel {
 
         // Lazy alloc per-GPU chunked attention buffers.
         if (!ab.attn_chunk_q) {
-            cudaMalloc(&ab.attn_chunk_q,        (size_t)CHUNK_SIZE * q_out_dim * sizeof(half));
-            cudaMalloc(&ab.attn_chunk_k,        (size_t)CHUNK_SIZE * kv_dim    * sizeof(half));
-            cudaMalloc(&ab.attn_chunk_v,        (size_t)CHUNK_SIZE * kv_dim    * sizeof(half));
-            cudaMalloc(&ab.attn_chunk_q_post,   (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
-            cudaMalloc(&ab.attn_chunk_gate,     (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_q,        (size_t)chunk_cap * q_out_dim * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_k,        (size_t)chunk_cap * kv_dim    * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_v,        (size_t)chunk_cap * kv_dim    * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_q_post,   (size_t)chunk_cap * total_qg  * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_gate,     (size_t)chunk_cap * total_qg  * sizeof(half));
             cudaMalloc(&ab.attn_chunk_scores,   (size_t)ATTN_NB * num_q * kv_max_seq * sizeof(float));
-            cudaMalloc(&ab.attn_chunk_out,      (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
-            cudaMalloc(&ab.attn_chunk_oproj,    (size_t)CHUNK_SIZE * H         * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_out,      (size_t)chunk_cap * total_qg  * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_oproj,    (size_t)chunk_cap * H         * sizeof(half));
             constexpr int K_SPLITS_MAX = 16;
             cudaMalloc(&ab.attn_split_m, (size_t)num_q * ATTN_NB * K_SPLITS_MAX * sizeof(float));
             cudaMalloc(&ab.attn_split_l, (size_t)num_q * ATTN_NB * K_SPLITS_MAX * sizeof(float));
@@ -5061,8 +5079,8 @@ struct QwenModel {
             half*  q_post_sub = ab.attn_chunk_q_post + (size_t)sub_processed * total_qg;
             // Per-sub-chunk score scratch: sub-chunks are processed sequentially
             // and never read each other's scores, so reuse the same ATTN_NB-row
-            // window (offset 0) instead of a CHUNK_SIZE-row slab. At 256K ctx the
-            // old CHUNK_SIZE sizing was 4.3 GB/GPU (num_q*kv_max_seq*256*4) which
+            // window (offset 0) instead of a chunk_cap-row slab. At 256K ctx the
+            // old chunk_cap sizing was 4.3 GB/GPU (num_q*kv_max_seq*256*4) which
             // overcommitted 16 GB cards on the smaller-hidden A3B model and
             // silently zeroed the hidden state.
             float* scores_sub = ab.attn_chunk_scores;
@@ -5204,11 +5222,11 @@ struct QwenModel {
                                        (size_t)num_kv * n_blocks_max * HD * sizeof(half));
                         }
                         if (!ab.sparse_block_index) {
-                            // CHUNK_SIZE rows (was ATTN_NB): the hoisted builder
+                            // chunk_cap rows (was ATTN_NB): the hoisted builder
                             // writes all n_tokens query rows once per chunk. Also
                             // >= any decode batch that shares this buffer.
                             cudaMalloc(&ab.sparse_block_index,
-                                       (size_t)num_kv * CHUNK_SIZE * topk_cap * sizeof(int));
+                                       (size_t)num_kv * chunk_cap * topk_cap * sizeof(int));
                         }
                         // Launch-error tripwire. After every sparse kernel we
                         // peek at the last error so a fault that surfaces on
@@ -5289,7 +5307,7 @@ struct QwenModel {
                                     check_launch("build_k_pool_max");
                                 }
                                 // block_index for ALL n_tokens queries; grid
-                                // (num_kv, n_tokens), row stride = CHUNK_SIZE,
+                                // (num_kv, n_tokens), row stride = chunk_cap,
                                 // start_pos = chunk start. ab.attn_chunk_q_post
                                 // holds the whole chunk's post-RoPE queries.
                                 dim3 bi_grid(num_kv, n_tokens);
@@ -5298,21 +5316,21 @@ struct QwenModel {
                                     if (num_q == 24)
                                         build_block_index_ms_kern<HD, 6, BLOCK_THR><<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
                                             ab.attn_chunk_q_post, ab.sparse_k_pool, ab.sparse_k_pool_max, ab.sparse_block_index,
-                                            num_q, num_kv, n_tokens, CHUNK_SIZE, start_pos, top_k, BLOCK_N, n_blocks_pool, n_blocks_pool, ms_beta);
+                                            num_q, num_kv, n_tokens, chunk_cap, start_pos, top_k, BLOCK_N, n_blocks_pool, n_blocks_pool, ms_beta);
                                     else
                                         build_block_index_ms_kern<HD, 4, BLOCK_THR><<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
                                             ab.attn_chunk_q_post, ab.sparse_k_pool, ab.sparse_k_pool_max, ab.sparse_block_index,
-                                            num_q, num_kv, n_tokens, CHUNK_SIZE, start_pos, top_k, BLOCK_N, n_blocks_pool, n_blocks_pool, ms_beta);
+                                            num_q, num_kv, n_tokens, chunk_cap, start_pos, top_k, BLOCK_N, n_blocks_pool, n_blocks_pool, ms_beta);
                                     check_launch("build_block_index_ms[hoist]");
                                 } else if (num_q == 24) {
                                     build_block_index_kern<HD, 6, BLOCK_THR><<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
                                         ab.attn_chunk_q_post, ab.sparse_k_pool, ab.sparse_block_index,
-                                        num_q, num_kv, n_tokens, CHUNK_SIZE, start_pos, top_k, BLOCK_N, n_blocks_pool);
+                                        num_q, num_kv, n_tokens, chunk_cap, start_pos, top_k, BLOCK_N, n_blocks_pool);
                                     check_launch("build_block_index<6>[hoist]");
                                 } else {
                                     build_block_index_kern<HD, 4, BLOCK_THR><<<bi_grid, BLOCK_THR, bi_smem, stream>>>(
                                         ab.attn_chunk_q_post, ab.sparse_k_pool, ab.sparse_block_index,
-                                        num_q, num_kv, n_tokens, CHUNK_SIZE, start_pos, top_k, BLOCK_N, n_blocks_pool);
+                                        num_q, num_kv, n_tokens, chunk_cap, start_pos, top_k, BLOCK_N, n_blocks_pool);
                                     check_launch("build_block_index<4>[hoist]");
                                 }
                                 sparse_pool_built = 1;
@@ -5398,10 +5416,10 @@ struct QwenModel {
                         }
                         if (g_profile_attn) g_attn_score_ms += pa_sync_ms(tb0);
                         // block_index layout: BLOCK/BLOCK_MS build it whole-chunk
-                        // (stride CHUNK_SIZE, this sub-chunk's rows at sub_processed);
+                        // (stride chunk_cap, this sub-chunk's rows at sub_processed);
                         // VS/A_SHAPE still build per-sub-chunk (stride ATTN_NB, rows 0..).
                         int fa_bi_base   = (layer_pattern == SPARSE_BLOCK || layer_pattern == SPARSE_BLOCK_MS) ? sub_processed : 0;
-                        int fa_bi_stride = (layer_pattern == SPARSE_BLOCK || layer_pattern == SPARSE_BLOCK_MS) ? CHUNK_SIZE : ATTN_NB;
+                        int fa_bi_stride = (layer_pattern == SPARSE_BLOCK || layer_pattern == SPARSE_BLOCK_MS) ? chunk_cap : ATTN_NB;
                         auto launch_sp = [&](auto gqa_const, auto k_const) {
                             constexpr int GQA = decltype(gqa_const)::value;
                             constexpr int K   = decltype(k_const)::value;
@@ -5839,14 +5857,14 @@ struct QwenModel {
         // Lazy alloc — identical shapes to forward_attn_chunk (shared buffers,
         // either function may run first).
         if (!ab.attn_chunk_q) {
-            cudaMalloc(&ab.attn_chunk_q,        (size_t)CHUNK_SIZE * q_out_dim * sizeof(half));
-            cudaMalloc(&ab.attn_chunk_k,        (size_t)CHUNK_SIZE * kv_dim    * sizeof(half));
-            cudaMalloc(&ab.attn_chunk_v,        (size_t)CHUNK_SIZE * kv_dim    * sizeof(half));
-            cudaMalloc(&ab.attn_chunk_q_post,   (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
-            cudaMalloc(&ab.attn_chunk_gate,     (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_q,        (size_t)chunk_cap * q_out_dim * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_k,        (size_t)chunk_cap * kv_dim    * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_v,        (size_t)chunk_cap * kv_dim    * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_q_post,   (size_t)chunk_cap * total_qg  * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_gate,     (size_t)chunk_cap * total_qg  * sizeof(half));
             cudaMalloc(&ab.attn_chunk_scores,   (size_t)ATTN_NB * num_q * kv_max_seq * sizeof(float));
-            cudaMalloc(&ab.attn_chunk_out,      (size_t)CHUNK_SIZE * total_qg  * sizeof(half));
-            cudaMalloc(&ab.attn_chunk_oproj,    (size_t)CHUNK_SIZE * H         * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_out,      (size_t)chunk_cap * total_qg  * sizeof(half));
+            cudaMalloc(&ab.attn_chunk_oproj,    (size_t)chunk_cap * H         * sizeof(half));
             constexpr int K_SPLITS_MAX = 16;
             cudaMalloc(&ab.attn_split_m, (size_t)num_q * ATTN_NB * K_SPLITS_MAX * sizeof(float));
             cudaMalloc(&ab.attn_split_l, (size_t)num_q * ATTN_NB * K_SPLITS_MAX * sizeof(float));

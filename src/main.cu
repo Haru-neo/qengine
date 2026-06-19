@@ -566,7 +566,11 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
     const int V = model.cfg.vocab_size;
     const int n_layers = model.cfg.num_layers;
     const int last_gpu = gpu_model.layer_gpu[n_layers - 1];
-    constexpr int CHUNK = QwenModel::CHUNK_SIZE;
+    // Use the runtime prefill chunk (env QENGINE_PREFILL_CHUNK). On the 4090 the
+    // model is offloaded to host (UM); a bigger chunk re-reads those host weights
+    // far fewer times. model.alloc_buffers() already sized every chunk-scratch
+    // buffer to model.chunk_cap, so CHUNK must match it.
+    const int CHUNK = model.chunk_cap;
 
     // Flash attention: the other run modes (serve/eval) default this ON, but
     // run_dflash_extract never set it — so extraction silently used the slow
