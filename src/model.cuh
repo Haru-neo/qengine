@@ -2654,20 +2654,33 @@ struct QwenModel {
         kvext_k_host.assign(kvext_n_attn, nullptr);
         kvext_v_host.assign(kvext_n_attn, nullptr);
         for (int li = 0; li < kvext_n_attn; li++) {
-            cudaError_t e1 = cudaMallocHost(&kvext_k_host[li], plane_bytes);
-            cudaError_t e2 = cudaMallocHost(&kvext_v_host[li], plane_bytes);
-            if (e1 != cudaSuccess || e2 != cudaSuccess) {
-                fprintf(stderr, "[kvext] FATAL: pinned alloc failed at layer %d (%zu B/plane): %s / %s\n",
-                        li, plane_bytes, cudaGetErrorString(e1), cudaGetErrorString(e2));
+            // PAGEABLE host (malloc), NOT pinned. These planes hold a WHOLE
+            // sequence's K/V — up to ~17 GB at 256K × 16 attn layers × 2 — and
+            // are consumed only by CPU fwrite. Page-locking them is pointless and
+            // on WSL2 blows the pinned ceiling (~4 GB) long before host RAM is
+            // exhausted (that was the "pinned alloc failed" OOM at 256K). The D2H
+            // capture uses cudaMemcpyAsync into these; to pageable host that just
+            // degrades to a synchronous staged copy, which is correct (it still
+            // completes before the in-place RoPE that follows) and negligible
+            // (17 GB once vs minutes of 256K attention compute).
+            kvext_k_host[li] = (half*)malloc(plane_bytes);
+            kvext_v_host[li] = (half*)malloc(plane_bytes);
+            if (!kvext_k_host[li] || !kvext_v_host[li]) {
+                fprintf(stderr, "[kvext] FATAL: host alloc failed at layer %d (%zu B/plane): out of memory\n"
+                        "  Need ~%.0f GB pageable host for kvext staging + ~11 GB for offloaded weights.\n"
+                        "  On WSL2 raise the VM memory cap in %%UserProfile%%\\.wslconfig ([wsl2] memory=48GB)\n"
+                        "  then `wsl --shutdown` and relaunch.\n",
+                        li, plane_bytes,
+                        2.0 * kvext_n_attn * plane_bytes / 1073741824.0);
                 for (int j = 0; j <= li; j++) {
-                    if (kvext_k_host[j]) cudaFreeHost(kvext_k_host[j]);
-                    if (kvext_v_host[j]) cudaFreeHost(kvext_v_host[j]);
+                    if (kvext_k_host[j]) free(kvext_k_host[j]);
+                    if (kvext_v_host[j]) free(kvext_v_host[j]);
                 }
                 kvext_k_host.clear(); kvext_v_host.clear();
                 return;
             }
         }
-        printf("[kvext] staging %d attn layers x %lld tokens x kv_dim=%d (per-layer %.1f MB, total %.1f MB pinned)\n",
+        printf("[kvext] staging %d attn layers x %lld tokens x kv_dim=%d (per-layer %.1f MB, total %.1f MB pageable host)\n",
                kvext_n_attn, cap, kv_dim, plane_bytes / 1048576.0,
                2.0 * kvext_n_attn * plane_bytes / 1048576.0);
     }
