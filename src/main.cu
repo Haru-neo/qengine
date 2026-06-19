@@ -1024,6 +1024,13 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
         size_t wp_arena_bytes = 0;
         if (um_off) {
             char pfx[32];
+            size_t total_host = 0, total_dev = 0; int n_host = 0, n_dev = 0;
+            for (auto& kv : gpu_model.tensors) {
+                if (kv.second.on_host) { total_host += kv.second.byte_size; n_host++; }
+                else                   { total_dev  += kv.second.byte_size; n_dev++; }
+            }
+            fprintf(stderr, "[prefetch] tensor placement: %d on_host (%.0f MB), %d device (%.0f MB)\n",
+                    n_host, total_host/1e6, n_dev, total_dev/1e6);
             for (int l = 0; l < n_layers; l++) {
                 snprintf(pfx, sizeof(pfx), "blk.%d.", l);
                 size_t lb = 0;
@@ -1040,9 +1047,27 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
                             wp_arena_bytes / 1e6, cudaGetErrorString(ae));
                     wp_arena = nullptr;
                 } else {
-                    printf("[prefetch] UM weight arena: %.0f MB/layer staged host->VRAM per chunk\n",
-                           wp_arena_bytes / 1e6);
+                    fprintf(stderr, "[prefetch] UM weight arena: %.0f MB/layer staged host->VRAM per chunk\n",
+                            wp_arena_bytes / 1e6);
+                    // One-shot H2D bandwidth probe: how fast can we pull a host
+                    // tensor into the arena? This is the prefetch ceiling.
+                    for (auto& kv : gpu_model.tensors) {
+                        if (!kv.second.on_host) continue;
+                        size_t nb = std::min(kv.second.byte_size, wp_arena_bytes);
+                        cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+                        cudaMemcpy(wp_arena, kv.second.data, nb, cudaMemcpyDefault); // warm
+                        cudaEventRecord(e0);
+                        for (int r = 0; r < 5; r++) cudaMemcpy(wp_arena, kv.second.data, nb, cudaMemcpyDefault);
+                        cudaEventRecord(e1); cudaEventSynchronize(e1);
+                        float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
+                        fprintf(stderr, "[prefetch] H2D probe: %.0f MB x5 in %.1f ms = %.2f GB/s\n",
+                                nb/1e6, ms, (5.0*nb/1e9)/(ms/1e3));
+                        cudaEventDestroy(e0); cudaEventDestroy(e1);
+                        break;
+                    }
                 }
+            } else {
+                fprintf(stderr, "[prefetch] no on_host tensors found — prefetch disabled\n");
             }
         }
         struct SavedWP { GPUTensor* t; void* orig; };
