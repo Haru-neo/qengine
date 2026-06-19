@@ -345,12 +345,20 @@ struct GPUModel {
             }
         }
         
-        printf("\n=== VRAM Usage ===\n");
+        printf("\n=== Weight Memory ===\n");
         for (int g = 0; g < n_gpus; g++) {
             printf("  GPU %d: %.1f MB (%zu tensors)\n", g, gpu_bytes[g] / 1e6, gpu_tensors[g].size());
         }
-        printf("  Total: %.1f MB in %.2fs (%.1f GB/s)\n", 
+        printf("  Total: %.1f MB in %.2fs (%.1f GB/s)\n",
             total_bytes.load() / 1e6, load_secs, total_bytes.load() / 1e9 / load_secs);
+        // Under UM offload the per-GPU figure above is the SUM of tensor bytes,
+        // not device residency (the model is bigger than VRAM). Report the real
+        // split so it is obvious how much actually sits in VRAM vs host RAM.
+        if (getenv("QENGINE_UM_OFFLOAD")) {
+            size_t dev = qe_dev_used, host = total_bytes.load() > dev ? total_bytes.load() - dev : 0;
+            printf("  UM offload split: %.1f MB device-resident (VRAM) + %.1f MB host RAM (PCIe access)\n",
+                   dev / 1e6, host / 1e6);
+        }
         
         return true;
     }
