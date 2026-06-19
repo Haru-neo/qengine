@@ -1097,6 +1097,27 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
         };
         auto wp_restore = [&]() { for (auto& sp : wp_saved) sp.t->data = sp.orig; };
 
+        // ── Layer-major full-sequence hidden (UM offload, single GPU) ──────
+        // Chunk-major re-streams ALL host weights once per CHUNK; the same 13 GB
+        // of static weights cross PCIe (L/CHUNK) times per sequence. Layer-major
+        // instead holds the WHOLE sequence's hidden state resident and streams
+        // each layer's weights ONCE, processing all tokens through it — so host
+        // weights cross PCIe once per SEQUENCE. Needs full_hidden [max_L, H] fp32
+        // in VRAM (e.g. 5.4 GB at 256K); raise QENGINE_UM_RESERVE_MB to fit.
+        float* full_hidden = nullptr;
+        if (um_off && n_gpus == 1 && wp_arena) {
+            cudaSetDevice(0);
+            cudaError_t fe = cudaMalloc(&full_hidden, (size_t)max_L * H * sizeof(float));
+            if (fe != cudaSuccess) {
+                fprintf(stderr, "[layer-major] full_hidden %.1f GB alloc failed: %s — chunk-major fallback\n",
+                        (double)max_L * H * 4 / 1e9, cudaGetErrorString(fe));
+                full_hidden = nullptr;
+            } else {
+                fprintf(stderr, "[layer-major] full_hidden %.1f GB resident — host weights stream ONCE per sequence\n",
+                        (double)max_L * H * 4 / 1e9);
+            }
+        }
+
         // KD (DFLASH_EXTRACT_TGT): per-chunk scratch on last_gpu to compute the
         // 27B greedy argmax (same out_norm + lm_head + argmax the serve path uses)
         // from each chunk's post-final-layer hidden, plus a per-seq host buffer.
@@ -1136,6 +1157,54 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
                            (size_t)L * N_TGT * H * sizeof(half));
             }
 
+          if (full_hidden) {
+            // ───────────────── LAYER-MAJOR (UM offload, 1 GPU) ───────────────
+            auto _st0 = std::chrono::high_resolution_clock::now();
+            cudaSetDevice(0);
+            // 1. Embed ALL L tokens into the resident full-sequence buffer.
+            for (int t = 0; t < L; t++) {
+                int token_id = ids[t];
+                if (embd_t->type == GGML_TYPE_Q8_0)
+                    dequant_embd_q8_0_row<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half0, token_id, H);
+                else if (embd_t->type == GGML_TYPE_Q5_K)
+                    dequant_embd_q5k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half0, token_id, H);
+                else if (embd_t->type == GGML_TYPE_Q6_K)
+                    dequant_embd_q6k_row_v2<<<(H+255)/256, 256>>>(embd_t->data, gpu_hidden_half0, token_id, H);
+                half_to_float_kernel<<<(H+255)/256, 256>>>(
+                    gpu_hidden_half0, full_hidden + (size_t)t * H, H);
+            }
+            // 2. Stream each layer ONCE; process every token through it in
+            //    CHUNK-sized sub-tiles (small tiles keep the attention kernel
+            //    efficient; the per-layer weight prefetch is hoisted out).
+            for (int layer = 0; layer < n_layers; layer++) {
+                wp_prefetch(layer, 0);
+                bool is_attn = model.is_attn_layer(layer);
+                for (int pos = 0; pos < L; pos += CHUNK) {
+                    int n = std::min(CHUNK, L - pos);
+                    float* h = full_hidden + (size_t)pos * H;
+                    if (is_attn) model.forward_attn_chunk(layer, h, pos, n, 0);
+                    else         model.forward_gdn_chunk (layer, h, n, 0, /*slot=*/0, pos);
+                    if (model.layer_is_moe[layer]) model.forward_moe_chunk(layer, h, n, 0);
+                    else                           model.forward_mlp_chunk(layer, h, n, 0);
+                }
+                wp_restore();
+            }
+            cudaSetDevice(0); cudaDeviceSynchronize();
+            {
+                double dt = std::chrono::duration<double>(
+                    std::chrono::high_resolution_clock::now() - _st0).count();
+                fprintf(stderr, "[layer-major] seq=%zu L=%d wall=%.1fs rate=%.0f tok/s\n",
+                        si, L, dt, L / dt);
+            }
+            // 3. KD targets (if enabled): final hidden for all tokens is resident.
+            if (extract_tgt) {
+                if ((int)host_tgt.size() < L) host_tgt.resize(L);
+                for (int pos = 0; pos < L; pos += CHUNK) {
+                    int n = std::min(CHUNK, L - pos);
+                    compute_tgt_chunk(full_hidden + (size_t)pos * H, n, host_tgt.data() + pos);
+                }
+            }
+          } else {
             int chunk_pos = 0;
             while (chunk_pos < L) {
                 int chunk_n = std::min(CHUNK, L - chunk_pos);
@@ -1206,6 +1275,7 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
                     fflush(stdout);
                 }
             }
+          }  // end chunk-major else
 
             cudaSetDevice(0); cudaError_t kvext_sync_err = cudaDeviceSynchronize();
             if (extract_kv) {
