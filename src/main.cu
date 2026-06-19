@@ -1072,11 +1072,14 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
         }
         struct SavedWP { GPUTensor* t; void* orig; };
         std::vector<SavedWP> wp_saved;
+        size_t wp_bytes_chunk = 0;   // host->VRAM bytes staged this chunk (diag)
+        const bool no_prefetch = getenv("QENGINE_NO_PREFETCH") != nullptr;
         auto wp_prefetch = [&](int layer, cudaStream_t s) {
-            if (!wp_arena) return;
+            if (!wp_arena || no_prefetch) return;
             wp_saved.clear();
             char pfx[32]; snprintf(pfx, sizeof(pfx), "blk.%d.", layer);
             size_t off = 0; uint8_t* base = (uint8_t*)wp_arena;
+            int nred = 0;
             for (auto& kv : gpu_model.tensors) {
                 if (kv.first.compare(0, strlen(pfx), pfx) != 0) continue;
                 GPUTensor& gt = kv.second;
@@ -1086,7 +1089,11 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
                 wp_saved.push_back({&gt, gt.data});
                 gt.data = base + off;          // redirect GEMMs to the VRAM copy
                 off += gt.byte_size;
+                wp_bytes_chunk += gt.byte_size; nred++;
             }
+            static bool dbg = false;
+            if (!dbg && layer == 0) { dbg = true;
+                fprintf(stderr, "[prefetch] layer0 redirected %d tensors, %.0f MB\n", nred, off/1e6); }
         };
         auto wp_restore = [&]() { for (auto& sp : wp_saved) sp.t->data = sp.orig; };
 
@@ -1132,6 +1139,8 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
             int chunk_pos = 0;
             while (chunk_pos < L) {
                 int chunk_n = std::min(CHUNK, L - chunk_pos);
+                wp_bytes_chunk = 0;
+                auto _ct0 = std::chrono::high_resolution_clock::now();
                 cudaSetDevice(0);
                 for (int t = 0; t < chunk_n; t++) {
                     int token_id = ids[chunk_pos + t];
@@ -1175,6 +1184,12 @@ int run_dflash_extract(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus,
                     wp_restore();
                 }
                 cudaSetDevice(last_gpu); cudaDeviceSynchronize();
+                {
+                    double dt = std::chrono::duration<double>(
+                        std::chrono::high_resolution_clock::now() - _ct0).count();
+                    fprintf(stderr, "[chunk] seq=%zu pos=%d n=%d wall=%.2fs prefetch=%.2fGB rate=%.0f tok/s\n",
+                            si, chunk_pos, chunk_n, dt, wp_bytes_chunk / 1e9, chunk_n / dt);
+                }
                 // KD: h_chunk now holds the post-final-layer hidden for these
                 // chunk_n positions on last_gpu → 27B greedy argmax at p=chunk_pos+t.
                 if (extract_tgt) {
