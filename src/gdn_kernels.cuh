@@ -593,6 +593,223 @@ __global__ void gdn_chunk_step(
     }
 }
 
+// ============ FAST GDN path (GDN_CHUNK_FAST=1) ============
+//
+// The reference gdn_chunk_step is latency-bound: the sequential token loop
+// contains 3-4 __syncthreads() plus cross-warp tree reductions (q_norm,
+// k_norm, attn_score) PER TOKEN. Those state-INDEPENDENT reductions serialize
+// the 48 blocks and dominate per-step latency.
+//
+// Key insight: q_ns, k_n, attn_score, g, beta depend only on the token's
+// inputs (not on the recurrent state S). So we precompute them in a fully
+// parallel pre-pass (grid over tokens×heads — no sequential dependency, all
+// latency hidden), store to scratch, then the recurrence kernel just loads
+// k_n/q_ns into SMEM (ONE __syncthreads per token) and does the per-v-column
+// sum1/sum2/state-update. This removes the expensive in-loop tree-reduce
+// syncs, unlocking latency hiding across the 48 blocks.
+
+// --- Pre-pass A: per (token, k_head) compute q_ns[k_dim] and k_n[k_dim].
+// grid = (n_tokens, num_k); block = min(k_dim,128) threads. One block per
+// (t, k_head) reduces ||q||^2 and ||k||^2 with a block reduce, then writes
+// q_ns = q_n*scale and k_n. Fully parallel across (t, k_head) — no sequential
+// dependency, so reduction latency is hidden.
+__global__ void gdn_fast_prepass_qknorm(
+    const float* __restrict__ chunk_qkv,  // [N, qkv_dim] FP32
+    float* __restrict__ out_qns,          // [N, num_k, k_dim] FP32
+    float* __restrict__ out_kn,           // [N, num_k, k_dim] FP32
+    int n_tokens, int num_k, int k_dim, int qkv_dim
+) {
+    int t      = blockIdx.x;
+    int k_head = blockIdx.y;
+    if (t >= n_tokens || k_head >= num_k) return;
+
+    const float* qkv   = chunk_qkv + (size_t)t * qkv_dim;
+    const float* q_raw = qkv + k_head * k_dim;
+    const float* k_raw = qkv + num_k * k_dim + k_head * k_dim;
+
+    const int tid   = threadIdx.x;
+    const int lane  = tid & 31;
+    const int warp  = tid >> 5;
+    const int nwarp = (blockDim.x + 31) >> 5;
+
+    __shared__ float sWQ[32];
+    __shared__ float sWK[32];
+    __shared__ float sQn, sKn;
+
+    float q_ss = 0.0f, k_ss = 0.0f;
+    for (int i = tid; i < k_dim; i += blockDim.x) {
+        float qv = q_raw[i];
+        float kv = k_raw[i];
+        q_ss += qv * qv;
+        k_ss += kv * kv;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        q_ss += __shfl_xor_sync(0xffffffff, q_ss, off);
+        k_ss += __shfl_xor_sync(0xffffffff, k_ss, off);
+    }
+    if (lane == 0) { sWQ[warp] = q_ss; sWK[warp] = k_ss; }
+    if (warp == 0 && lane >= nwarp && lane < 32) { sWQ[lane] = 0.0f; sWK[lane] = 0.0f; }
+    __syncthreads();
+    if (warp == 0) {
+        float qv = sWQ[lane], kv = sWK[lane];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            qv += __shfl_xor_sync(0xffffffff, qv, off);
+            kv += __shfl_xor_sync(0xffffffff, kv, off);
+        }
+        if (lane == 0) { sQn = qv; sKn = kv; }
+    }
+    __syncthreads();
+    float q_inv = rsqrtf(sQn + 1e-6f);
+    float k_inv = rsqrtf(sKn + 1e-6f);
+    float scale = rsqrtf((float)k_dim);
+
+    size_t base = ((size_t)t * num_k + k_head) * k_dim;
+    for (int i = tid; i < k_dim; i += blockDim.x) {
+        out_qns[base + i] = q_raw[i] * q_inv * scale;
+        out_kn[base + i]  = k_raw[i] * k_inv;
+    }
+}
+
+// Pre-pass B: per (token, v_head) compute attn_score, g, beta.
+// grid = (n_tokens, num_v); block = min(k_dim,128). attn_score reduces over
+// k_dim using the precomputed q_ns / k_n (q_ns already folded scale once, so
+// attn_score = sum(q_n * k_n)*scale = sum((q_ns/scale)*k_n)*scale =
+// sum(q_ns*k_n). i.e. attn_score = dot(q_ns, k_n).
+__global__ void gdn_fast_prepass_gate(
+    const float* __restrict__ out_qns,    // [N, num_k, k_dim]
+    const float* __restrict__ out_kn,     // [N, num_k, k_dim]
+    const float* __restrict__ a_log,      // [num_v]
+    const float* __restrict__ dt_bias,    // [num_v]
+    const half*  __restrict__ chunk_a,    // [N, num_v]
+    const half*  __restrict__ chunk_b,    // [N, num_v]
+    float* __restrict__ out_attn,         // [N, num_v]
+    float* __restrict__ out_g,            // [N, num_v]
+    float* __restrict__ out_beta,         // [N, num_v]
+    int n_tokens, int num_k, int num_v, int k_dim
+) {
+    int t    = blockIdx.x;
+    int head = blockIdx.y;
+    if (t >= n_tokens || head >= num_v) return;
+    int k_head = head % num_k;
+
+    const int tid   = threadIdx.x;
+    const int lane  = tid & 31;
+    const int warp  = tid >> 5;
+    const int nwarp = (blockDim.x + 31) >> 5;
+    __shared__ float sWA[32];
+    __shared__ float sA;
+
+    size_t base = ((size_t)t * num_k + k_head) * k_dim;
+    float acc = 0.0f;
+    for (int i = tid; i < k_dim; i += blockDim.x) {
+        acc += out_qns[base + i] * out_kn[base + i];
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_xor_sync(0xffffffff, acc, off);
+    if (lane == 0) sWA[warp] = acc;
+    if (warp == 0 && lane >= nwarp && lane < 32) sWA[lane] = 0.0f;
+    __syncthreads();
+    if (warp == 0) {
+        float a = sWA[lane];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            a += __shfl_xor_sync(0xffffffff, a, off);
+        if (lane == 0) sA = a;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        // attn_score = scale * sum(q_n*k_n); q_ns already carries one `scale`,
+        // so sum(q_ns*k_n) == scale*sum(q_n*k_n) == attn_score. Matches ref.
+        float attn_score = sA;
+        float alpha = __half2float(chunk_a[(size_t)t * num_v + head]);
+        float dt    = dt_bias[head];
+        float ssm_a = a_log[head];
+        float g_log = ssm_a * logf(1.0f + expf(alpha + dt));
+        float g     = expf(fminf(g_log, 50.0f));
+        float beta  = 1.0f / (1.0f + expf(-__half2float(chunk_b[(size_t)t * num_v + head])));
+        out_attn[(size_t)t * num_v + head] = attn_score;
+        out_g[(size_t)t * num_v + head]    = g;
+        out_beta[(size_t)t * num_v + head] = beta;
+    }
+}
+
+// Fast recurrence kernel: <<<num_v, threads>>>. Loops tokens sequentially but
+// reads precomputed q_ns/k_n/attn/g/beta. Loads k_n/q_ns into SMEM with ONE
+// __syncthreads per token; each thread (v-column) does sum1/sum2 + state
+// update. State stays resident in SMEM across the chunk (same as reference).
+__global__ void gdn_fast_recurrence(
+    const float* __restrict__ chunk_qkv,  // [N, qkv_dim] FP32 (for v)
+    const float* __restrict__ in_qns,     // [N, num_k, k_dim]
+    const float* __restrict__ in_kn,      // [N, num_k, k_dim]
+    const float* __restrict__ in_attn,    // [N, num_v]
+    const float* __restrict__ in_g,       // [N, num_v]
+    const float* __restrict__ in_beta,    // [N, num_v]
+    float* __restrict__ rec_state,        // FP32 state, updated in-place
+    half*  __restrict__ chunk_out,        // [N, num_v * v_dim]
+    int n_tokens, int num_k, int num_v, int k_dim, int v_dim
+) {
+    int head = blockIdx.x;
+    if (head >= num_v) return;
+    int k_head  = head % num_k;
+    int qkv_dim = 2 * num_k * k_dim + num_v * v_dim;
+    int v_total = num_v * v_dim;
+    const int state_len = k_dim * v_dim;
+
+    extern __shared__ float smem[];
+    float* sState = smem;
+    float* sQ     = sState + state_len;   // q_ns  [k_dim]
+    float* sK     = sQ + k_dim;           // k_n   [k_dim]
+
+    float* gState = rec_state + head * k_dim * v_dim;
+    for (int i = threadIdx.x; i < state_len; i += blockDim.x)
+        sState[i] = gState[i];
+    __syncthreads();
+
+    const int tid = threadIdx.x;
+
+    for (int t = 0; t < n_tokens; t++) {
+        size_t kbase = ((size_t)t * num_k + k_head) * k_dim;
+        for (int i = tid; i < k_dim; i += blockDim.x) {
+            sQ[i] = in_qns[kbase + i];
+            sK[i] = in_kn[kbase + i];
+        }
+        __syncthreads();
+
+        float attn_score = in_attn[(size_t)t * num_v + head];
+        float g          = in_g[(size_t)t * num_v + head];
+        float beta       = in_beta[(size_t)t * num_v + head];
+        const float* v_raw = chunk_qkv + (size_t)t * qkv_dim
+                             + 2 * num_k * k_dim + head * v_dim;
+
+        for (int vi = tid; vi < v_dim; vi += blockDim.x) {
+            float sum1 = 0.0f, sum2 = 0.0f;
+            for (int kd = 0; kd < k_dim; kd++) {
+                float s = sState[kd * v_dim + vi];
+                sum1 += s * sK[kd];
+                sum2 += s * sQ[kd];
+            }
+            float sv_new  = beta * (v_raw[vi] - sum1 * g);
+            float out_val = sum2 * g + sv_new * attn_score;
+            chunk_out[(size_t)t * v_total + head * v_dim + vi] = __float2half(out_val);
+
+            for (int kd = 0; kd < k_dim; kd++) {
+                float s_new = g * sState[kd * v_dim + vi] + sv_new * sK[kd];
+                if (s_new > 1e6f) s_new = 1e6f;
+                else if (s_new < -1e6f) s_new = -1e6f;
+                sState[kd * v_dim + vi] = s_new;
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int i = threadIdx.x; i < state_len; i += blockDim.x)
+        gState[i] = sState[i];
+}
+
 // ============ Chunked RMSNorm Gated (multi-token) ============
 __global__ void rms_norm_gated_chunk_kernel(
     const half* __restrict__ chunk_x,    // [N, num_v, v_dim]

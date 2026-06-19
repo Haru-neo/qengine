@@ -933,6 +933,14 @@ struct QwenModel {
         half*  chunk_normed;  // [chunk_cap * num_v * v_dim]
         half*  chunk_proj_out;// [chunk_cap * hidden_size]
         half*  chunk_norm_out;// [chunk_cap * hidden_size]
+        // GDN_CHUNK_FAST scratch (lazy-alloc, reused across calls). Sized by
+        // chunk_cap. qns/kn are [chunk_cap, num_k, k_dim]; attn/g/beta are
+        // [chunk_cap, num_v].
+        float* fast_qns  = nullptr;
+        float* fast_kn   = nullptr;
+        float* fast_attn = nullptr;
+        float* fast_g    = nullptr;
+        float* fast_beta = nullptr;
     };
     GDNBuffers gdn_bufs[4];
 
@@ -3907,6 +3915,49 @@ struct QwenModel {
             // limit, so the 66 KB SMEM request either failed at launch or hit
             // undefined behavior — producing layer-wise drift starting at the
             // first GPU-boundary GDN layer (reproduced on 9B at L08).
+            static const bool gdn_chunk_fast = getenv("GDN_CHUNK_FAST") != nullptr;
+            if (gdn_chunk_fast) {
+                // ---- FAST path: parallel pre-pass + light recurrence. ----
+                // Scratch lazy-alloc, sized by chunk_cap. Reused across calls.
+                if (!gb.fast_qns) {
+                    size_t kn_elems = (size_t)chunk_cap * num_k * k_dim;
+                    size_t hv_elems = (size_t)chunk_cap * num_v;
+                    cudaMalloc(&gb.fast_qns,  kn_elems * sizeof(float));
+                    cudaMalloc(&gb.fast_kn,   kn_elems * sizeof(float));
+                    cudaMalloc(&gb.fast_attn, hv_elems * sizeof(float));
+                    cudaMalloc(&gb.fast_g,    hv_elems * sizeof(float));
+                    cudaMalloc(&gb.fast_beta, hv_elems * sizeof(float));
+                }
+                int kthreads = min(k_dim, 128);
+                // Pre-pass 1: q_ns / k_n  (grid n_tokens × num_k).
+                dim3 g1(n_tokens, num_k);
+                gdn_fast_prepass_qknorm<<<g1, kthreads, 0, stream>>>(
+                    gb.chunk_qkv, gb.fast_qns, gb.fast_kn,
+                    n_tokens, num_k, k_dim, qkv_dim);
+                // Pre-pass 2: attn_score / g / beta  (grid n_tokens × num_v).
+                dim3 g2(n_tokens, num_v);
+                gdn_fast_prepass_gate<<<g2, kthreads, 0, stream>>>(
+                    gb.fast_qns, gb.fast_kn,
+                    (float*)a_log_t->data, (float*)dt_bias_t->data,
+                    gb.chunk_a_proj, gb.chunk_b_proj,
+                    gb.fast_attn, gb.fast_g, gb.fast_beta,
+                    n_tokens, num_k, num_v, k_dim);
+                // Recurrence: state + q_ns[k_dim] + k_n[k_dim] in SMEM.
+                int fast_smem = (state_len + 2 * k_dim) * sizeof(float);
+                static bool fast_attr_set[16] = {false};
+                int cur_dev_f = 0; cudaGetDevice(&cur_dev_f);
+                if (cur_dev_f >= 0 && cur_dev_f < 16 && !fast_attr_set[cur_dev_f]) {
+                    cudaFuncSetAttribute(
+                        (const void*)gdn_fast_recurrence,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
+                    fast_attr_set[cur_dev_f] = true;
+                }
+                gdn_fast_recurrence<<<num_v, threads, fast_smem, stream>>>(
+                    gb.chunk_qkv, gb.fast_qns, gb.fast_kn,
+                    gb.fast_attn, gb.fast_g, gb.fast_beta,
+                    rec_state_slot, gb.chunk_core_out,
+                    n_tokens, num_k, num_v, k_dim, v_dim);
+            } else {
             static bool smem_attr_set[16] = {false};
             int cur_dev = 0; cudaGetDevice(&cur_dev);
             if (cur_dev >= 0 && cur_dev < 16 && !smem_attr_set[cur_dev]) {
@@ -3926,6 +3977,7 @@ struct QwenModel {
                 gb.chunk_core_out,
                 n_tokens, num_k, num_v, k_dim, v_dim
             );
+            }
         }
 
         // RMSNorm gated (chunked) + batched output projection + batched residual
