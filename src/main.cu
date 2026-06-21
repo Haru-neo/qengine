@@ -2564,6 +2564,24 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         // model init. No additional buffer pool needed here.
         model.alloc_tree_decode(tree_budget);
         if (dflash_enabled) model.init_dflash_tree_scratch(tree_budget);
+        // Defense-in-depth: alloc_tree_decode's GDN-intermediate buffers (~1.2GB) are
+        // the alloc that tips a full GPU into OOM. Most cudaMalloc sites are unchecked
+        // (they leave a null/zeroed buffer -> hidden=0 -> token-0 `!` garbage instead of
+        // a clean error). Catch a failure HERE, loudly, before serving.
+        for (int g = 0; g < n_gpus; g++) {
+            cudaSetDevice(g); cudaDeviceSynchronize();
+            cudaError_t _te = cudaGetLastError();
+            if (_te != cudaSuccess) {
+                size_t _fb = 0, _tb2 = 0; cudaMemGetInfo(&_fb, &_tb2);
+                fprintf(stderr, "[FATAL] CUDA error after DFlash/tree buffer alloc on GPU%d: %s\n"
+                        "  (%.0f MB free / %.0f MB total) — VRAM OOM. The Q8 model + KV left no\n"
+                        "  room for DFlash's ~1.4GB GDN-intermediate/capture buffers. Reduce\n"
+                        "  --max-seq, lower DFLASH_BUDGET, or rebalance PP_LAYER_BOUNDS to unload\n"
+                        "  this GPU. Refusing to serve (would emit token-0 `!` garbage).\n",
+                        g, cudaGetErrorString(_te), _fb/1e6, _tb2/1e6);
+                return 1;
+            }
+        }
         printf("[TREE] tree decoding buffers allocated (budget=%d)\n", tree_budget);
     }
     long long mtp_accept_count = 0;
@@ -3989,6 +4007,19 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         else break;
                     }
                 }
+                // QDBG_DFLASH: dump draft vs verify tokens for first few iters to
+                // localize the reject=0/garbage bug (draft==verify garbage?).
+                static const bool qdbg_df = getenv("QDBG_DFLASH") != nullptr;
+                static int qdbg_df_n = 0;
+                if (qdbg_df && qdbg_df_n < 8) {
+                    qdbg_df_n++;
+                    fprintf(stderr, "[QDFL it%d anchor=%d] draft=[", qdbg_df_n, anchor_tok);
+                    for (int i = 0; i < n_ver - 1; i++) fprintf(stderr, "%s%d", i?",":"", fold_chain[i]);
+                    fprintf(stderr, "] verify=[");
+                    for (int i = 0; i < n_ver; i++) fprintf(stderr, "%s%d", i?",":"", tree_h_argmax[i]);
+                    fprintf(stderr, "] accept=%d\n", accept_drafts);
+                    fflush(stderr);
+                }
                 // DFLASH_POS_ACCEPT stats: per-position conditional accept curve
                 // p_k = matched[k]/reached[k], plus top-2 recovery rate at the
                 // first mismatch q_k = top2hit[k]/mismatch[k] (= the win a leaf
@@ -4152,6 +4183,22 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
 
             if (step >= (int)prompt_ids.size() - 1) {
                 cudaSetDevice(last_gpu); cudaDeviceSynchronize();
+                // QDBG_GEN: per-generation-step hidden-state magnitude + content
+                // hash, to localize the long-gen repetition collapse. max|h| growth
+                // => numerical blow-up; repeating hash => state-saturation fixed point.
+                static const bool qdbg_gen = getenv("QDBG_GEN") != nullptr;
+                if (qdbg_gen && step >= (int)prompt_ids.size()) {
+                    static thread_local std::vector<float> qhb;
+                    qhb.resize(H);
+                    cudaMemcpy(qhb.data(), h, H * sizeof(float), cudaMemcpyDeviceToHost);
+                    float qmx = 0.f, qsum = 0.f;
+                    for (int i = 0; i < H; i++) { float a = fabsf(qhb[i]); if (a > qmx) qmx = a; qsum += a; }
+                    uint64_t qhh = 0xcbf29ce484222325ULL;
+                    for (int i = 0; i < H; i++) { uint32_t b; memcpy(&b, &qhb[i], 4); qhh = (qhh ^ (uint64_t)b) * 0x100000001b3ULL; }
+                    fprintf(stderr, "[QGEN s%03d] max|h|=%.3f mean|h|=%.5f hash=%016lx\n",
+                            (int)generated.size(), qmx, qsum / H, qhh);
+                    fflush(stderr);
+                }
                 auto gl0 = prof_now();
                 // Convert fp32 hidden to fp16 for output norm + projection
                 float_to_half_kernel<<<(H+255)/256, 256>>>(h, gpu_hidden_half[last_gpu], H);
@@ -5695,6 +5742,17 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     if (const char* e = getenv("QWEN_MAX_QUEUE")) max_queue = std::max(0, atoi(e));
     sched.set_max_queue(max_queue);
     printf("[server] queue cap: %d (set QWEN_MAX_QUEUE=0 for unbounded)\n", max_queue);
+
+    // Startup VRAM headroom report — so a near-full GPU (which makes runtime allocs
+    // fail SILENTLY -> token-0 `!` garbage) is visible at a glance. <64 MB free is the
+    // danger zone that produced the DFlash/max-seq garbage.
+    for (int g = 0; g < n_gpus; g++) {
+        cudaSetDevice(g);
+        size_t _fb = 0, _tb = 0; cudaMemGetInfo(&_fb, &_tb);
+        printf("[VRAM] GPU%d: %.0f MB free / %.0f MB total%s\n", g, _fb/1e6, _tb/1e6,
+               _fb < (size_t)64*1024*1024 ? "   <-- LOW: runtime allocs may fail -> garbage" : "");
+    }
+    fflush(stdout);
 
     // P3: speculative-prefill PREFETCH (SPEC_PREFILL_PREFETCH=1, default off).
     // While a long-prompt request decodes, predict the NEXT queued long

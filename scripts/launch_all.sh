@@ -85,11 +85,22 @@ rm -f "$LOG_DIR/main_27b.log"
 # backslash block below — no comments between continuations, see the note there.)
 # vision auto-enables once a Coder mmproj exists at CHAT_MMPROJ; text-only until then
 VISION_ARG=""; [ -n "$CHAT_MMPROJ" ] && [ -f "$CHAT_MMPROJ" ] && VISION_ARG="--vision-mmproj $CHAT_MMPROJ"
+# 2026-06-21: ROOT CAUSE of the repetition/`!!!!` garbage was VRAM EXHAUSTION, not a
+# DFlash logic bug. The Coder model (Q8_0 ~30GB, up from the old Q5_K ~19GB) filled GPU0
+# to 16144/16384; DFlash's extra buffers (GDN-intermediate 1208MB + capture 200MB) then
+# tipped an UNCHECKED cudaMalloc to null → kernels wrote to a null/zeroed buffer →
+# hidden=0 → argmax=token0(`!`) → garbage. FIX: rebalance layers OFF GPU0 (PP 17,40 →
+# 15,40) so the DFlash buffers fit, balanced so every GPU keeps >1GB free. Verified at
+# full --max-seq 262144: all GPUs >1.2GB free, DFlash healthy (AL~3.1-3.9, reject>0),
+# output correct. DFlash itself + the Jun-6 drafter are
+# FINE (confirmed: same DFlash at max-seq 4096 gave AL 3.75 / clean output).
+# MLP_GATEUP_FUSED stays OFF — separate, real quality dead-end (degenerate tails, hidden
+# was healthy so NOT the VRAM issue). See memory project_qengine_maxseq_hidden_zero_2026_06_21.
+# (No comments allowed *inside* the \-continued env block below.)
 CUDA_VISIBLE_DEVICES=0,1,2 \
-MTP_TQ=1 MLP_GATEUP_FUSED=1 MLP_GATEUP_FUSED_KERNEL=1 \
-DFLASH=1 DFLASH_DRAFT_PATH="$CHAT_DRAFTER" \
-DFLASH_VERIFY_BLOCKSPARSE=1 DFLASH_BUDGET=8 \
-PP_LAYER_BOUNDS=17,40 \
+MTP_TQ=1 \
+DFLASH=1 DFLASH_DRAFT_PATH="$CHAT_DRAFTER" DFLASH_BUDGET=8 \
+PP_LAYER_BOUNDS=15,40 \
 MINF_SPARSE_ATTN=1 MINF_BUDGET=0.10 \
 MINF_PROFILE_PATH=$ROOT/profiles/27B_block_sparse.bin \
 SPEC_PREFILL_AUTO=0 SPEC_PREFILL_KVGEN=127.0.0.1:$KVGEN_PORT \
