@@ -5173,6 +5173,13 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     // generation token, so fire on_token for streaming.
                     generated.push_back(max_idx);
                     if (on_token) on_token(max_idx);
+                    // BUGFIX: mirror the think-state tracking from the main path
+                    // (4294-4296). Without this, when the FIRST sampled token is
+                    // <think> (248068) — which it almost always is — in_think never
+                    // gets set, so every subsequent reasoning token wrongly counts
+                    // against max_tokens and generation is cut off mid-<think>.
+                    if (max_idx == 248068) in_think = true;   // <think>
+                    if (max_idx == 248069) in_think = false;  // </think>
                 }
             }
 
