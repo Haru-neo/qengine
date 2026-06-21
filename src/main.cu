@@ -3720,6 +3720,35 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
             }
             return output_tokens >= max_gen;
         };
+
+        // dflash_verify_tokens: fill `dst[0..n_rows-1]` with the TARGET token at
+        // each verified position from the n_rows×V logits in `tree_logits_buf`
+        // (on last_gpu). temp<=0 keeps the existing on-GPU greedy argmax kernel
+        // (byte-identical to the pre-sampling behavior). temp>0 SAMPLES each row
+        // with the request's sampling params via the shared `sampler` so spec
+        // decode draws from the target distribution instead of forcing greedy:
+        // we sample t_i per row, accept draft d_i iff d_i==t_i, and emit t_i on
+        // the first mismatch — provably the target distribution. The shared
+        // sampler's rng advances once per row, consistent with the main path.
+        // Both DFlash callers are gated on `sampler.grammar == nullptr`, so the
+        // grammar branch inside sample() is never exercised here.
+        std::vector<half> dflash_verify_logits_host;
+        auto dflash_verify_tokens = [&](int n_rows, int* dst) {
+            if (sampler.params().temperature <= 0.0f) {
+                argmax_half_rows_kernel<<<n_rows,1024>>>(tree_logits_buf, V, tree_d_argmax);
+                cudaMemcpy(dst, tree_d_argmax, (size_t)n_rows*sizeof(int), cudaMemcpyDeviceToHost);
+                return;
+            }
+            cudaDeviceSynchronize();
+            dflash_verify_logits_host.resize((size_t)n_rows * V);
+            cudaMemcpy(dflash_verify_logits_host.data(), tree_logits_buf,
+                       (size_t)n_rows * V * sizeof(half), cudaMemcpyDeviceToHost);
+            std::vector<int> ctx = prompt_ids;
+            ctx.insert(ctx.end(), generated.begin(), generated.end());
+            for (int r = 0; r < n_rows; r++)
+                dst[r] = sampler.sample(dflash_verify_logits_host.data() + (size_t)r * V, V, ctx);
+        };
+
         int step_cap = std::min((int)prompt_ids.size() + max_gen + 4096, max_seq);
         int dyn_poll_ctr = 0;   // throttle the router-yield atomic poll
         for (int step = prefill_len; step < step_cap; step++) {
@@ -3980,8 +4009,9 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                     rms_norm_f32in(tree_norm_buf, h_tree, (half*)out_norm_t->data, n_ver, H, model.cfg.rms_norm_eps, 0);
                 qi_logits_tree.quantize_chunk(tree_norm_buf, H, n_ver, 0);
                 quant_gemv_chunk(out_w->data, out_w->type, qi_logits_tree.q8_buf, tree_logits_buf, H, V, n_ver, 0);
-                argmax_half_rows_kernel<<<n_ver,1024>>>(tree_logits_buf, V, tree_d_argmax);
-                cudaMemcpy(tree_h_argmax, tree_d_argmax, (size_t)n_ver*sizeof(int), cudaMemcpyDeviceToHost);
+                // Target verify tokens: greedy argmax at temp<=0, else sample
+                // each row from the target distribution (see dflash_verify_tokens).
+                dflash_verify_tokens(n_ver, tree_h_argmax);
                 if (do_gen_prof) { g_logits += prof_sync_ms(sl0, last_gpu); g_spec_iters++; g_steps++; }
 
                 // (6) accept: posterior[i]=tree_h_argmax[i]=27B greedy @ step+1+i.
@@ -4487,12 +4517,10 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
                         qi_logits_tree.quantize_chunk(tree_norm_buf, H, tree_budget, 0);
                         quant_gemv_chunk(out_w->data, out_w->type, qi_logits_tree.q8_buf,
                                          tree_logits_buf, H, V, tree_budget, 0);
-                        for (int b = 0; b < tree_budget; b++)
-                            argmax_half_kernel<<<1, 1024>>>(
-                                tree_logits_buf + (size_t)b * V, V,
-                                tree_d_argmax + b);
-                        cudaMemcpy(tree_h_argmax, tree_d_argmax,
-                                   (size_t)tree_budget * sizeof(int), cudaMemcpyDeviceToHost);
+                        // Target verify tokens: greedy argmax at temp<=0, else
+                        // sample each row from the target distribution so spec
+                        // decode respects temperature (see dflash_verify_tokens).
+                        dflash_verify_tokens(tree_budget, tree_h_argmax);
                         if (do_gen_prof) {
                             g_logits += prof_sync_ms(sl0, last_gpu);
                             g_spec_iters++;
