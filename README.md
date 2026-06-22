@@ -17,14 +17,14 @@ A custom CUDA inference engine for **Qwen3.5 / Qwen3.6 hybrid (GDN + Attention) 
 
 ## What it does
 
-- Serves **Qwen3.5 / Qwen3.6** dense hybrid models in **27B** and **9B** sizes (GGUF Q8_0). MoE variants (Qwen3-Moe etc.) **not supported**.
-- **v2-MTP inline GGUF support** (2026-05-27): nextn head packed as `blk.N.nextn.*` in the GGUF is auto-detected and used as the spec drafter — no external `mtp_head_*.bin` needed. Accept rate jumped 73 → 83 % on Qwopus3.6-27B vs the legacy external head.
+- Serves **Qwen3.5 / Qwen3.6** dense hybrid models in **27B** and **9B** sizes (GGUF Q8_0). **Qwen3-MoE / Qwen3.x-A3B** GGUFs are also auto-detected (per-layer `ffn_gate_inp` router) and run through a grouped-expert FFN — but that MoE path is **experimental and not yet validated against real MoE weights**, so treat it as untested, not a supported configuration.
+- **v2-MTP inline GGUF support** (2026-05-27): nextn head packed as `blk.N.nextn.*` in the GGUF is auto-detected and used as the spec drafter — no external `mtp_head_*.bin` needed. Accept rate measured **~83 %** on Qwopus3.6-27B-v2-MTP in our testing (vs ~73 % for the legacy external head).
 - Vision input via **Qwen3-VL mmproj** (ViT + M-RoPE + spatial reshape).
 - **OpenAI-compatible HTTP API** (`/v1/chat/completions`, `/v1/models`, streaming, tool calls).
 - **Embeddings + reranking** from the same binary (`--mode embed` / `--mode rerank`): Qwen3-Embedding-4B (last-token pool, L2-normalized) and Qwen3-Reranker-4B (cross-encoder via the `cls.output` classifier head, instruction-aware). The chat server reverse-proxies `/v1/embeddings` and `/v1/rerank` to these sidecars.
 - **Qwen3 thinking control**: `/no_think` (and `/think`) directives in user **or** system messages, plus vLLM-style `extra_body.chat_template_kwargs.enable_thinking` — all resolve to the same `force_think` switch in the chat template.
 - **Continuous batching** across N concurrent slots, with per-slot prefix caching.
-- **MTP draft speculative decoding (K=1)** — works. **DFlash block-diffusion speculative decoding** works too now (lossless drafting + chain tree-verify). With a distribution-matched drafter it runs in the **mid-30s to upper-40s t/s** on 27B Q8_0 / 3-GPU. A **pipelined-fold** path (default-on; `DFLASH_FOLD=0` to disable) folds the bonus token into the verify batch for **+15–22%** — quality-equivalent (verified: identical compiled-C++ coding pass-rate) but **not bit-identical** (see Limitations).
+- **MTP draft speculative decoding (K=1)** — works. **DFlash block-diffusion speculative decoding** is lossless on the engine side (block-diffusion draft + chain tree-verify; verify uses greedy argmax at `temp≤0` and samples from the target distribution at `temp>0`, so the output distribution matches the target either way). Out of the box a stock drafter mismatches a distilled model (accept length ≈ 1–3, little speedup); **with a distribution-matched drafter** accept length reaches ~4.5–5 and throughput is projected in the **mid-30s to upper-40s t/s** on 27B Q8_0 / 3-GPU. A **pipelined-fold** path (default-on; `DFLASH_FOLD=0` to disable) folds the bonus token into the verify batch for **+15–22%** — quality-equivalent (verified: identical compiled-C++ coding pass-rate) but **not bit-identical** (see Limitations).
 - **3-bit KV cache (MTP_TQ)** — Walsh-Hadamard rotation + Lloyd-Max scalar quant. Same family of idea as llama.cpp [#21038](https://github.com/ggml-org/llama.cpp/pull/21038), but 3-bit Lloyd-Max instead of 4-bit RTN.
 - **Fused gate+up GEMM** (`MLP_GATEUP_FUSED_KERNEL=1`, default off): two Q8_0 weights share one Q8_1 input tile in SMEM, +5–10 % prefill on v2 models.
 - Multi-GPU layer-parallel split with pinned-host activation bridge (no P2P required).
@@ -42,9 +42,9 @@ So `vLLM`, `llama.cpp`'s default cuBLAS path, FlashAttention, bitsandbytes — a
 
 `qengine` works around it by:
 
-- Routing GEMM through **DP4A (int8)** at ~17 TFLOP and **HFMA2 (fp16 SIMD)** at ~24 TFLOP — these paths are *not* throttled on CMP.
+- Routing the LLM's GEMMs through **DP4A (int8)** at ~17 TFLOP — the path that is *not* throttled on CMP. (HFMA2 fp16 SIMD is also unthrottled at ~24 TFLOP; in this engine it's used by the vision encoder, while the LLM weights run Q8_0 over DP4A.)
 - A **hand-written Q8_0 GEMM tile path** for prefill.
-- A **hybrid attention layout** that avoids the strict cuBLAS path for `max_seq > 32 K`.
+- A **FlashAttention-style fused attention layout** that, for `max_seq > 32 K`, avoids the VRAM-heavy strict per-score buffer (its own custom kernel, not cuBLAS).
 - **Pinned-host activation bridge** between GPUs (since P2P is unavailable).
 
 It's not faster than llama.cpp at everything. See the honest benchmarks below.
@@ -63,7 +63,7 @@ All measurements on a CMP 100-210 host, same `Q8_0` GGUFs (Qwopus3.5-9B-v3.5, Qw
 | 18.4 K | **393** | 324 | 27.6 | — |
 | tg64 | — | — | — | 46.6 |
 
-`qengine`: 1.56–2.99× on prompts up to ~4.6 K, **1.22×** at 18 K (split-K FA, 1.46× over the pre-split-K build). Generation +51% on the comparable short-context point (70.4 vs 46.6 t/s).
+`qengine`: 1.62–2.99× on prompts up to ~4.6 K, **1.22×** at 18 K (split-K FA, 1.46× over the pre-split-K build). Generation +51% on the comparable short-context point (70.4 vs 46.6 t/s).
 
 ### 9B Q8_0 — dual GPU (layer split, prefill pipelining on)
 
@@ -253,7 +253,7 @@ curl http://localhost:8000/v1/rerank -H "Content-Type: application/json" \
 The engine looks for the MTP nextn head in two places, in priority order:
 
 1. **Inline GGUF (v2 models)** — if the last block (e.g. `blk.64.nextn.eh_proj.weight`) carries nextn tensors, they're used directly from the already-GPU-resident weights. Matches the model's training distribution exactly; no external file needed. Measured accept rate **~83 %** on Qwopus3.6-27B-v2-MTP.
-2. **External binary (v1 fallback)** — `mtp_head_<hidden>.bin` at `--mtp-head <path>` (default `/home/paru/mtp_work/mtp_head_<hidden>.bin`). Use this only when the GGUF has no inline nextn (e.g. legacy v1 GGUFs).
+2. **External binary (v1 fallback)** — `mtp_head_<hidden>.bin`, auto-loaded from the hardcoded path `/home/paru/mtp_work/mtp_head_<hidden>.bin` (falling back to `/home/paru/mtp_work/mtp_head.bin`). Used only when the GGUF has no inline nextn (e.g. legacy v1 GGUFs). This path is **not** configurable via a CLI flag.
 
 If neither is found, the engine runs plain greedy / continuous-batched.
 
@@ -265,7 +265,11 @@ All three trigger forms work; later wins on conflict:
 - vLLM-compatible `extra_body.chat_template_kwargs.enable_thinking: false`.
 - Top-level `chat_template_kwargs.enable_thinking: false` (some clients).
 
-Internally these all set the same `force_think` argument on the chat template (`-1` = insert empty `<think></think>` block, `0` = let the model decide, `1` = prefill `<think>\n`).
+Internally these all set the same `force_think` argument on the chat template (`-1` = insert a closed `<think>\n\n</think>\n\n` block so the model emits no reasoning, `0` = let the model decide, `1` = prefill `<think>\n`).
+
+### JSON mode (`response_format`)
+
+OpenAI-style `response_format` (`{"type":"json_object"}` / `{"type":"json_schema"}`) is implemented via a state-machine grammar that masks tokens which would break JSON validity. It is **off by default** — the strict path (grammar mask + skip-think + spec/MTP disabled) drops throughput roughly 10×, so enable it explicitly with `MINF_ENABLE_JSON_MODE=1`. Note: `json_schema` is currently treated the same as `json_object` — only structural JSON validity is enforced, the schema itself is not.
 
 ### Call it
 
@@ -301,9 +305,10 @@ curl http://localhost:8000/v1/chat/completions \
 | `MTP_TQ` | `0` | 3-bit KV cache (WHT + Lloyd-Max). Required for 27B at 256 K. Tradeoff: gen TG drops at long context (18 K: 11.4 → 7.6 t/s on 27B 3-GPU) because per-token attention pays the dequant cost. Set when you need >32 K context; leave off for fastest gen at smaller windows. |
 | `MLP_GATEUP_FUSED` | `0` | Route ffn_gate + ffn_up through a single dispatcher (no behavior change; sets up the fused-kernel path). Pair with `MLP_GATEUP_FUSED_KERNEL=1`. |
 | `MLP_GATEUP_FUSED_KERNEL` | `0` | Run the actual fused Q8_0 GEMM that shares one Q8_1 input tile in SMEM across both weights. +5–10 % prefill on v2 models. Verified bit-stable on Qwopus3.6-27B-v2; older v1 models showed argmax drift in earlier testing — leave OFF unless your model is v2-MTP. |
-| `MINF_SPARSE_ATTN` | `0` | Block-sparse FA path (MInference port). Requires a profile binary at `MINF_PROFILE_PATH` describing per-layer sparsity patterns. ~10 % prefill win at 23 K on 27B with no measurable quality loss. |
-| `MINF_BUDGET` | `0.10` | Block budget for `MINF_SPARSE_ATTN` (fraction of K/V blocks kept per Q row). |
-| `MINF_PROFILE_PATH` | unset | Path to the offline sparsity profile (e.g. `profiles/27B_block_sparse.bin`). Without this, `MINF_SPARSE_ATTN=1` is a no-op. |
+| `MINF_SPARSE_ATTN` | `0` | Block-sparse FA path (MInference port). Optionally loads a per-head sparsity profile from `MINF_PROFILE_PATH`; without one it runs uniform block-sparse for all heads. ~10 % prefill win at 23 K on 27B with no measurable quality loss. |
+| `MINF_BUDGET` | `0.10` | Block budget for `MINF_SPARSE_ATTN` (fraction of K/V blocks kept per Q row). When a profile is loaded its header value takes over. |
+| `MINF_PROFILE_PATH` | unset | Path to the offline sparsity profile (e.g. `profiles/27B_block_sparse.bin`). Without it, `MINF_SPARSE_ATTN=1` still runs uniform block-sparse (using `MINF_BUDGET`); a profile only refines per-head patterns. If a path is given but fails to load, sparse attention is disabled. |
+| `MINF_MIN_SEQ` | `4096` | Min sequence length below which `MINF_SPARSE_ATTN` stays dense. |
 | `FLASH_ATTN` | `1` | FA fused score+softmax+value. `0` falls back to the strict block-per-score path (bit-exact with per-token, ~2× slower prefill). |
 | `BIT_EXACT_GEMM_ON` | `0` | Use the strict column-wise GEMV reduction path instead of the GEMM tile (regression / bit-exact testing, ~2.4× slower prefill). |
 | `FA_BM` | `32` | FA tile width. `64` halves K/V tile-load iterations (96 KB SMEM opt-in). Marginal on the prompts we measured. |
@@ -312,9 +317,16 @@ curl http://localhost:8000/v1/chat/completions \
 | `PREFILL_NO_PIPELINE` | unset | Set to disable cross-GPU prefill pipelining (per-GPU compute / D2H / H2D streams + double-buffered hidden + host transfer). Pipelining is auto-enabled with ≥2 GPU segments and gives ~2–3× prefill at 1K-18K. |
 | `PREFILL_NO_HOST_FENCE` | unset | Set to drop the `cudaEventSynchronize` between cross-GPU D2H and H2D — racy on CMP 100-210 (sampled tokens diverge from the sequential path). Only set this for benchmarking the upper-bound throughput on hardware where cross-device stream waits properly fence pinned memory. |
 | `QWEN_SLOTS` | `1` | Concurrent slots (continuous batching). Set via `--slots` too. |
-| `QWEN_MAX_QUEUE` | `64` | Max queued requests; `0` = unbounded. |
+| `QWEN_MAX_QUEUE` | `max(16×slots, 32)` | Max queued requests (= 32 at `slots=1`); `0` = unbounded. |
 | `MTP_ACCEPT_TOP2` | `0` | MTP K=2 top-2 verify (small accept rate gain). |
+| `TQ_KEYS_Q8` | `0` | V-only TurboQuant: keep KV **keys** at Q8_0 (near-lossless) and quantize only **values** to 3-bit TQ, instead of 3-bit for both. Requires `MTP_TQ=1`. Higher long-context KV fidelity at the cost of a larger key cache (a Q8 key is ~2.7× a TQ3 key); at 256 K the extra bytes may need a layer-split rebalance via `PP_LAYER_BOUNDS`. |
+| `Q8KV` | `0` | Store the KV cache in Q8_0 instead of fp16 (without TurboQuant). Memory/quality middle ground for sub-32 K windows. |
+| `PREFIX_CACHE_AUTO` | `1` | On each request, reuse the longest matching cached prefix across all slots' snapshots and skip re-prefilling those tokens (TTFT win for append-only chat). `0` disables (needed for KV-inject / probe runs). |
+| `PP_LAYER_BOUNDS` | unset | Comma-separated per-GPU layer boundaries overriding the automatic split — for multi-GPU rebalancing / OOM avoidance (e.g. when `TQ_KEYS_Q8` / `Q8KV` enlarges the KV cache). |
+| `MINF_ENABLE_JSON_MODE` | `0` | Enable `response_format` JSON-grammar constrained decoding (below). Off by default: the strict path (grammar mask + skip-think + spec/MTP off) drops throughput ~10×. |
 | `CUDA_VISIBLE_DEVICES` | — | Standard CUDA mask; engine splits layers across visible GPUs. |
+
+This table lists the main user-facing knobs. The engine reads many more internal / experimental / debug env vars (DFlash drafter tuning, kernel-fusion toggles, profiling dumps, the experimental kvgen spec-prefill, the 4090 unified-memory extraction path, …) — grep `getenv` in `src/` for the full set; those are not part of the supported surface.
 
 ## Architecture (in 90 seconds)
 
@@ -331,28 +343,32 @@ src/
   mtp_head.cuh        MTP draft head (K=1, K=2 opt-in)
   dflash_*.cuh        DFlash + DDTree speculative path (experimental)
   vision.cuh          Qwen3-VL ViT + M-RoPE + spatial reshape + splice
-  quant_gemv.cuh      Q5_K / Q6_K / Q8_0 GEMV kernels (DP4A path)
-  q8_0_gemm.cuh       Q8_0 GEMM tile path (default for prefill)
+  quant_gemv.cuh      Q5_K / Q6_K / Q8_0 GEMV + the Q8_0 prefill GEMM tile (DP4A path)
+  q8_0_gemm.cuh       Q8_0 GEMM launcher wrappers for the DFlash drafter (reuse quant_gemv.cuh kernels)
   turboquant.cuh      WHT + Lloyd-Max 3-bit KV (MTP_TQ)
+  sparse_attn/        MInference-style block-sparse / vertical-slash attention indexing
+  json_grammar.h      JSON-schema grammar state machine for response_format
+  gemma_model.cuh     GemmaModel: Gemma-4 forward + generation path
   gguf.h              GGUF v3 parser, mmap loader
   gpu_loader.h        multi-GPU parallel weight load (thread pool + streams)
   sampling.h          top-p / top-k / min-p / rep-pen / freq-pen / pres-pen
 ```
 
-Layer split (4-GPU 27B example): GPU 0 holds layers 0–15 + token embeddings; GPU 3 holds layers 48–63 + output norm + LM head; activations bounce through pinned host memory between GPUs.
+Layer split (4-GPU 27B, `15 / 17 / 17 / 16`): GPU 0 holds layers 0–14 + token embeddings; GPU 3 holds layers 49–64 (incl. the inline MTP block 64) + output norm + LM head; activations bounce through pinned host memory between GPUs. The recommended 3-GPU layout is `0–21 / 22–43 / 44–64` (one fewer hop, ~12 % faster prefill); override either with `PP_LAYER_BOUNDS`.
 
 ## Limitations & known issues
 
-- **MoE not supported.** Only dense Qwen3 hybrid (GDN + Attention) models — Qwen3-Moe and similar mixture-of-experts variants do not load.
+- **MoE is experimental, not validated.** Qwen3-MoE / Qwen3.x-A3B GGUFs *do* auto-detect (per-layer `ffn_gate_inp` router) and run through a grouped Q8_0 expert FFN in every prefill/decode path — but this has **not** been validated against real MoE weights. Treat it as untested, not a supported configuration. Dense Qwen3 hybrid (GDN + Attention) is the validated path.
 - **DFlash needs a distribution-matched drafter.** The engine-side DFlash path is functional and lossless, but a stock drafter trained on vanilla Qwen3.5 mismatches a distilled model's distribution, so accept rate is poor out of the box — train/fine-tune a drafter on your model's own outputs to get a usable accept length (~4.5–5).
-- **Pipelined-fold is quality-equivalent, not bit-identical.** The default fold path (`DFLASH_FOLD=0` to disable) forwards the committed bonus token through the *batched tree-verify* kernel instead of the *single-token* kernel, so near-tie argmax tokens can occasionally flip — different-but-valid wording on some responses. Verified to **not** change correctness (identical 8/8 compiled-C++ coding pass-rate and reasoning accuracy vs the non-fold path), but if you need byte-exact reproducibility set `DFLASH_FOLD=0` for the slower bit-exact path.
+- **Pipelined-fold is quality-equivalent, not bit-identical.** The default fold path (`DFLASH_FOLD=0` to disable) forwards the committed bonus token through the *batched tree-verify* kernel instead of the *single-token* kernel, so near-tie argmax tokens can occasionally flip — different-but-valid wording on some responses. Verified to **not** change correctness (identical 8/8 compiled-C++ coding pass-rate and reasoning accuracy vs the non-fold path), but if you need byte-exact reproducibility set `DFLASH_FOLD=0` for the slower bit-exact path. (Separately, DFlash verify is greedy at `temp≤0` and samples from the target distribution at `temp>0` — both distribution-faithful; the fold/non-fold divergence is an orthogonal kernel-numeric effect.)
 - **No batched MTP / spec.** Speculative paths run only when `slots == 1`. With `slots > 1`, the batched gen loop is plain greedy.
 - **GGUF Q8_0 is the supported path.** Q5_K_M / Q6_K load but quality is degraded — use Q8_0.
 - **sm_70 specific tuning.** Should run on sm_75; sm_80+ has better engines anyway.
 - **Single-host.** No tensor parallelism across machines, no multi-node.
 - **Linux only.**
 - **Cross-GPU prefill pipelining requires a host-side fence** (`cudaEventSynchronize` between D2H and H2D). On CMP 100-210 (PCIe 1.0 x1, no P2P) the cross-device `cudaStreamWaitEvent` doesn't reliably fence pinned host memory between the source GPU's D2H and the destination GPU's H2D — H2D reads stale bytes and the first sampled token diverges from the sequential path on some prompt lengths. The host fence is default-on (`PREFILL_NO_HOST_FENCE=1` to revert to the racy event-only path) and the perf cost is ≤3% at 18 K because chunks-internal overlap is already serialized by stream FIFOs. May or may not affect newer hardware with proper P2P.
-- **Continuous batching with system-prompt-less requests can stop after 1 token** on Qwopus distill models — known issue with empty-system-prompt EOS bias under batched gen. Set `--default-system-prompt`.
+- **Continuous batching with system-prompt-less requests can stop after 1 token** on Qwopus distill models — known issue with empty-system-prompt EOS bias under batched gen. Workaround: supply a non-empty system message. (The engine binary has no default-system-prompt flag; the separate `router.py` proxy can prepend one with `--default-system-prompt`.)
+- **Experimental speculative-prefill (kvgen sidecar) is not production-ready.** A 0.8B sidecar (`--mode kvgen`, auto-wire via `SPEC_PREFILL_AUTO`, default **off**) can predict the attention KV for a long prompt's head so the 27B only real-prefills the recent tail. The predicted KV is **approximate** — at long context (e.g. 256 K) it captures gist with effectively **zero needle recall**, so it is disabled in the default launcher and not wired into normal chat. Long prompts use full dense prefill.
 
 ## Status
 
