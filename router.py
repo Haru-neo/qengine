@@ -360,6 +360,7 @@ async function send() {
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = '';
+    let reasoningOpen = false;
     tickTimer = setInterval(updateTick, 250);
     while (true) {
       const {value, done} = await reader.read();
@@ -374,8 +375,24 @@ async function send() {
         if (!payload || payload === '[DONE]') continue;
         try {
           const j = JSON.parse(payload);
-          const delta = j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content;
+          const d = j.choices && j.choices[0] && j.choices[0].delta;
+          const reasoning = d && d.reasoning_content;
+          const delta = d && d.content;
+          if (reasoning) {
+            if (!reasoningOpen) {
+              asst.content += '<think>';
+              reasoningOpen = true;
+            }
+            if (!tFirst) tFirst = performance.now();
+            asst.content += reasoning;
+            tokenCount++;
+            render();
+          }
           if (delta) {
+            if (reasoningOpen) {
+              asst.content += '</think>\n\n';
+              reasoningOpen = false;
+            }
             if (!tFirst) tFirst = performance.now();
             asst.content += delta;
             tokenCount++;
@@ -383,6 +400,10 @@ async function send() {
           }
         } catch {}
       }
+    }
+    if (reasoningOpen) {
+      asst.content += '</think>';
+      reasoningOpen = false;
     }
     asst.streamDone = true;
     render();

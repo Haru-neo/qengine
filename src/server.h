@@ -429,6 +429,48 @@ static std::string strip_think_block(const std::string& text) {
     return result;
 }
 
+struct ThinkContent {
+    std::string reasoning;
+    std::string content;
+    bool has_reasoning = false;
+};
+
+// Split Qwen's inline <think> block into the de-facto OpenAI-compatible
+// `reasoning_content` field and ordinary assistant content. When thinking was
+// explicitly enabled, the chat template prefills the opening tag into the
+// prompt, so generated text begins inside the block and contains only the
+// closing tag.
+static ThinkContent split_think_content(const std::string& text,
+                                        bool opening_tag_was_prefilled) {
+    ThinkContent out;
+    size_t reasoning_start = 0;
+    if (opening_tag_was_prefilled) {
+        out.has_reasoning = true;
+    } else {
+        size_t ts = text.find("<think>");
+        if (ts == std::string::npos) {
+            out.content = text;
+            return out;
+        }
+        out.has_reasoning = true;
+        out.content = text.substr(0, ts);
+        reasoning_start = ts + 7;
+    }
+
+    size_t te = text.find("</think>", reasoning_start);
+    if (te == std::string::npos) {
+        out.reasoning = text.substr(reasoning_start);
+        return out;
+    }
+    out.reasoning = text.substr(reasoning_start, te - reasoning_start);
+    out.content += text.substr(te + 8);
+
+    size_t first = out.content.find_first_not_of(" \n\r\t");
+    if (first != std::string::npos) out.content.erase(0, first);
+    else out.content.clear();
+    return out;
+}
+
 // Strip tool_call XML blocks from content
 static std::string strip_tool_calls(const std::string& text) {
     std::string result = text;
@@ -1278,14 +1320,11 @@ struct HttpServer {
             send_sse(client_fd, "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\""
                 + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}");
 
-            std::string stream_accum;  // accumulate full output for tool_call detection
-            // If the chat encoder prefilled "<think>\n", surface that to the
-            // client so the streamed content is well-formed (<think>...</think>...).
-            if (prefills_think_tag) {
-                stream_accum += "<think>\n";
-                send_sse(client_fd, "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\""
-                    + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<think>\\n\"},\"finish_reason\":null}]}");
-            }
+            std::string stream_accum;  // answer output for tool_call detection
+            // force_think=1 prefills the opening tag into this request's chat
+            // template. Track it per request; the old server-wide
+            // prefills_think_tag flag cannot represent Pi/vLLM request toggles.
+            bool stream_in_think = (force_think == 1);
             bool client_alive = true;
             std::atomic<bool> gen_truncated{false};
             stream_generate_fn(prompt_ids, max_tokens, cached_prompt_tokens, rf, requested_slot, [&](const std::string& token, bool done) -> bool {
@@ -1313,9 +1352,21 @@ struct HttpServer {
                     }
                     client_alive &= send_sse(client_fd, "[DONE]");
                 } else {
-                    stream_accum += token;
+                    // Qwen emits special think tags as individual decoded
+                    // tokens. Keep delimiters off the wire and expose reasoning
+                    // through the field understood by llama.cpp/Pi clients.
+                    if (token == "<think>") {
+                        stream_in_think = true;
+                        return client_alive;
+                    }
+                    if (token == "</think>") {
+                        stream_in_think = false;
+                        return client_alive;
+                    }
+                    const char* field = stream_in_think ? "reasoning_content" : "content";
+                    if (!stream_in_think) stream_accum += token;
                     client_alive &= send_sse(client_fd, "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\""
-                        + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\""
+                        + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{\"" + field + "\":\""
                         + json_escape(token) + "\"},\"finish_reason\":null}]}");
                 }
                 return client_alive;
@@ -1326,23 +1377,15 @@ struct HttpServer {
             std::atomic<bool> gen_truncated{false};
             std::string generated_text = generate_fn(prompt_ids, max_tokens, cached_prompt_tokens, rf, client_fd, requested_slot, &completion_tokens, &gen_truncated);
 
-            // The chat encoder may prefill "<think>\n" into the prompt, in
-            // which case the generated text starts mid-think with no opening
-            // tag. Re-attach it so strip_think_block can find a balanced pair
-            // and the wire response stays well-formed.
-            std::string full_text = prefills_think_tag ? ("<think>\n" + generated_text) : generated_text;
+            ThinkContent split = split_think_content(generated_text, force_think == 1);
 
             // Parse tool calls from XML output
-            auto parsed_calls = parse_tool_calls(full_text);
+            auto parsed_calls = parse_tool_calls(split.content);
             // Priority: tool_calls > length (server-side rep-loop cut) > stop.
             std::string finish_reason = !parsed_calls.empty() ? "tool_calls"
                 : (gen_truncated.load(std::memory_order_relaxed) ? "length" : "stop");
 
-            // Clean content: KEEP <think> blocks so non-stream clients see the
-            // reasoning too (matches the streaming path, which never strips it).
-            // 2026-06-09: think strip disabled by user config. Still strip
-            // <tool_call> blocks — those leave as structured tool_calls fields.
-            std::string clean_content = strip_tool_calls(full_text);
+            std::string clean_content = strip_tool_calls(split.content);
 
             std::ostringstream json;
             json << "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"model\":\""
@@ -1354,6 +1397,9 @@ struct HttpServer {
                 json << ",\"tool_calls\":" << tool_calls_to_api_json(parsed_calls);
             } else {
                 json << ",\"content\":\"" << json_escape(clean_content) << "\"";
+            }
+            if (split.has_reasoning) {
+                json << ",\"reasoning_content\":\"" << json_escape(split.reasoning) << "\"";
             }
 
             json << "},\"finish_reason\":\"" << finish_reason << "\"}],"

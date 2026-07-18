@@ -267,6 +267,11 @@ All three trigger forms work; later wins on conflict:
 
 Internally these all set the same `force_think` argument on the chat template (`-1` = insert a closed `<think>\n\n</think>\n\n` block so the model emits no reasoning, `0` = let the model decide, `1` = prefill `<think>\n`).
 
+The OpenAI-compatible API returns reasoning in `reasoning_content` and keeps
+`content` free of Qwen's `<think>` delimiters. This applies to both streaming and
+non-streaming responses. The bundled web UI renders the structured reasoning as
+a collapsible block.
+
 ### JSON mode (`response_format`)
 
 OpenAI-style `response_format` (`{"type":"json_object"}` / `{"type":"json_schema"}`) is implemented via a state-machine grammar that masks tokens which would break JSON validity. It is **off by default** — the strict path (grammar mask + skip-think + spec/MTP disabled) drops throughput roughly 10×, so enable it explicitly with `MINF_ENABLE_JSON_MODE=1`. Note: `json_schema` is currently treated the same as `json_object` — only structural JSON validity is enforced, the schema itself is not.
