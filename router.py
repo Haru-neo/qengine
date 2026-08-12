@@ -235,9 +235,10 @@ function el(tag, cls, text) {
   if (text !== undefined) e.textContent = text;
   return e;
 }
-// Parse a streaming/final assistant content into think + answer.
-// Qwopus wraps chain-of-thought in <think>...</think> before the real
-// answer. While a <think> block is still open (no closing tag yet),
+// Fallback parser for backends that still put <think>...</think> inside
+// content. qengine sends reasoning in the separate `reasoning_content`
+// field (see renderMsg), so this only runs for other OpenAI-compatible
+// servers. While a <think> block is still open (no closing tag yet),
 // everything so far is think, answer is empty, done=false.
 function splitThink(full, streamDone) {
   if (!full.startsWith('<think>')) return {think: '', answer: full, done: true};
@@ -257,7 +258,11 @@ function splitThink(full, streamDone) {
 function renderMsg(m) {
   const wrap = el('div', 'msg ' + m.role);
   if (m.role === 'assistant') {
-    const {think, answer, done} = splitThink(m.content, !!m.streamDone);
+    // reasoning_content is authoritative when the server sends it; otherwise
+    // fall back to digging the tags out of content.
+    const {think, answer, done} = (m.reasoning !== undefined && m.reasoning !== '')
+      ? {think: m.reasoning, answer: m.content, done: !!m.content || !!m.streamDone}
+      : splitThink(m.content, !!m.streamDone);
     if (think) {
       const d = document.createElement('details');
       d.className = 'think';
@@ -321,14 +326,16 @@ async function send() {
   if (!text) return;
   input.value = '';
   history.push({role: 'user', content: text});
-  const asst = {role: 'assistant', content: ''};
+  const asst = {role: 'assistant', content: '', reasoning: ''};
   history.push(asst);
   render();
 
   const msgs = [];
   const sys = sysArea.value.trim();
   if (sys) msgs.push({role: 'system', content: sys});
-  for (const m of history.slice(0, -1)) msgs.push(m);  // exclude pending assistant stub
+  // exclude the pending assistant stub, and send role+content only — reasoning
+  // is not fed back into the next turn (the chat template drops it anyway).
+  for (const m of history.slice(0, -1)) msgs.push({role: m.role, content: m.content});
 
   pending = true;
   sendBtn.disabled = true;
@@ -374,10 +381,17 @@ async function send() {
         if (!payload || payload === '[DONE]') continue;
         try {
           const j = JSON.parse(payload);
-          const delta = j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content;
-          if (delta) {
+          const d = j.choices && j.choices[0] && j.choices[0].delta;
+          if (!d) continue;
+          if (d.reasoning_content) {
             if (!tFirst) tFirst = performance.now();
-            asst.content += delta;
+            asst.reasoning = (asst.reasoning || '') + d.reasoning_content;
+            tokenCount++;
+            render();
+          }
+          if (d.content) {
+            if (!tFirst) tFirst = performance.now();
+            asst.content += d.content;
             tokenCount++;
             render();
           }

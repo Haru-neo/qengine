@@ -1,10 +1,15 @@
-import subprocess, sys
+import os, subprocess, sys
 sys.path.insert(0, '/home/paru/exllamav2')
 from exllamav2 import ExLlamaV2Config
 from exllamav2.tokenizer.tokenizer import ExLlamaV2Tokenizer
 import torch
 
-config = ExLlamaV2Config('/home/paru/models/Qwen3.5-27B-Opus-Q6')
+# Tokenizer comes from the HF checkpoint, weights from the GGUF the engine
+# loads. Override either with QENGINE_HF_DIR / QENGINE_GGUF.
+HF_DIR = os.environ.get('QENGINE_HF_DIR', '/home/paru/models/hf/Qwopus3.6-27B-v2')
+GGUF = os.environ.get('QENGINE_GGUF', '/mnt/ssd/base-gguf/Qwen3.6-27B-Q8_0.gguf')
+
+config = ExLlamaV2Config(HF_DIR)
 tokenizer = ExLlamaV2Tokenizer(config)
 
 prompts = [
@@ -14,8 +19,7 @@ prompts = [
 
 for prompt in prompts:
     ids = tokenizer.encode(prompt, encode_special_tokens=True)[0].tolist()
-    args = ["/home/paru/qwen-engine/build/qwen-engine",
-            "/home/paru/models/gguf/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled.Q5_K_M.gguf"]
+    args = ["/home/paru/qwen-engine/build/qwen-engine", GGUF]
     args += [str(t) for t in ids]
     result = subprocess.run(args, capture_output=True, text=True, timeout=300)
     for line in result.stdout.split('\n'):

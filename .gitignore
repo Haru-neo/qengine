@@ -49,6 +49,7 @@ models/
 /tools/*
 !/tools/*.cu
 !/tools/*.cuh
+!/tools/*.cpp
 !/tools/*.h
 !/tools/*.sh
 !/tools/*.py

@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -409,25 +410,142 @@ static std::string tool_calls_to_api_json(const std::vector<ParsedToolCall>& cal
     return json;
 }
 
-// Strip <think>...</think> from content, return cleaned content
-static std::string strip_think_block(const std::string& text) {
-    std::string result = text;
-    while (true) {
-        size_t ts = result.find("<think>");
-        if (ts == std::string::npos) break;
-        size_t te = result.find("</think>", ts);
+// Split a reply into reasoning (the <think> block) and the visible answer.
+//
+// `prefilled` = the chat encoder already put `<think>\n` into the prompt
+// (force_think == 1), so `text` starts *inside* the block with no opening
+// tag. That is a per-request property — see the note on `has_think_token`.
+//
+// An unterminated block (model ran out of max_tokens mid-reasoning) yields
+// all-reasoning + empty content, never a dropped response.
+struct ThinkSplit {
+    std::string reasoning;
+    std::string content;
+    bool closed = true;   // false = a <think> was opened and never closed
+};
+
+static ThinkSplit split_think(const std::string& text, bool prefilled) {
+    ThinkSplit out;
+    std::string rest = text;
+    if (prefilled) {
+        size_t te = rest.find("</think>");
         if (te == std::string::npos) {
-            result = result.substr(0, ts);  // unclosed think = strip rest
+            out.reasoning = rest;
+            out.closed = false;
+            rest.clear();
+        } else {
+            out.reasoning = rest.substr(0, te);
+            rest.erase(0, te + 8);
+        }
+    }
+    // Blocks the model opened itself (force_think == 0 lets it decide).
+    while (true) {
+        size_t ts = rest.find("<think>");
+        if (ts == std::string::npos) break;
+        size_t te = rest.find("</think>", ts);
+        if (!out.reasoning.empty()) out.reasoning += "\n";
+        if (te == std::string::npos) {
+            out.reasoning += rest.substr(ts + 7);
+            rest.erase(ts);
+            out.closed = false;
             break;
         }
-        result = result.substr(0, ts) + result.substr(te + 8);
+        out.reasoning += rest.substr(ts + 7, te - (ts + 7));
+        rest.erase(ts, te + 8 - ts);
     }
-    // Trim leading whitespace
-    size_t first = result.find_first_not_of(" \n\r\t");
-    if (first != std::string::npos) result = result.substr(first);
-    else result.clear();
-    return result;
+    out.content = rest;
+    auto ltrim = [](std::string& s) {
+        size_t b = s.find_first_not_of(" \n\r\t");
+        s = (b == std::string::npos) ? std::string() : s.substr(b);
+    };
+    ltrim(out.reasoning);
+    ltrim(out.content);
+    size_t e = out.reasoning.find_last_not_of(" \n\r\t");
+    if (e != std::string::npos) out.reasoning.erase(e + 1);
+    return out;
 }
+
+// Length of the longest suffix of `s` that is a proper prefix of `tag` — how
+// many trailing bytes must be held back because they might be the start of a
+// tag split across two token boundaries.
+static size_t partial_tag_suffix(const std::string& s, const char* tag) {
+    size_t tlen = strlen(tag);
+    size_t maxn = std::min(s.size(), tlen - 1);
+    for (size_t n = maxn; n > 0; n--)
+        if (s.compare(s.size() - n, n, tag, n) == 0) return n;
+    return 0;
+}
+
+// Streaming counterpart of split_think: feed generated text in arbitrary
+// chunks, get back the reasoning / content deltas to put on the wire.
+// Concatenating all the deltas gives byte-identical output to split_think on
+// the same text — including the whitespace trimming — so a client sees the
+// same thing whether or not it asked for a stream. `tools/test_think_split.cpp`
+// asserts that, feeding the same strings one byte at a time.
+struct ThinkStreamSplitter {
+    bool in_think;
+    bool trim_leading;         // swallow whitespace at the start of a segment
+    bool reasoning_started = false;
+    std::string hold;          // withheld: might be the head of a split tag
+    std::string ws_hold;       // withheld: might be trailing whitespace of a
+                               // think block, which split_think trims off
+
+    explicit ThinkStreamSplitter(bool prefilled)
+        : in_think(prefilled), trim_leading(true) {}
+
+    void feed(const std::string& chunk, bool final_chunk,
+              std::string& reasoning_out, std::string& content_out) {
+        hold += chunk;
+        while (!hold.empty()) {
+            const char* tag = in_think ? "</think>" : "<think>";
+            size_t tlen = in_think ? 8 : 7;
+            size_t at = hold.find(tag);
+            if (at != std::string::npos) {
+                emit(hold.substr(0, at), reasoning_out, content_out);
+                hold.erase(0, at + tlen);
+                in_think = !in_think;
+                trim_leading = true;
+                ws_hold.clear();
+                continue;
+            }
+            size_t keep = final_chunk ? 0 : partial_tag_suffix(hold, tag);
+            if (keep == hold.size()) return;   // all of it might be a tag
+            emit(hold.substr(0, hold.size() - keep), reasoning_out, content_out);
+            hold.erase(0, hold.size() - keep);
+            return;
+        }
+    }
+
+private:
+    void emit(std::string s, std::string& reasoning_out, std::string& content_out) {
+        if (s.empty()) return;
+        if (!in_think) {
+            if (trim_leading) {
+                size_t b = s.find_first_not_of(" \n\r\t");
+                if (b == std::string::npos) return;   // still only whitespace
+                s = s.substr(b);
+                trim_leading = false;
+            }
+            content_out += s;
+            return;
+        }
+        s = ws_hold + s;
+        ws_hold.clear();
+        if (trim_leading) {
+            size_t b = s.find_first_not_of(" \n\r\t");
+            if (b == std::string::npos) return;
+            s = s.substr(b);
+            trim_leading = false;
+            if (reasoning_started) s = "\n" + s;   // separate consecutive blocks
+        }
+        size_t e = s.find_last_not_of(" \n\r\t");
+        if (e == std::string::npos) { ws_hold = s; return; }
+        ws_hold = s.substr(e + 1);
+        s.erase(e + 1);
+        reasoning_started = true;
+        reasoning_out += s;
+    }
+};
 
 // Strip tool_call XML blocks from content
 static std::string strip_tool_calls(const std::string& text) {
@@ -599,12 +717,14 @@ struct HttpServer {
     std::function<std::vector<int>(const std::vector<std::pair<std::string,std::string>>&, int)> chat_encode_fn;
     std::string model_name = "qwen";
     std::string api_key;
-    // When true, the chat encoder prefills "<think>\n" into the prompt, so the
-    // model's generated stream starts mid-think (no opening <think> token).
-    // The HTTP layer compensates by emitting "<think>\n" as the first content
-    // delta (streaming) and by prepending it before strip_think_block runs
-    // (non-streaming) so the strip can find a balanced pair.
-    bool prefills_think_tag = false;
+    // Whether "<think>" exists in the tokenizer vocab, i.e. whether
+    // apply_chat() is able to prefill it at all. This is a model capability,
+    // set once at startup. Whether a prefill actually happened is decided
+    // *per request* by force_think — see `prefilled_think` in the chat
+    // handler. (Before 2026-08-12 this was a server-level `prefills_think_tag`
+    // hardcoded false, which is why `enable_thinking: true` leaked a bare
+    // closing tag into content: issue #4.)
+    bool has_think_token = false;
     // Optional stats hook: returns "queue=N active=M slots=K" so /stats can
     // surface scheduler health without exposing the whole scheduler.
     std::function<std::string()> stats_fn;
@@ -1239,6 +1359,12 @@ struct HttpServer {
         }
         if (ctk_override != 0) force_think = ctk_override;
 
+        // Does the prompt we are about to build end inside a <think> block?
+        // apply_chat() prefills the opening tag only for force_think == 1 (a
+        // per-request value), and only if the vocab has the token. force_think
+        // == -1 prefills a *closed* pair, so generation starts on the answer.
+        const bool prefilled_think = (force_think == 1) && has_think_token;
+
         std::vector<int> prompt_ids;
         if (chat_encode_fn) prompt_ids = chat_encode_fn(msg_pairs, force_think);
 
@@ -1279,18 +1405,31 @@ struct HttpServer {
                 + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}");
 
             std::string stream_accum;  // accumulate full output for tool_call detection
-            // If the chat encoder prefilled "<think>\n", surface that to the
-            // client so the streamed content is well-formed (<think>...</think>...).
-            if (prefills_think_tag) {
-                stream_accum += "<think>\n";
-                send_sse(client_fd, "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\""
-                    + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<think>\\n\"},\"finish_reason\":null}]}");
-            }
+            // Reasoning goes out as `delta.reasoning_content`, the answer as
+            // `delta.content` — the two never mix and no tag reaches the wire.
+            if (prefilled_think) stream_accum += "<think>\n";
+            ThinkStreamSplitter tsplit(prefilled_think);
             bool client_alive = true;
+            int stream_tokens = 0;   // for finish_reason, same rule as non-stream
             std::atomic<bool> gen_truncated{false};
+            auto send_deltas = [&](const std::string& reasoning, const std::string& content) {
+                if (!reasoning.empty())
+                    client_alive &= send_sse(client_fd, "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\""
+                        + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\""
+                        + json_escape(reasoning) + "\"},\"finish_reason\":null}]}");
+                if (!content.empty())
+                    client_alive &= send_sse(client_fd, "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\""
+                        + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\""
+                        + json_escape(content) + "\"},\"finish_reason\":null}]}");
+            };
             stream_generate_fn(prompt_ids, max_tokens, cached_prompt_tokens, rf, requested_slot, [&](const std::string& token, bool done) -> bool {
                 if (!client_alive) return false;  // already dead, stop calling
                 if (done) {
+                    // Flush whatever the splitter is still holding back (a
+                    // partial tag at the very end is just text).
+                    std::string rd, cd;
+                    tsplit.feed("", true, rd, cd);
+                    send_deltas(rd, cd);
                     auto parsed_calls = parse_tool_calls(stream_accum);
                     if (!parsed_calls.empty()) {
                         for (size_t ci = 0; ci < parsed_calls.size(); ci++) {
@@ -1304,9 +1443,11 @@ struct HttpServer {
                         client_alive &= send_sse(client_fd, "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\""
                             + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}");
                     } else {
-                        // "length" = server cut the gen (rep-loop, resumes
-                        // exhausted) — distinguishable from a clean stop.
-                        const char* fr = gen_truncated.load(std::memory_order_relaxed)
+                        // "length" = hit max_tokens, or the server cut the gen
+                        // (rep-loop, resumes exhausted) — distinguishable from
+                        // a clean stop.
+                        const char* fr = (gen_truncated.load(std::memory_order_relaxed)
+                                          || (max_tokens > 0 && stream_tokens >= max_tokens))
                                          ? "length" : "stop";
                         client_alive &= send_sse(client_fd, "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\""
                             + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"" + std::string(fr) + "\"}]}");
@@ -1314,9 +1455,10 @@ struct HttpServer {
                     client_alive &= send_sse(client_fd, "[DONE]");
                 } else {
                     stream_accum += token;
-                    client_alive &= send_sse(client_fd, "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\""
-                        + model_name + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\""
-                        + json_escape(token) + "\"},\"finish_reason\":null}]}");
+                    stream_tokens++;
+                    std::string rd, cd;
+                    tsplit.feed(token, false, rd, cd);
+                    send_deltas(rd, cd);
                 }
                 return client_alive;
             }, &gen_truncated);
@@ -1326,27 +1468,31 @@ struct HttpServer {
             std::atomic<bool> gen_truncated{false};
             std::string generated_text = generate_fn(prompt_ids, max_tokens, cached_prompt_tokens, rf, client_fd, requested_slot, &completion_tokens, &gen_truncated);
 
-            // The chat encoder may prefill "<think>\n" into the prompt, in
-            // which case the generated text starts mid-think with no opening
-            // tag. Re-attach it so strip_think_block can find a balanced pair
-            // and the wire response stays well-formed.
-            std::string full_text = prefills_think_tag ? ("<think>\n" + generated_text) : generated_text;
+            // Reasoning leaves in `reasoning_content`, the answer in
+            // `content`; neither carries a <think> tag. `full_text` keeps the
+            // tags for tool-call parsing and the journal.
+            std::string full_text = prefilled_think ? ("<think>\n" + generated_text) : generated_text;
+            ThinkSplit tsplit = split_think(generated_text, prefilled_think);
 
             // Parse tool calls from XML output
             auto parsed_calls = parse_tool_calls(full_text);
-            // Priority: tool_calls > length (server-side rep-loop cut) > stop.
+            // Priority: tool_calls > length (max_tokens, or a server-side
+            // rep-loop cut) > stop. A reply cut off mid-reasoning still
+            // reports its reasoning rather than vanishing.
+            bool hit_cap = gen_truncated.load(std::memory_order_relaxed)
+                           || (max_tokens > 0 && completion_tokens >= max_tokens);
             std::string finish_reason = !parsed_calls.empty() ? "tool_calls"
-                : (gen_truncated.load(std::memory_order_relaxed) ? "length" : "stop");
+                : (hit_cap ? "length" : "stop");
 
-            // Clean content: KEEP <think> blocks so non-stream clients see the
-            // reasoning too (matches the streaming path, which never strips it).
-            // 2026-06-09: think strip disabled by user config. Still strip
-            // <tool_call> blocks — those leave as structured tool_calls fields.
-            std::string clean_content = strip_tool_calls(full_text);
+            // <tool_call> blocks leave as structured tool_calls fields.
+            std::string clean_content = strip_tool_calls(tsplit.content);
 
             std::ostringstream json;
             json << "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"model\":\""
                  << model_name << "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\"";
+
+            if (!tsplit.reasoning.empty())
+                json << ",\"reasoning_content\":\"" << json_escape(tsplit.reasoning) << "\"";
 
             if (!parsed_calls.empty()) {
                 // Return structured tool_calls + cleaned content

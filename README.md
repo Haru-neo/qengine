@@ -271,6 +271,16 @@ Internally these all set the same `force_think` argument on the chat template (`
 
 OpenAI-style `response_format` (`{"type":"json_object"}` / `{"type":"json_schema"}`) is implemented via a state-machine grammar that masks tokens which would break JSON validity. It is **off by default** — the strict path (grammar mask + skip-think + spec/MTP disabled) drops throughput roughly 10×, so enable it explicitly with `MINF_ENABLE_JSON_MODE=1`. Note: `json_schema` is currently treated the same as `json_object` — only structural JSON validity is enforced, the schema itself is not.
 
+**Reasoning comes back in `reasoning_content`, not in `content`.** Non-streaming replies carry a `message.reasoning_content` field (omitted when the model didn't think); streaming sends `delta.reasoning_content` chunks until the block closes, then `delta.content`. No `<think>` tag ever reaches the wire, and the two paths produce byte-identical text. A reply cut off at `max_tokens` mid-reasoning still returns what it had, with `finish_reason: "length"`.
+
+```jsonc
+{"choices":[{"message":{"role":"assistant",
+  "reasoning_content":"The user greeted me, so...",
+  "content":"Hello!"},"finish_reason":"stop"}]}
+```
+
+This is the vLLM / SGLang / DeepSeek field name, so reasoning-aware clients work unchanged. `tools/test_think_split.cpp` is a standalone unit test for the split (`g++ -std=c++17 -I../src -I/usr/local/cuda/include`).
+
 ### Call it
 
 ```bash
@@ -282,6 +292,14 @@ curl http://localhost:8000/v1/chat/completions \
     "max_tokens": 256
   }'
 ```
+
+Besides the OpenAI routes (`/v1/chat/completions`, `/v1/models`, and `/v1/embeddings` + `/v1/rerank` when the sidecars are proxied) there are three operator endpoints:
+
+| Route | Returns |
+|---|---|
+| `GET /health` (also `GET /`) | `{"status":"ok","model":"..."}` |
+| `GET /stats` | scheduler queue depth, active slots, queue cap, rep-loop cut/resume counters |
+| `GET /probe?trunc_w=..&eps=..&keep=..` | speculative-prefill research knobs, tunable at runtime so a sweep doesn't need a model reload |
 
 Vision (27B with mmproj):
 

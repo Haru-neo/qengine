@@ -124,6 +124,16 @@ client.chat.completions.create(
 )
 ```
 
+**추론 과정은 `content` 가 아니라 `reasoning_content` 로 나갑니다.** 논스트리밍은 `message.reasoning_content` 필드(생각 안 했으면 필드 자체가 없음), 스트리밍은 블록이 닫힐 때까지 `delta.reasoning_content` 를 보내고 그 뒤부터 `delta.content` 입니다. `<think>` 태그는 와이어에 안 나가고, 두 경로의 텍스트는 바이트 단위로 같습니다. `max_tokens` 에 걸려 생각 도중에 끊긴 응답도 거기까지의 추론을 그대로 돌려주고 `finish_reason` 은 `"length"` 입니다.
+
+```jsonc
+{"choices":[{"message":{"role":"assistant",
+  "reasoning_content":"사용자가 인사했으니...",
+  "content":"안녕하세요!"},"finish_reason":"stop"}]}
+```
+
+vLLM / SGLang / DeepSeek 과 같은 필드 이름이라 추론 지원 클라이언트는 그대로 붙습니다. 분리 로직 단위 테스트는 `tools/test_think_split.cpp`.
+
 **임베딩 + 리랭커 사이드카** (Qwen3 4B dense, 같은 binary, GPU 3 공유):
 
 ```bash

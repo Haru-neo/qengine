@@ -17,7 +17,7 @@
 #include <csignal>
 #include <poll.h>
 // Vision hooks (shared via global pointers — see main() wiring). When the CLI
-// is invoked with --mmproj + --image-raw, main() runs the ViT on GPU 0 and
+// is invoked with --vision-mmproj + --image-raw, main() runs the ViT on GPU 0 and
 // populates g_vision_embeds with 576 fp16 rows of LLM-hidden dim. During
 // prefill, any token matching g_image_pad_id uses the next vision embedding
 // instead of the normal dequant_embd path.
@@ -6061,11 +6061,11 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
         if (out_completion_tokens) *out_completion_tokens = (int)out_ids.size();
         return tok.decode(out_ids);
     };
-    // Match llama.cpp: no <think> prefill. 모델이 자율적으로 필요 시
-    // `<think>` 열고 닫음. 웹 UI splitThink 는 `<think>` 로 시작하는
-    // stream 만 think block 으로 접고, 바로 답 오는 경우는 all-answer
-    // 로 표시 — 둘 다 자연스럽게 처리.
-    server.prefills_think_tag = false;
+    // Model capability, not policy: whether apply_chat() *can* prefill an
+    // opening `<think>`. Whether it does is per request (force_think), and the
+    // server derives that itself. Default stays "model decides" (force_think
+    // 0 = no prefill) unless the client asks for thinking.
+    server.has_think_token = tok.token_to_id.count("<think>") > 0;
     server.sampling_params = &sp;
 
     // Streaming wrapper. The scheduler invokes on_token on the worker thread
