@@ -29,7 +29,7 @@ CMP 100-210, V100 같은 채굴 카드는 중고 시장에 헐값으로 풀려�
 - **Tensor Core throttle** — HMMA latency 64 배 (8 → 512 cycle), cuBLAS WMMA 5 TFLOP 한계
 - **PCIe Gen1 x1**, P2P 없음, NVLink 없음
 - **CUPTI 차단** — torch.profiler 도 못 씁니다
-- 전부 다이에 박힌 e-fuse + PMU bootrom 이중락이라 펌웨어가 아닙니다. 소프트웨어 unlock 경로는 없습니다 (전수 시도 후 확인).
+- 전부 드라이버 아래 단계 — 다이의 PMU/SEC2 시큐어부트 — 에서 걸립니다. 유저 코드가 닿는 권한으론 못 풉니다. 이 Volta 카드용 소프트웨어 unlock 은 (아직) 없습니다. 더 나중 형제칩인 GA100 CMP 170HX 는 2026 년에 소프트웨어로 뚫렸지만, Volta 엔 없는 GSP 시대 부트 원시함수를 써서라 여기엔 안 옮겨집니다.
 
 그래서 이렇게 풀었습니다.
 

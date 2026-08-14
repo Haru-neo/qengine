@@ -36,7 +36,7 @@ Mining cards (CMP 100-210, ex-mining V100) are dirt-cheap on the secondhand mark
 - **Tensor Cores throttled** — HMMA latency stretched 64× (8 → 512 cycles), hard cap ~5 TFLOP via cuBLAS WMMA.
 - **PCIe Gen1 x1 only**, no P2P, no NVLink.
 - **CUPTI blocked** — no vendor profiler, no `torch.profiler`.
-- **All of this is enforced in hardware** — e-fuse + PMU bootrom double-lock on the die. There is no software unlock; we tried.
+- **All of this is enforced below the driver** — PMU/SEC2 secure boot on the die, at a privilege level user code can't reach. No software unlock exists for these Volta cards; the newer GA100 sibling (CMP 170HX) *was* cracked in software in 2026, but through a GSP-era boot primitive Volta doesn't have, so it doesn't port.
 
 So `vLLM`, `llama.cpp`'s default cuBLAS path, FlashAttention, bitsandbytes — anything that goes through cuBLAS Tensor Cores runs at 1/64 speed or fails outright.
 
