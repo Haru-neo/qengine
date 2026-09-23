@@ -55,3 +55,4 @@ models/
 !/tools/*.py
 !/tools/*.md
 !/tools/*.txt
+!/tools/testdata/

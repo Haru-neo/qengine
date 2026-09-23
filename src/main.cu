@@ -6068,6 +6068,22 @@ int serve_qwen(GGUFFile& gguf, GPUModel& gpu_model, int n_gpus, int port, const 
     server.has_think_token = tok.token_to_id.count("<think>") > 0;
     server.sampling_params = &sp;
 
+    // Qwen3.8 has the Qwen3.6 architecture but a new chat template
+    // (reasoning_effort, preserve_thinking on by default). Recognise it by
+    // the template embedded in the GGUF; QENGINE_CHAT_TEMPLATE=qwen38|legacy
+    // overrides for GGUFs whose template was stripped or patched.
+    {
+        const std::string tmpl = gguf.get_str("tokenizer.chat_template");
+        bool qwen38 = tmpl.find("reasoning_effort") != std::string::npos &&
+                      tmpl.find("preserve_thinking") != std::string::npos;
+        if (const char* e = getenv("QENGINE_CHAT_TEMPLATE")) {
+            if (strcmp(e, "qwen38") == 0) qwen38 = true;
+            else if (strcmp(e, "legacy") == 0) qwen38 = false;
+        }
+        server.chat_template_qwen38 = qwen38;
+        printf("[chat] template: %s\n", qwen38 ? "qwen3.8 (reasoning_effort, preserve_thinking)" : "legacy qwen3.5/3.6");
+    }
+
     // Streaming wrapper. The scheduler invokes on_token on the worker thread
     // that owns this sequence, so we decode + flush directly into the SSE
     // callback. on_done finalizes the trailing UTF-8 buffer (in case a final

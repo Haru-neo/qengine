@@ -188,6 +188,62 @@ static size_t find_obj_end(const std::string& json, size_t start) {
     return std::string::npos;
 }
 
+// Raw text of the value of a *top-level* key of a JSON object (strings keep
+// their quotes), or "" if absent. Unlike json_get_str/json_get_raw this never
+// matches the same key nested deeper (a tool schema property, message text)
+// and never reads past a `null` into the next key's string.
+static std::string json_top_raw(const std::string& json, const std::string& key) {
+    int depth = 0;
+    for (size_t i = 0; i < json.size(); i++) {
+        char c = json[i];
+        if (c == '"') {
+            size_t e = i + 1;
+            while (e < json.size() && json[e] != '"') { if (json[e] == '\\') e++; e++; }
+            if (e >= json.size()) return "";
+            size_t after = e + 1;
+            while (after < json.size() && (json[after] == ' ' || json[after] == '\n' || json[after] == '\r' || json[after] == '\t')) after++;
+            bool is_key = depth == 1 && after < json.size() && json[after] == ':';
+            if (is_key && json.compare(i + 1, e - i - 1, key) == 0) {
+                size_t vs = after + 1;
+                while (vs < json.size() && (json[vs] == ' ' || json[vs] == '\n' || json[vs] == '\r' || json[vs] == '\t')) vs++;
+                if (vs >= json.size()) return "";
+                size_t ve = vs;
+                if (json[vs] == '"') {
+                    ve = vs + 1;
+                    while (ve < json.size() && json[ve] != '"') { if (json[ve] == '\\') ve++; ve++; }
+                    return json.substr(vs, ve - vs + 1);
+                }
+                if (json[vs] == '{' || json[vs] == '[') {
+                    int d = 0; bool in_s = false;
+                    for (ve = vs; ve < json.size(); ve++) {
+                        char v = json[ve];
+                        if (in_s) { if (v == '\\') ve++; else if (v == '"') in_s = false; continue; }
+                        if (v == '"') in_s = true;
+                        else if (v == '{' || v == '[') d++;
+                        else if (v == '}' || v == ']') { if (--d == 0) break; }
+                    }
+                    return json.substr(vs, ve - vs + 1);
+                }
+                ve = json.find_first_of(",}] \n\r\t", vs);
+                if (ve == std::string::npos) ve = json.size();
+                return json.substr(vs, ve - vs);
+            }
+            i = e;
+            continue;
+        }
+        if (c == '{' || c == '[') depth++;
+        else if (c == '}' || c == ']') depth--;
+    }
+    return "";
+}
+
+// Decoded string value of a top-level key; "" when absent, null or not a string.
+static std::string json_top_str(const std::string& json, const std::string& key) {
+    std::string raw = json_top_raw(json, key);
+    if (raw.empty() || raw[0] != '"') return "";
+    return json_get_str("{\"v\":" + raw + "}", "v");
+}
+
 // ============ Tool call helpers ============
 
 // Iterate objects in JSON array, returns each {...} substring
@@ -571,6 +627,10 @@ struct ChatMessage {
     std::string role;
     std::string content;
     std::string tool_calls_json;  // raw JSON array for assistant tool_calls
+    // Assistant reasoning sent back by the client (OpenAI-compatible
+    // `reasoning_content`, or vLLM's newer `reasoning`). Only the Qwen3.8
+    // template re-renders it; the legacy path strips past reasoning.
+    std::string reasoning_content;
     // Decoded raw image bytes from any "image_url" entries inside an OpenAI
     // content array. data URLs (`data:image/...;base64,...`) are decoded
     // here. Plain http(s) URLs are not fetched (out of scope for now).
@@ -665,8 +725,13 @@ static std::vector<ChatMessage> json_get_messages(const std::string& json) {
         if (!raw_content.empty() && raw_content.front() == '[') {
             parse_content_array(raw_content, msg.content, msg.images);
         } else {
-            msg.content = json_get_str(obj, "content");
+            // json_top_str, not json_get_str: `"content": null` (usual on
+            // assistant tool-call turns) must stay empty instead of picking up
+            // the next key's string.
+            msg.content = json_top_str(obj, "content");
         }
+        msg.reasoning_content = json_top_str(obj, "reasoning_content");
+        if (msg.reasoning_content.empty()) msg.reasoning_content = json_top_str(obj, "reasoning");
         // Parse tool_calls array from assistant messages
         msg.tool_calls_json = json_get_raw(obj, "tool_calls");
         if (!msg.role.empty()) msgs.push_back(msg);
@@ -675,6 +740,263 @@ static std::vector<ChatMessage> json_get_messages(const std::string& json) {
         if (json.find(']', pos) < json.find('{', pos)) break;
     }
     return msgs;
+}
+
+// ============ Qwen3.8 chat template ============
+//
+// Port of the official chat_template.jinja shipped with Qwen/Qwen3.8-27B. The
+// model itself is architecturally identical to Qwen3.6-27B; what changed is
+// the template:
+//   - reasoning_effort (xhigh default, medium, low): with thinking on, an
+//     instruction line is put at the top of the system turn. xhigh is the
+//     default, so a request with no system message still gets one.
+//   - preserve_thinking now defaults to true: earlier assistant turns are
+//     re-rendered with their reasoning as <think>...</think>, from the
+//     message's reasoning_content (the legacy path strips it instead).
+//   - the generation prompt opens <think>\n unless thinking is disabled.
+// The output is the full prompt text; Tokenizer::encode() turns the <|...|>
+// and <think> markers into their special tokens.
+// tools/qwen38_template_check.py diffs this against the real jinja template.
+
+static const char* const QWEN38_EFFORT_XHIGH =
+    "Reasoning effort is set to xhigh. Please think carefully through the task, validate key "
+    "assumptions, consider plausible alternatives, and prioritize correctness, consistency, and "
+    "clarity in the final answer.";
+static const char* const QWEN38_EFFORT_LOW =
+    "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to "
+    "the conclusion without unnecessary elaboration.";
+
+// Jinja's |trim (Python str.strip() on ASCII whitespace).
+static std::string qwen38_trim(const std::string& s) {
+    const char* ws = " \t\n\r\f\v";
+    size_t b = s.find_first_not_of(ws);
+    if (b == std::string::npos) return "";
+    size_t e = s.find_last_not_of(ws);
+    return s.substr(b, e - b + 1);
+}
+
+// Jinja's `x | tojson` for a JSON value we received as text: re-serialize
+// with Python json.dumps separators (", " and ": "), dropping the client's
+// own whitespace outside strings.
+static std::string qwen38_tojson(const std::string& raw) {
+    std::string compact;
+    bool in_str = false;
+    for (size_t i = 0; i < raw.size(); i++) {
+        char c = raw[i];
+        if (in_str) {
+            compact += c;
+            if (c == '\\' && i + 1 < raw.size()) { compact += raw[++i]; continue; }
+            if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') continue;
+        if (c == '"') in_str = true;
+        compact += c;
+    }
+    return json_normalize(compact);
+}
+
+// Map an OpenAI-style effort onto the three levels the template accepts.
+// "high"/"minimal" are what OpenAI clients send; "none" turns thinking off.
+// Returns "" for a value we don't recognise.
+static std::string qwen38_effort_level(const std::string& e) {
+    if (e == "xhigh" || e == "high" || e == "max") return "xhigh";
+    if (e == "medium") return "medium";
+    if (e == "low" || e == "minimal") return "low";
+    if (e == "none") return "none";
+    return "";
+}
+
+struct Qwen38ChatOptions {
+    bool enable_thinking = true;       // false == enable_thinking=false in the template
+    std::string reasoning_effort = "xhigh";
+    bool preserve_thinking = true;
+    bool add_generation_prompt = true;
+};
+
+// `<tool_call>` blocks for one assistant turn, exactly as the template writes
+// them after the message content.
+static std::string qwen38_tool_calls(const std::string& tool_calls_json, bool has_content) {
+    std::string out;
+    bool first = true;
+    for (auto& call : json_array_objects(tool_calls_json)) {
+        std::string fn = json_top_raw(call, "function");
+        if (fn.empty() || fn[0] != '{') fn = call;   // {% if tool_call.function is defined %}
+        std::string name = json_top_str(fn, "name");
+        if (first) out += has_content ? "\n\n<tool_call>\n<function=" : "<tool_call>\n<function=";
+        else       out += "\n<tool_call>\n<function=";
+        out += name + ">\n";
+        first = false;
+
+        // OpenAI sends arguments as a JSON-encoded string; accept an object too.
+        std::string args = json_top_raw(fn, "arguments");
+        if (!args.empty() && args[0] == '"') args = json_top_str(fn, "arguments");
+        if (!args.empty() && args[0] == '{') {
+            for (auto& kv : json_flat_kv(args)) {
+                // json_flat_kv decodes string values; anything else comes back
+                // raw and goes out as |tojson.
+                std::string raw = json_top_raw(args, kv.key);
+                std::string v = (!raw.empty() && raw[0] == '"') ? json_top_str(args, kv.key)
+                                                                : qwen38_tojson(raw);
+                out += "<parameter=" + kv.key + ">\n" + v + "\n</parameter>\n";
+            }
+        }
+        out += "</function>\n</tool_call>";
+    }
+    return out;
+}
+
+// Render `messages` (+ the request's `tools` array, may be "") with the
+// Qwen3.8 template. `developer` messages follow the legacy mapping (the first
+// becomes the system turn, later ones user turns) and several system
+// messages are merged, since the official template rejects both.
+static std::string render_qwen38_chat(std::vector<ChatMessage> messages,
+                                      const std::string& tools_json,
+                                      const Qwen38ChatOptions& opt) {
+    // Normalise roles into the shape the template expects: one system turn first.
+    std::string system;
+    bool has_system = false;
+    std::vector<ChatMessage> conv;
+    for (auto& m : messages) {
+        if (m.role == "system" || (m.role == "developer" && !has_system)) {
+            std::string c = qwen38_trim(m.content);
+            if (has_system && !c.empty() && !system.empty()) system += "\n\n";
+            system += c;
+            has_system = true;
+        } else if (m.role == "developer") {
+            ChatMessage u = m; u.role = "user"; conv.push_back(u);
+        } else {
+            conv.push_back(m);
+        }
+    }
+
+    std::string instr;
+    if (opt.enable_thinking) {
+        if (opt.reasoning_effort == "xhigh") instr = QWEN38_EFFORT_XHIGH;
+        else if (opt.reasoning_effort == "low") instr = QWEN38_EFFORT_LOW;
+    }
+
+    std::string out;
+    auto tools = tools_json.empty() ? std::vector<std::string>() : json_array_objects(tools_json);
+    if (!tools.empty()) {
+        out += "<|im_start|>system\n";
+        if (!instr.empty()) out += instr + "\n\n";
+        out += "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+        for (auto& t : tools) out += "\n" + qwen38_tojson(t);
+        out += "\n</tools>";
+        out += "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+               "<tool_call>\n<function=example_function_name>\n"
+               "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+               "<parameter=example_parameter_2>\nThis is the value for the second parameter\n"
+               "that can span\nmultiple lines\n</parameter>\n"
+               "</function>\n</tool_call>\n\n"
+               "<IMPORTANT>\nReminder:\n"
+               "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
+               "- Required parameters MUST be specified\n"
+               "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n"
+               "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n"
+               "</IMPORTANT>";
+        if (!system.empty()) out += "\n\n" + system;
+        out += "<|im_end|>\n";
+    } else if (!system.empty()) {
+        out += "<|im_start|>system\n" + (instr.empty() ? "" : instr + "\n\n") + system + "<|im_end|>\n";
+    } else if (!instr.empty()) {
+        out += "<|im_start|>system\n" + instr + "<|im_end|>\n";
+    }
+
+    // Index of the last real user query (tool results wrapped as user turns
+    // don't count). Assistant turns after it always keep their reasoning.
+    int last_query = (int)conv.size() - 1;
+    for (int i = (int)conv.size() - 1; i >= 0; i--) {
+        if (conv[i].role != "user") continue;
+        std::string c = qwen38_trim(conv[i].content);
+        bool is_tool_resp = c.compare(0, 15, "<tool_response>") == 0 && c.size() >= 16 &&
+                            c.compare(c.size() - 16, 16, "</tool_response>") == 0;
+        if (!is_tool_resp) { last_query = i; break; }
+    }
+
+    for (size_t i = 0; i < conv.size(); i++) {
+        const auto& m = conv[i];
+        std::string content = qwen38_trim(m.content);
+        if (m.role == "assistant") {
+            out += "<|im_start|>assistant\n";
+            if (opt.preserve_thinking || (int)i > last_query)
+                out += "<think>\n" + qwen38_trim(m.reasoning_content) + "\n</think>\n\n";
+            out += content;
+            if (!m.tool_calls_json.empty())
+                out += qwen38_tool_calls(m.tool_calls_json, !content.empty());
+            out += "<|im_end|>\n";
+        } else if (m.role == "tool") {
+            // {% if loop.previtem and loop.previtem.role != "tool" %} — the
+            // system turn counts as a previous item in the original list.
+            bool prev_not_tool = (i > 0) ? conv[i - 1].role != "tool" : has_system;
+            if (prev_not_tool) out += "<|im_start|>user";
+            out += "\n<tool_response>\n" + content + "\n</tool_response>";
+            if (i + 1 == conv.size() || conv[i + 1].role != "tool") out += "<|im_end|>\n";
+        } else {
+            out += "<|im_start|>" + m.role + "\n" + content + "<|im_end|>\n";
+        }
+    }
+
+    if (opt.add_generation_prompt) {
+        out += "<|im_start|>assistant\n";
+        out += opt.enable_thinking ? "<think>\n" : "<think>\n\n</think>\n\n";
+    }
+    return out;
+}
+
+// chat_template_kwargs lookups, top-level body first, then extra_body
+// (the same priority the enable_thinking override uses).
+static std::string qwen38_kwarg_raw(const std::string& body, const std::string& key) {
+    for (const std::string& obj : {body, json_top_raw(body, "extra_body")}) {
+        if (obj.empty()) continue;
+        std::string ctk = json_top_raw(obj, "chat_template_kwargs");
+        if (!ctk.empty() && ctk[0] == '{') {
+            std::string v = json_top_raw(ctk, key);
+            if (!v.empty()) return v;
+        }
+    }
+    return "";
+}
+
+// Resolve the Qwen3.8 template variables for one request. `force_think` is
+// what the directive / enable_thinking logic settled on (-1 off, 0 unset,
+// 1 on); reasoning_effort "none" turns thinking off, and an unset value
+// becomes 1 because the template opens <think> by default.
+static Qwen38ChatOptions qwen38_options_for_request(const std::string& body, int& force_think) {
+    Qwen38ChatOptions o;
+    std::string effort;
+    std::string raw = qwen38_kwarg_raw(body, "reasoning_effort");
+    if (!raw.empty() && raw[0] == '"') effort = json_get_str("{\"v\":" + raw + "}", "v");
+    if (effort.empty()) effort = json_top_str(body, "reasoning_effort");
+    if (effort.empty()) effort = json_top_str(json_top_raw(body, "extra_body"), "reasoning_effort");
+    if (!effort.empty()) {
+        std::string level = qwen38_effort_level(effort);
+        if (level.empty()) {
+            fprintf(stderr, "[API] unknown reasoning_effort '%s', using xhigh\n", effort.c_str());
+            level = "xhigh";
+        }
+        if (level == "none") force_think = -1;
+        else o.reasoning_effort = level;
+    }
+    if (qwen38_kwarg_raw(body, "preserve_thinking") == "false") o.preserve_thinking = false;
+    o.enable_thinking = force_think != -1;
+    if (o.enable_thinking) force_think = 1;
+    return o;
+}
+
+// Remove a /think or /no_think directive (and the whitespace around it) from
+// message text.
+static void strip_directive(std::string& s, const std::string& tag) {
+    size_t p;
+    while ((p = s.find(tag)) != std::string::npos) {
+        size_t end = p + tag.size();
+        while (end < s.size() && (s[end] == ' ' || s[end] == '\t' || s[end] == '\n' || s[end] == '\r')) end++;
+        size_t start = p;
+        while (start > 0 && (s[start - 1] == ' ' || s[start - 1] == '\t')) start--;
+        s.erase(start, end - start);
+    }
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\n' || s.back() == '\r' || s.back() == '\t')) s.pop_back();
 }
 
 // ============ HTTP Server ============
@@ -725,6 +1047,10 @@ struct HttpServer {
     // hardcoded false, which is why `enable_thinking: true` leaked a bare
     // closing tag into content: issue #4.)
     bool has_think_token = false;
+    // Render chats with the Qwen3.8 template (render_qwen38_chat) instead of
+    // msg_pairs + chat_encode_fn. Set at startup from the GGUF's embedded
+    // chat template; needs encode_fn.
+    bool chat_template_qwen38 = false;
     // Optional stats hook: returns "queue=N active=M slots=K" so /stats can
     // surface scheduler health without exposing the whole scheduler.
     std::function<std::string()> stats_fn;
@@ -1312,17 +1638,6 @@ struct HttpServer {
         // force_think: -1=skip (insert <think></think>), 0=auto, 1=prefill
         // Directives are stripped from message text before encoding.
         int force_think = rf.json_mode ? -1 : 0;
-        auto strip_directive = [](std::string& s, const std::string& tag) {
-            size_t p;
-            while ((p = s.find(tag)) != std::string::npos) {
-                size_t end = p + tag.size();
-                while (end < s.size() && (s[end] == ' ' || s[end] == '\t' || s[end] == '\n' || s[end] == '\r')) end++;
-                size_t start = p;
-                while (start > 0 && (s[start - 1] == ' ' || s[start - 1] == '\t')) start--;
-                s.erase(start, end - start);
-            }
-            while (!s.empty() && (s.back() == ' ' || s.back() == '\n' || s.back() == '\r' || s.back() == '\t')) s.pop_back();
-        };
         // Scan all messages (system + user) for /no_think and /think directives.
         // Last match wins; strip from text either way.
         for (auto& [role, content] : msg_pairs) {
@@ -1359,14 +1674,41 @@ struct HttpServer {
         }
         if (ctk_override != 0) force_think = ctk_override;
 
+        // Qwen3.8: render the official template from the messages themselves
+        // (it needs each assistant turn's reasoning_content, which msg_pairs
+        // drops). Directives were only stripped from msg_pairs, so strip them
+        // here too; the json_mode hint goes in the same way as above.
+        std::string qwen38_prompt;
+        const bool use_qwen38 = chat_template_qwen38 && encode_fn;
+        if (use_qwen38) {
+            Qwen38ChatOptions o = qwen38_options_for_request(body, force_think);
+            for (auto& m : messages) {
+                if (m.role != "user" && m.role != "system" && m.role != "developer") continue;
+                if (m.content.find("/no_think") != std::string::npos) strip_directive(m.content, "/no_think");
+                if (m.content.find("/think") != std::string::npos) strip_directive(m.content, "/think");
+            }
+            if (rf.json_mode) {
+                const std::string hint = "Respond strictly with a single JSON object starting with `{`. Do not include any text, prefix, or commentary outside the JSON.";
+                auto sys = std::find_if(messages.begin(), messages.end(),
+                    [](const ChatMessage& m) { return m.role == "system" || m.role == "developer"; });
+                if (sys == messages.end()) messages.insert(messages.begin(), ChatMessage{"system", hint});
+                else if (sys->content.find("JSON") == std::string::npos) sys->content = hint + "\n\n" + sys->content;
+            }
+            qwen38_prompt = render_qwen38_chat(messages, tools_json, o);
+            printf("[API] qwen3.8 template: thinking=%d effort=%s preserve_thinking=%d\n",
+                   (int)o.enable_thinking, o.reasoning_effort.c_str(), (int)o.preserve_thinking);
+        }
+
         // Does the prompt we are about to build end inside a <think> block?
         // apply_chat() prefills the opening tag only for force_think == 1 (a
         // per-request value), and only if the vocab has the token. force_think
         // == -1 prefills a *closed* pair, so generation starts on the answer.
+        // The Qwen3.8 template sets force_think to 1 whenever thinking is on.
         const bool prefilled_think = (force_think == 1) && has_think_token;
 
         std::vector<int> prompt_ids;
-        if (chat_encode_fn) prompt_ids = chat_encode_fn(msg_pairs, force_think);
+        if (use_qwen38) prompt_ids = encode_fn(qwen38_prompt);
+        else if (chat_encode_fn) prompt_ids = chat_encode_fn(msg_pairs, force_think);
 
         // Vision: rebuild M-RoPE per-token position arrays now that we know
         // exactly where each image_pad token landed in prompt_ids.
@@ -1375,6 +1717,7 @@ struct HttpServer {
         // Debug: dump prompt details
         { FILE* f = fopen("/tmp/engine_prompt_debug.txt", "w");
           if (f) {
+              if (use_qwen38) fprintf(f, "--- qwen3.8 prompt ---\n%s\n", qwen38_prompt.c_str());
               for (size_t i = 0; i < msg_pairs.size(); i++)
                   fprintf(f, "--- msg[%zu] role='%s' ---\n%s\n", i, msg_pairs[i].first.c_str(), msg_pairs[i].second.c_str());
               fprintf(f, "--- prompt_ids (%zu tokens) ---\n", prompt_ids.size());
