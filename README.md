@@ -11,7 +11,7 @@ A custom CUDA inference engine for **Qwen3.5 / Qwen3.6 hybrid (GDN + Attention) 
 
 📖 **한국어 README → [README.ko.md](README.ko.md)**
 
-> **A note on the writing:** I'm not a native English speaker — this README was written in Korean first and translated/polished with an LLM. All of the engineering, kernels, benchmarks, and decisions are my own.
+> **A note on authorship:** I'm not a native English speaker, so this README was written in Korean and translated with an LLM. The code was written by Claude (Anthropic) across many sessions; the direction, architecture decisions, debugging, hardware diagnosis, and benchmarks are mine.
 
 ---
 
